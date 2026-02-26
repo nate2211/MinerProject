@@ -231,7 +231,12 @@ class Miner:
                     now = time.time()
                     hps = self.pop_hashes() / (now - last_t)
                     last_t = now
-                    print(f"[Stats] {hps:.2f} H/s | A:{self.accepted} R:{self.rejected}")
+
+                    # Fetch the current job to grab the ID
+                    current_job = self.job_state.get()
+                    job_id_str = current_job.job_id if current_job else ""
+
+                    print(f"[Stats] {hps:.2f} H/s | A:{self.accepted} R:{self.rejected} | Job:{job_id_str[:8]}")
 
                     if on_stats:
                         on_stats({
@@ -240,7 +245,8 @@ class Miner:
                             "accepted": self.accepted,
                             "rejected": self.rejected,
                             "last_error": self.last_err,
-                            "height": (self.job_state.get().height if self.job_state.get() else None),
+                            "height": (current_job.height if current_job else None),
+                            "job_id": job_id_str,  # <--- Added this back in
                         })
 
             async def keepalive_loop() -> None:
