@@ -57,7 +57,8 @@ class JobState:
 
 class Miner:
     def __init__(self, *, stratum_host: str, stratum_port: int, wallet: str, password: str, threads: int = 1,
-                 agent: str = "py-blockminer/1.0") -> None:
+                 agent: str = "py-blockminer/1.0", logger=None) -> None:
+        self.logger = logger
         self.stratum_host = stratum_host
         self.stratum_port = stratum_port
         self.wallet = wallet
@@ -70,8 +71,8 @@ class Miner:
         self._stop = threading.Event()
 
         # Load RandomX immediately
-        print("[Miner] Initializing RandomX...")
-        self.rx = RandomX()
+        self.logger("[Miner] Initializing RandomX...")
+        self.rx = RandomX(self.logger)
 
         self._hashes = 0
         self._hash_mu = threading.Lock()
@@ -79,9 +80,10 @@ class Miner:
         self.rejected = 0
         self.last_err: str = ""
 
+
     def stop(self) -> None:
         """Signal all threads and loops to stop immediately."""
-        print("[Miner] Stop signal received.")
+        self.logger("[Miner] Stop signal received.")
         self._stop.set()
 
     def add_hashes(self, n: int) -> None:
@@ -95,7 +97,7 @@ class Miner:
             return h
 
     def _worker(self, idx: int) -> None:
-        print(f"[Worker-{idx}] Started.")
+        self.logger(f"[Worker-{idx}] Started.")
         vm = None
         try:
             last_seq = 0
@@ -164,29 +166,29 @@ class Miner:
                     # (int.from_bytes is fast enough in Python 3.10+)
                     value = int.from_bytes(h32[24:32], "little", signed=False)
                     if value < cur_job.target64:
-                        print(f"[Worker-{idx}] SHARE FOUND! Nonce: {nonce}")
+                        self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {nonce}")
                         self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=nonce, result32=h32))
 
                 self.add_hashes(batch_size)
 
         except Exception as e:
             self.last_err = f"Worker {idx} crashed: {e}"
-            print(f"[Worker-{idx}] FATAL ERROR: {e}")
+            self.logger(f"[Worker-{idx}] FATAL ERROR: {e}")
             traceback.print_exc()
         finally:
             if vm: self.rx.destroy_vm(vm)
-            print(f"[Worker-{idx}] Stopped.")
+            self.logger(f"[Worker-{idx}] Stopped.")
 
     async def run(self, *, on_stats: Optional[callable] = None) -> None:
-        cli = StratumClient(self.stratum_host, self.stratum_port)
+        cli = StratumClient(self.stratum_host, self.stratum_port,logger=self.logger)
 
         try:
-            print(f"[Miner] Connecting to {self.stratum_host}:{self.stratum_port}...")
+            self.logger(f"[Miner] Connecting to {self.stratum_host}:{self.stratum_port}...")
             await cli.connect()
-            print("[Miner] Connected. Logging in...")
+            self.logger("[Miner] Connected. Logging in...")
 
             login = await cli.login(wallet=self.wallet, password=self.password, agent=self.agent)
-            print(f"[Miner] Logged in. Client ID: {login.client_id}")
+            self.logger(f"[Miner] Logged in. Client ID: {login.client_id}")
 
             self.job_state.set(MoneroJob.from_stratum(login.job))
 
@@ -213,10 +215,10 @@ class Miner:
                             await cli.submit(job_id=share.job_id, nonce_hex=share.nonce_hex,
                                              result_hex=share.result_hex)
                             self.accepted += 1
-                            print("[Miner] Share accepted!")
+                            self.logger("[Miner] Share accepted!")
                         except Exception as e:
                             self.rejected += 1
-                            print(f"[Miner] Share rejected: {e}")
+                            self.logger(f"[Miner] Share rejected: {e}")
                     except queue.Empty:
                         continue
 
@@ -236,7 +238,6 @@ class Miner:
                     current_job = self.job_state.get()
                     job_id_str = current_job.job_id if current_job else ""
 
-                    print(f"[Stats] {hps:.2f} H/s | A:{self.accepted} R:{self.rejected} | Job:{job_id_str[:8]}")
 
                     if on_stats:
                         on_stats({
@@ -268,12 +269,12 @@ class Miner:
             while not self._stop.is_set():
                 await asyncio.sleep(0.1)
 
-            print("[Miner] Shutting down tasks...")
+            self.logger("[Miner] Shutting down tasks...")
             for t in tasks: t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
         finally:
-            print("[Miner] Closing connection...")
+            self.logger("[Miner] Closing connection...")
             await cli.close()
             self._stop.set()  # Ensure threads know
-            print("[Miner] Shutdown complete.")
+            self.logger("[Miner] Shutdown complete.")

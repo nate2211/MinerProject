@@ -211,6 +211,7 @@ class MinerWorker(QThread):
                 password=self.cfg.password,
                 threads=int(self.cfg.threads),
                 agent=self.cfg.agent.strip() or "py-blockminer/0.1",
+                logger=self.log_line.emit
             )
 
             last_stats: Dict[str, Any] = {}

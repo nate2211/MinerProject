@@ -11,10 +11,11 @@ from ctypes.util import find_library
 
 
 class RandomX:
-    def __init__(self) -> None:
-        print("[RandomX] Loading DLL...")
+    def __init__(self, logger = None) -> None:
+        self.logger = logger
+        self.logger("[RandomX] Loading DLL...")
         self.lib = self._load_randomx()
-        print(f"[RandomX] DLL Loaded: {self.lib}")
+        self.logger(f"[RandomX] DLL Loaded: {self.lib}")
 
         self._bind()
 
@@ -27,7 +28,7 @@ class RandomX:
         self._dataset = None
 
         self._dataset_items: int = int(self.randomx_dataset_item_count())
-        print(f"[RandomX] Flags: {self._flags}, Dataset Items: {self._dataset_items}")
+        self.logger(f"[RandomX] Flags: {self._flags}, Dataset Items: {self._dataset_items}")
 
     def _load_randomx(self) -> CDLL:
         # 1. Try environment variable
@@ -36,7 +37,7 @@ class RandomX:
             try:
                 return CDLL(env)
             except Exception as e:
-                print(f"[RandomX] Warning: Could not load from RANDOMX_LIB={env}: {e}")
+                self.logger(f"[RandomX] Warning: Could not load from RANDOMX_LIB={env}: {e}")
 
         # 2. Try common names
         candidates = ["./randomx-dll.dll", "randomx.dll", "librandomx.so", "librandomx.dylib"]
@@ -105,7 +106,7 @@ class RandomX:
             if seed_hash == self._seed and self._cache is not None and self._dataset is not None:
                 return
 
-            print(f"[RandomX] New Seed Detected! Initializing Dataset (this takes time)...")
+            self.logger(f"[RandomX] New Seed Detected! Initializing Dataset (this takes time)...")
             t0 = time.time()
 
             if self._dataset is not None:
@@ -126,12 +127,12 @@ class RandomX:
             if not self._dataset:
                 raise MemoryError("Failed to allocate RandomX Dataset (Do you have 3GB+ RAM free?)")
 
-            print(f"[RandomX] Building Dataset... (Please Wait)")
+            self.logger(f"[RandomX] Building Dataset... (Please Wait)")
             self.randomx_init_dataset(self._dataset, self._cache, c_uint64(0), c_uint64(self._dataset_items))
 
             self._seed = seed_hash
             dt = time.time() - t0
-            print(f"[RandomX] Dataset Ready! (Took {dt:.2f} seconds)")
+            self.logger(f"[RandomX] Dataset Ready! (Took {dt:.2f} seconds)")
 
     def create_vm(self) -> c_void_p:
         with self._lock:

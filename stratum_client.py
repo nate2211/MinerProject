@@ -25,7 +25,8 @@ class StratumClient:
     Robust JSON-RPC-over-TCP stratum client.
     """
 
-    def __init__(self, host: str, port: int, *, timeout: float = 30.0) -> None:
+    def __init__(self, host: str, port: int, *, timeout: float = 30.0, logger = None) -> None:
+        self.logger = logger
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -42,13 +43,13 @@ class StratumClient:
         self._extensions: Tuple[str, ...] = ()
 
     async def connect(self) -> None:
-        print(f"[stratum] Connecting to {self.host}:{self.port}...")
+        self.logger(f"[stratum] Connecting to {self.host}:{self.port}...")
         try:
             self._r, self._w = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
                 timeout=self.timeout,
             )
-            print("[stratum] Connected!")
+            self.logger("[stratum] Connected!")
         except Exception as e:
             raise RuntimeError(f"Could not connect to {self.host}:{self.port} -> {e}")
 
@@ -113,7 +114,7 @@ class StratumClient:
                 line_bytes = await self._r.readline()
                 if not line_bytes:
                     # Empty bytes means the server closed the connection
-                    print("[stratum] Server closed connection (EOF)")
+                    self.logger("[stratum] Server closed connection (EOF)")
                     break
 
                 line = line_bytes.decode("utf-8", errors="replace").strip()
@@ -123,7 +124,7 @@ class StratumClient:
                 try:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
-                    print(f"[stratum] Warning: Ignored garbage data: {line[:50]}...")
+                    self.logger(f"[stratum] Warning: Ignored garbage data: {line[:50]}...")
                     continue
 
                 # 1. Is it a Response to our request? (Has 'id')
@@ -146,7 +147,7 @@ class StratumClient:
                     continue
 
             except Exception as e:
-                print(f"[stratum] Read loop error: {e}")
+                self.logger(f"[stratum] Read loop error: {e}")
                 break
 
         # Cleanup when loop exits
@@ -162,7 +163,7 @@ class StratumClient:
         if algos is None:
             algos = ["rx/0"]
 
-        print(f"[stratum] Logging in as {wallet[:6]}...")
+        self.logger(f"[stratum] Logging in as {wallet[:6]}...")
         # XMRig-compatible login
         resp = await self.call("login", {
             "login": wallet,
@@ -182,7 +183,7 @@ class StratumClient:
         exts = tuple(result.get("extensions") or [])
 
         if not job:
-            print("[stratum] Login successful, waiting for first job...")
+            self.logger("[stratum] Login successful, waiting for first job...")
 
         self._client_id = cid
         self._extensions = exts
