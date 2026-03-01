@@ -64,12 +64,15 @@ class BlockNetClient:
             h.update(extra)
         return h
 
-    def _conn(self) -> Tuple[http.client.HTTPConnection, str]:
+
+    def _conn(self, timeout: Optional[int] = None) -> Tuple[http.client.HTTPConnection, str]:
         scheme, host, port, base_path = self._parse()
+        to = self.timeout if timeout is None else int(timeout)
+
         if scheme == "https":
-            conn: http.client.HTTPConnection = http.client.HTTPSConnection(host, port, timeout=self.timeout)
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(host, port, timeout=to)
         else:
-            conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+            conn = http.client.HTTPConnection(host, port, timeout=to)
         return conn, base_path
 
     @staticmethod
@@ -84,19 +87,16 @@ class BlockNetClient:
         return p
 
     def _request(
-        self,
-        method: str,
-        path: str,
-        body: bytes = b"",
-        headers: Optional[Dict[str, str]] = None,
-        *,
-        follow_redirects_for_get: bool = True,
+            self,
+            method: str,
+            path: str,
+            body: bytes = b"",
+            headers: Optional[Dict[str, str]] = None,
+            *,
+            follow_redirects_for_get: bool = True,
+            timeout: Optional[int] = None,  # NEW
     ) -> Tuple[int, Dict[str, str], bytes]:
-        """
-        Returns: (status, headers, body_bytes)
-        Follows redirects for GET (useful for /v1/get?key=... which may redirect).
-        """
-        conn, base_path = self._conn()
+        conn, base_path = self._conn(timeout=timeout)
         full_path = self._normalize_path(base_path, path)
 
         try:
@@ -106,12 +106,10 @@ class BlockNetClient:
             status = int(res.status)
             hdrs = dict(res.getheaders())
 
-            # Redirect handling for GET only (safe default)
             if follow_redirects_for_get and method.upper() == "GET" and status in (301, 302, 303, 307, 308):
                 loc = res.getheader("Location") or ""
                 conn.close()
                 if loc:
-                    # Location may be absolute or relative
                     if loc.startswith("http://") or loc.startswith("https://"):
                         u = urlparse(loc)
                         new_scheme = u.scheme.lower() or "http"
@@ -121,10 +119,11 @@ class BlockNetClient:
                         if u.query:
                             new_path += "?" + u.query
 
+                        to = self.timeout if timeout is None else int(timeout)
                         if new_scheme == "https":
-                            c2 = http.client.HTTPSConnection(new_host, new_port, timeout=self.timeout)
+                            c2 = http.client.HTTPSConnection(new_host, new_port, timeout=to)
                         else:
-                            c2 = http.client.HTTPConnection(new_host, new_port, timeout=self.timeout)
+                            c2 = http.client.HTTPConnection(new_host, new_port, timeout=to)
 
                         try:
                             c2.request("GET", new_path, body=b"", headers=self._headers(headers))
@@ -134,11 +133,12 @@ class BlockNetClient:
                         finally:
                             c2.close()
                     else:
-                        # relative redirect stays on same relay/base_path
-                        return self._request("GET", loc, b"", headers=headers, follow_redirects_for_get=True)
+                        return self._request("GET", loc, b"", headers=headers, follow_redirects_for_get=True,
+                                             timeout=timeout)
 
             conn.close()
             return status, hdrs, data
+
         except Exception as e:
             try:
                 conn.close()
@@ -146,7 +146,6 @@ class BlockNetClient:
                 pass
             msg = str(e).encode("utf-8", errors="replace")
             return 0, {}, msg
-
     @staticmethod
     def _as_json(status: int, data: bytes, hdrs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         try:
@@ -165,23 +164,26 @@ class BlockNetClient:
     # ---------------- generic JSON helpers ----------------
 
     def request_raw(
-        self,
-        method: str,
-        path: str,
-        *,
-        body: bytes = b"",
-        headers: Optional[Dict[str, str]] = None,
+            self,
+            method: str,
+            path: str,
+            *,
+            body: bytes = b"",
+            headers: Optional[Dict[str, str]] = None,
+            timeout: Optional[int] = None,  # NEW
     ) -> Tuple[int, Dict[str, str], bytes]:
-        return self._request(method, path, body=body, headers=headers)
+        return self._request(method, path, body=body, headers=headers, timeout=timeout)
 
     def request_json(
-        self,
-        method: str,
-        path: str,
-        obj: Optional[Dict[str, Any]] = None,
+            self,
+            method: str,
+            path: str,
+            obj: Optional[Dict[str, Any]] = None,
+            *,
+            timeout: Optional[int] = None,  # NEW
     ) -> Dict[str, Any]:
         if obj is None:
-            status, hdrs, data = self._request(method, path, body=b"", headers=None)
+            status, hdrs, data = self._request(method, path, body=b"", headers=None, timeout=timeout)
             return self._as_json(status, data, hdrs)
 
         body = json.dumps(obj).encode("utf-8")
@@ -190,9 +192,9 @@ class BlockNetClient:
             path,
             body=body,
             headers={"Content-Type": "application/json"},
+            timeout=timeout,
         )
         return self._as_json(status, data, hdrs)
-
     # ---------------- existing BlockNet endpoints ----------------
 
     def stats(self) -> Dict[str, Any]:
@@ -277,9 +279,9 @@ class BlockNetClient:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/randomx/hash_batch", dict(body))
 
-    def api_randomx_scan(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
+    def api_randomx_scan(self, body: Dict[str, Any], *, prefix: str = "/v1", timeout: int = 300) -> Dict[str, Any]:
         p = self._pfx(prefix)
-        return self.request_json("POST", f"{p}/randomx/scan", dict(body))
+        return self.request_json("POST", f"{p}/randomx/scan", dict(body), timeout=timeout)
 
     def api_web_fetch(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
@@ -316,6 +318,7 @@ class BlockNetClient:
     def api_p2pool_close(self, session: str, *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/p2pool/close", {"session": session})
-    def api_p2pool_scan(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
+
+    def api_p2pool_scan(self, body: Dict[str, Any], *, prefix: str = "/v1", timeout: int = 300) -> Dict[str, Any]:
         p = self._pfx(prefix)
-        return self.request_json("POST", f"{p}/p2pool/scan", dict(body))
+        return self.request_json("POST", f"{p}/p2pool/scan", dict(body), timeout=timeout)

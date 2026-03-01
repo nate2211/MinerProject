@@ -40,7 +40,7 @@ class BlockNetApiCfg:
     relay: str
     token: str = ""
     prefix: str = "/v1"
-    timeout_s: float = 10.0
+    timeout_s: float = 100
     verify_tls: bool = False
     force_scheme: Optional[str] = None
 
