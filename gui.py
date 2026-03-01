@@ -37,15 +37,11 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
 )
 
-# --- your miner core ---
 from miner_core import Miner
 
-# --- optional: use your BlockNet blocks (keeps your "block structure") ---
 from registry import BLOCKS
 import blocks_blocknet  # registers blocknet_heartbeat / blocknet_put
 
-
-# ----------------------------- Paths + config -----------------------------
 
 def app_data_dir(app_name: str = "MoneroMinerGUI") -> Path:
     base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
@@ -56,8 +52,6 @@ def app_data_dir(app_name: str = "MoneroMinerGUI") -> Path:
 
 CFG_PATH = app_data_dir() / "miner_gui_config.json"
 
-
-# ----------------------------- Theme -----------------------------
 
 def apply_dark_theme(app: QApplication) -> None:
     app.setStyle("Fusion")
@@ -138,8 +132,6 @@ def apply_dark_theme(app: QApplication) -> None:
     """)
 
 
-# ----------------------------- Worker thread -----------------------------
-
 @dataclass
 class MinerConfig:
     stratum: str
@@ -149,12 +141,20 @@ class MinerConfig:
     agent: str
     randomx_lib: str
 
-    # BlockNet (optional)
+    # BlockNet reporting (optional)
     use_blocknet: bool
     blocknet_relay: str
     blocknet_token: str
     blocknet_id: str
     blocknet_key: str
+
+    # BlockNet mining backends (optional)
+    use_bn_p2pool: bool
+    use_bn_randomx: bool
+    bn_api_relay: str
+    bn_api_token: str
+    bn_api_prefix: str
+    bn_rx_batch: int
 
 
 class MinerWorker(QThread):
@@ -167,21 +167,18 @@ class MinerWorker(QThread):
         super().__init__()
         self.cfg = cfg
         self._miner: Optional[Miner] = None
-        self._stop_requested = False
 
-        # optional BlockNet blocks (keep your "block structure")
         self._bn_heartbeat = None
         self._bn_put = None
 
     def stop(self) -> None:
-        self._stop_requested = True
         if self._miner:
             try:
                 self._miner.stop()
             except Exception:
                 pass
 
-    def _setup_blocknet(self) -> None:
+    def _setup_blocknet_reporting(self) -> None:
         if not self.cfg.use_blocknet:
             return
         if not self.cfg.blocknet_relay.strip():
@@ -195,23 +192,38 @@ class MinerWorker(QThread):
         try:
             self.state_changed.emit("RUNNING")
 
-            # Set RandomX lib override (ctypes loader reads this)
-            if self.cfg.randomx_lib.strip():
+            # Only matters for LOCAL RandomX
+            if (not self.cfg.use_bn_randomx) and self.cfg.randomx_lib.strip():
                 os.environ["RANDOMX_LIB"] = self.cfg.randomx_lib.strip()
 
-            self._setup_blocknet()
+            self._setup_blocknet_reporting()
 
-            host, port_s = self.cfg.stratum.rsplit(":", 1)
-            port = int(port_s)
+            # Stratum host/port is only required when NOT using BlockNet P2Pool backend
+            stratum = (self.cfg.stratum or "").strip()
+            if ":" in stratum:
+                host, port_s = stratum.rsplit(":", 1)
+                host = host.strip() or "127.0.0.1"
+                port = int(port_s)
+            else:
+                host = "127.0.0.1"
+                port = 3333
 
             self._miner = Miner(
-                stratum_host=host.strip(),
+                stratum_host=host,
                 stratum_port=port,
                 wallet=self.cfg.wallet.strip(),
                 password=self.cfg.password,
                 threads=int(self.cfg.threads),
                 agent=self.cfg.agent.strip() or "py-blockminer/0.1",
-                logger=self.log_line.emit
+                logger=self.log_line.emit,
+
+                use_blocknet_p2pool=bool(self.cfg.use_bn_p2pool),
+                blocknet_api_relay=self.cfg.bn_api_relay.strip(),
+                blocknet_api_token=self.cfg.bn_api_token.strip(),
+                blocknet_api_prefix=(self.cfg.bn_api_prefix.strip() or "/v1"),
+
+                use_blocknet_randomx=bool(self.cfg.use_bn_randomx),
+                randomx_batch_size=int(self.cfg.bn_rx_batch),
             )
 
             last_stats: Dict[str, Any] = {}
@@ -221,17 +233,19 @@ class MinerWorker(QThread):
                 last_stats = dict(stats or {})
                 self.stats_updated.emit(last_stats)
 
-                # Lightweight, readable periodic line
                 hps = float(last_stats.get("hashrate_hs") or 0.0)
                 acc = int(last_stats.get("accepted") or 0)
                 rej = int(last_stats.get("rejected") or 0)
                 height = last_stats.get("height")
                 job_id = (last_stats.get("job_id") or "")[:10]
+                b_p2 = last_stats.get("backend_p2pool")
+                b_rx = last_stats.get("backend_randomx")
+
                 self.log_line.emit(
-                    f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | job={job_id}"
+                    f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | job={job_id} | p2pool={b_p2} rx={b_rx}"
                 )
 
-                # Optional BlockNet reporting (in-thread)
+                # Optional BlockNet reporting
                 if self._bn_heartbeat:
                     try:
                         self._bn_heartbeat.execute(
@@ -260,22 +274,16 @@ class MinerWorker(QThread):
                     except Exception as e:
                         self.log_line.emit(f"[blocknet] put error: {e}")
 
-            # Run miner (this blocks until stop / error)
-            try:
-                import asyncio
-                asyncio.run(self._miner.run(on_stats=on_stats))
-            except KeyboardInterrupt:
-                pass
+            import asyncio
+            asyncio.run(self._miner.run(on_stats=on_stats))
 
             self.state_changed.emit("STOPPED")
 
-        except Exception as e:
+        except Exception:
             import traceback
             self.state_changed.emit("STOPPED")
             self.fatal_error.emit(traceback.format_exc())
 
-
-# ----------------------------- GUI -----------------------------
 
 def _mono_font() -> QFont:
     f = QFont("Consolas")
@@ -292,14 +300,12 @@ class MainWindow(QMainWindow):
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
 
-        # root layout
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # header
         header = QHBoxLayout()
         title = QLabel("Monero Miner")
         tf = QFont()
@@ -310,19 +316,16 @@ class MainWindow(QMainWindow):
         self.pill = QLabel("STOPPED")
         self.pill.setObjectName("Pill")
 
-
         header.addWidget(title)
         header.addStretch(1)
         header.addWidget(self.pill)
         root.addLayout(header)
 
-        # main splitter
         self.main_split = QSplitter(Qt.Horizontal)
         self.main_split.setChildrenCollapsible(False)
         self.main_split.setHandleWidth(10)
         root.addWidget(self.main_split, 1)
 
-        # LEFT: controls (vertical splitter)
         self.left_split = QSplitter(Qt.Vertical)
         self.left_split.setChildrenCollapsible(False)
         self.left_split.setHandleWidth(10)
@@ -330,7 +333,6 @@ class MainWindow(QMainWindow):
         self.left_split.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.main_split.addWidget(self.left_split)
 
-        # RIGHT: tabs (dashboard/log/raw)
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
@@ -342,9 +344,8 @@ class MainWindow(QMainWindow):
         self.main_split.setStretchFactor(0, 1)
         self.main_split.setStretchFactor(1, 2)
 
-        # ---- Controls groups ----
+        # ---------------- Controls groups ----------------
 
-        # Mining connection
         gb_conn = QGroupBox("Mining (P2Pool Stratum)")
         fl = QFormLayout(gb_conn)
 
@@ -360,7 +361,6 @@ class MainWindow(QMainWindow):
 
         self.left_split.addWidget(gb_conn)
 
-        # Performance
         gb_perf = QGroupBox("Performance")
         pfl = QFormLayout(gb_perf)
 
@@ -373,11 +373,10 @@ class MainWindow(QMainWindow):
         self.btn_browse_randomx.clicked.connect(self._browse_randomx)
 
         pfl.addRow("Threads", self.sp_threads)
-        pfl.addRow("RandomX lib (optional)", self._hbox(self.ed_randomx, self.btn_browse_randomx))
+        pfl.addRow("RandomX lib (local only)", self._hbox(self.ed_randomx, self.btn_browse_randomx))
 
         self.left_split.addWidget(gb_perf)
 
-        # BlockNet reporting
         gb_bn = QGroupBox("BlockNet Reporting (optional)")
         bfl = QFormLayout(gb_bn)
 
@@ -398,7 +397,30 @@ class MainWindow(QMainWindow):
 
         self.left_split.addWidget(gb_bn)
 
-        # Controls
+        gb_bn_mine = QGroupBox("BlockNet Mining Backends (optional)")
+        mfl = QFormLayout(gb_bn_mine)
+
+        self.cb_bn_p2pool = QCheckBox("Use BlockNet P2Pool API (instead of direct Stratum TCP)")
+        self.cb_bn_randomx = QCheckBox("Use BlockNet RandomX API (remote hashing)")
+
+        self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
+        self.ed_bn_api_token = QLineEdit("")
+        self.ed_bn_api_token.setEchoMode(QLineEdit.Password)
+        self.ed_bn_api_prefix = QLineEdit("/v1")
+
+        self.sp_bn_rx_batch = QSpinBox()
+        self.sp_bn_rx_batch.setRange(1, 4096)
+        self.sp_bn_rx_batch.setValue(64)
+
+        mfl.addRow(self.cb_bn_p2pool)
+        mfl.addRow(self.cb_bn_randomx)
+        mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
+        mfl.addRow("API Token", self.ed_bn_api_token)
+        mfl.addRow("API Prefix", self.ed_bn_api_prefix)
+        mfl.addRow("RandomX batch size", self.sp_bn_rx_batch)
+
+        self.left_split.addWidget(gb_bn_mine)
+
         gb_ctrl = QGroupBox("Controls")
         cl = QVBoxLayout(gb_ctrl)
 
@@ -410,6 +432,7 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self._start)
         self.btn_stop.clicked.connect(self._stop)
         self._set_running(False)
+
         btn_row.addWidget(self.btn_start)
         btn_row.addWidget(self.btn_stop)
         cl.addLayout(btn_row)
@@ -430,9 +453,8 @@ class MainWindow(QMainWindow):
 
         self.left_split.addWidget(gb_ctrl)
 
-        # ---- Right tabs ----
+        # ---------------- Right tabs ----------------
 
-        # Dashboard tab
         dash = QWidget()
         dl = QVBoxLayout(dash)
         dl.setContentsMargins(10, 10, 10, 10)
@@ -459,7 +481,6 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(dash, "Dashboard")
 
-        # Log tab
         log = QWidget()
         ll = QVBoxLayout(log)
         ll.setContentsMargins(10, 10, 10, 10)
@@ -469,7 +490,6 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.txt_log)
         self.tabs.addTab(log, "Log")
 
-        # Raw stats tab
         raw = QWidget()
         rl = QVBoxLayout(raw)
         rl.setContentsMargins(10, 10, 10, 10)
@@ -479,21 +499,15 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.txt_raw)
         self.tabs.addTab(raw, "Raw Stats")
 
-        # timers
         self.uptime_timer = QTimer(self)
         self.uptime_timer.setInterval(500)
         self.uptime_timer.timeout.connect(self._tick_uptime)
 
-        # initial sizing
-        self.left_split.setSizes([220, 150, 200, 120])
-        self.main_split.setSizes([520, 900])
+        self.left_split.setSizes([220, 150, 200, 200, 120])
+        self.main_split.setSizes([560, 900])
 
-        # load config
         self._load_cfg()
-
         self.statusBar().showMessage("Ready")
-
-    # ---------- helpers ----------
 
     @staticmethod
     def _hbox(*widgets: QWidget) -> QWidget:
@@ -511,7 +525,6 @@ class MainWindow(QMainWindow):
             return
         self.txt_log.appendPlainText(s)
 
-        # cap blocks
         MAX_BLOCKS = 5000
         doc = self.txt_log.document()
         if doc.blockCount() > MAX_BLOCKS:
@@ -560,8 +573,6 @@ class MainWindow(QMainWindow):
         s = dt % 60
         self.lbl_uptime.setText(f"Uptime: {h:02d}:{m:02d}:{s:02d}")
 
-    # ---------- start/stop ----------
-
     def _start(self) -> None:
         if self.worker and self.worker.isRunning():
             return
@@ -573,14 +584,26 @@ class MainWindow(QMainWindow):
         threads = int(self.sp_threads.value())
         randomx_lib = self.ed_randomx.text().strip()
 
-        if ":" not in stratum:
-            QMessageBox.critical(self, "Invalid Stratum", "Stratum must be in the form host:port (e.g. 127.0.0.1:3333).")
-            return
+        use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
+        use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
+
         if not wallet:
             QMessageBox.critical(self, "Missing Wallet", "Please enter your Monero wallet address.")
             return
 
-        use_bn = bool(self.cb_bn.isChecked())
+        # Stratum is only required if NOT using BlockNet P2Pool backend
+        if (not use_bn_p2pool) and (":" not in stratum):
+            QMessageBox.critical(self, "Invalid Stratum", "Stratum must be host:port (e.g. 127.0.0.1:3333).")
+            return
+
+        # If any BlockNet mining backend enabled, require API relay
+        bn_api_relay = self.ed_bn_api_relay.text().strip()
+        if (use_bn_p2pool or use_bn_randomx) and not bn_api_relay:
+            QMessageBox.critical(self, "Missing BlockNet API Relay", "Please enter BlockNet API relay host:port (e.g. 1.2.3.4:38888).")
+            return
+
+        use_bn_reporting = bool(self.cb_bn.isChecked())
+
         cfg = MinerConfig(
             stratum=stratum,
             wallet=wallet,
@@ -589,11 +612,18 @@ class MainWindow(QMainWindow):
             agent=agent,
             randomx_lib=randomx_lib,
 
-            use_blocknet=use_bn,
+            use_blocknet=use_bn_reporting,
             blocknet_relay=self.ed_bn_relay.text().strip(),
             blocknet_token=self.ed_bn_token.text().strip(),
             blocknet_id=self.ed_bn_id.text().strip() or "miner1",
             blocknet_key=self.ed_bn_key.text().strip(),
+
+            use_bn_p2pool=use_bn_p2pool,
+            use_bn_randomx=use_bn_randomx,
+            bn_api_relay=bn_api_relay,
+            bn_api_token=self.ed_bn_api_token.text().strip(),
+            bn_api_prefix=self.ed_bn_api_prefix.text().strip() or "/v1",
+            bn_rx_batch=int(self.sp_bn_rx_batch.value()),
         )
 
         self._save_cfg()
@@ -636,7 +666,6 @@ class MainWindow(QMainWindow):
         self._tick_uptime()
 
     def _on_stats(self, stats: dict) -> None:
-        # Pretty dashboard
         hps = float(stats.get("hashrate_hs") or 0.0)
         acc = int(stats.get("accepted") or 0)
         rej = int(stats.get("rejected") or 0)
@@ -644,15 +673,14 @@ class MainWindow(QMainWindow):
         th = int(stats.get("threads") or self.sp_threads.value())
 
         self.lbl_hashrate.setText(f"{hps:,.0f} H/s")
-        self.lbl_sub.setText(f"Accepted: {acc}    Rejected: {rej}    Height: {height if height is not None else '—'}    Threads: {th}")
+        self.lbl_sub.setText(
+            f"Accepted: {acc}    Rejected: {rej}    Height: {height if height is not None else '—'}    Threads: {th}"
+        )
 
-        # Raw JSON
         try:
             self.txt_raw.setPlainText(json.dumps(stats, indent=2))
         except Exception:
             self.txt_raw.setPlainText(str(stats))
-
-    # ---------- config ----------
 
     def _save_cfg(self) -> None:
         try:
@@ -669,6 +697,13 @@ class MainWindow(QMainWindow):
                 "blocknet_token": self.ed_bn_token.text().strip(),
                 "blocknet_id": self.ed_bn_id.text().strip(),
                 "blocknet_key": self.ed_bn_key.text().strip(),
+
+                "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
+                "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
+                "bn_api_relay": self.ed_bn_api_relay.text().strip(),
+                "bn_api_token": self.ed_bn_api_token.text().strip(),
+                "bn_api_prefix": self.ed_bn_api_prefix.text().strip(),
+                "bn_rx_batch": int(self.sp_bn_rx_batch.value()),
             }
             CFG_PATH.write_text(json.dumps(j, indent=2), encoding="utf-8")
             self.statusBar().showMessage("Config saved", 1500)
@@ -694,14 +729,18 @@ class MainWindow(QMainWindow):
             self.ed_bn_id.setText(j.get("blocknet_id", self.ed_bn_id.text()))
             self.ed_bn_key.setText(j.get("blocknet_key", self.ed_bn_key.text()))
 
+            self.cb_bn_p2pool.setChecked(bool(j.get("bn_p2pool", False)))
+            self.cb_bn_randomx.setChecked(bool(j.get("bn_randomx", False)))
+            self.ed_bn_api_relay.setText(j.get("bn_api_relay", self.ed_bn_api_relay.text()))
+            self.ed_bn_api_token.setText(j.get("bn_api_token", self.ed_bn_api_token.text()))
+            self.ed_bn_api_prefix.setText(j.get("bn_api_prefix", self.ed_bn_api_prefix.text()))
+            self.sp_bn_rx_batch.setValue(int(j.get("bn_rx_batch", int(self.sp_bn_rx_batch.value()))))
+
             self.statusBar().showMessage("Config loaded", 1500)
         except Exception as e:
             self.statusBar().showMessage(f"Config load failed: {e}", 2000)
 
-    # ---------- window lifecycle ----------
-
     def closeEvent(self, ev) -> None:
-        # stop miner cleanly
         try:
             if self.worker and self.worker.isRunning():
                 self.worker.stop()
