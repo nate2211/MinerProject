@@ -4,6 +4,7 @@ block_cipher = None
 
 # List your hidden imports to ensure they are packed
 hidden_imports = [
+    "blocknet_mining_backend.py",
     'blocks_blocknet',
     'blocks_miner',
     'blocknet_client',
