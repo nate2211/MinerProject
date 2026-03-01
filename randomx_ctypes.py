@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 from ctypes import (
-    CDLL, c_int, c_void_p, c_size_t, c_uint64, c_ubyte, POINTER, byref, create_string_buffer
+    CDLL, c_int, c_void_p, c_size_t, c_uint64, c_ubyte, POINTER, byref, create_string_buffer,addressof, c_void_p
 )
 from ctypes.util import find_library
 

@@ -158,6 +158,9 @@ class BlockNetP2PoolBackend:
       POST /v1/p2pool/job    {"session":"..."}
       POST /v1/p2pool/submit {"session":"...","job_id":"...","nonce":"...","result":"..."}
       POST /v1/p2pool/close  {"session":"..."}
+
+      (optional)
+      POST /v1/p2pool/scan   {"session":"...","start_nonce":0,"iters":200000,"max_results":4,"nonce_offset":39,"poll_first":false}
     """
 
     def __init__(self, cfg: BlockNetApiCfg, *, logger: Optional[Callable[[str], None]] = None) -> None:
@@ -218,6 +221,51 @@ class BlockNetP2PoolBackend:
             raise RuntimeError(f"BlockNet p2pool submit failed: {j}")
         return j
 
+    # -------- NEW: scan (sync+async) --------
+
+    def scan_sync(
+        self,
+        *,
+        start_nonce: int,
+        iters: int = 200_000,
+        max_results: int = 4,
+        nonce_offset: Optional[int] = None,
+        poll_first: bool = False,
+    ) -> JsonDict:
+        if not self._opened or not self.session:
+            raise RuntimeError("p2pool session not open")
+        payload: JsonDict = {
+            "session": self.session,
+            "start_nonce": int(start_nonce) & 0xFFFFFFFF,
+            "iters": int(iters),
+            "max_results": int(max_results),
+            "poll_first": bool(poll_first),
+        }
+        if nonce_offset is not None:
+            payload["nonce_offset"] = int(nonce_offset)
+        j = _post_json_sync(self.cfg, "/p2pool/scan", payload)
+        if not j.get("ok"):
+            raise RuntimeError(f"BlockNet p2pool scan failed: {j}")
+        return j
+
+    async def scan(
+        self,
+        *,
+        start_nonce: int,
+        iters: int = 200_000,
+        max_results: int = 4,
+        nonce_offset: Optional[int] = None,
+        poll_first: bool = False,
+    ) -> JsonDict:
+        return await asyncio.to_thread(
+            self.scan_sync,
+            start_nonce=start_nonce,
+            iters=iters,
+            max_results=max_results,
+            nonce_offset=nonce_offset,
+            poll_first=poll_first,
+        )
+
     async def close(self) -> None:
         if not self._opened:
             return
@@ -235,6 +283,7 @@ class BlockNetRandomXHasher:
     Docs:
       POST /v1/randomx/hash
       POST /v1/randomx/hash_batch
+      POST /v1/randomx/scan   (optional, if server implements it)
     """
 
     def __init__(
@@ -308,6 +357,61 @@ class BlockNetRandomXHasher:
             items.append(bytes(b))
 
         return self.hash_batch_sync(items)
+
+    # -------- NEW: scan (sync+async) --------
+
+    def scan_sync(
+        self,
+        *,
+        blob: bytes,
+        nonce_offset: int,
+        start_nonce: int,
+        iters: int,
+        target64: int,
+        max_results: int = 4,
+    ) -> JsonDict:
+        if not self._seed_hex:
+            raise RuntimeError("seed not set")
+
+        b = bytes(blob or b"")
+        off = int(nonce_offset)
+        if off < 0 or off + 4 > len(b):
+            raise ValueError(f"nonce_offset out of range: {off} for blob_len={len(b)}")
+
+        payload: JsonDict = {
+            "seed_hex": self._seed_hex,
+            "blob_b64": _b64e(b),
+            "nonce_offset": off,
+            "start_nonce": int(start_nonce) & 0xFFFFFFFF,
+            "iters": int(iters),
+            "target64": int(target64),
+            "max_results": int(max_results),
+        }
+
+        j = _post_json_sync(self.cfg, "/randomx/scan", payload)
+        if not j.get("ok"):
+            raise RuntimeError(f"BlockNet randomx/scan failed: {j}")
+        return j
+
+    async def scan(
+        self,
+        *,
+        blob: bytes,
+        nonce_offset: int,
+        start_nonce: int,
+        iters: int,
+        target64: int,
+        max_results: int = 4,
+    ) -> JsonDict:
+        return await asyncio.to_thread(
+            self.scan_sync,
+            blob=blob,
+            nonce_offset=nonce_offset,
+            start_nonce=start_nonce,
+            iters=iters,
+            target64=target64,
+            max_results=max_results,
+        )
 
     # -------- async helpers (optional) --------
 

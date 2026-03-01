@@ -276,7 +276,11 @@ class BlockNetClient:
     def api_randomx_hash_batch(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/randomx/hash_batch", dict(body))
-    # web
+
+    def api_randomx_scan(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
+        p = self._pfx(prefix)
+        return self.request_json("POST", f"{p}/randomx/scan", dict(body))
+
     def api_web_fetch(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/web/fetch", dict(body))
@@ -312,3 +316,6 @@ class BlockNetClient:
     def api_p2pool_close(self, session: str, *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/p2pool/close", {"session": session})
+    def api_p2pool_scan(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
+        p = self._pfx(prefix)
+        return self.request_json("POST", f"{p}/p2pool/scan", dict(body))

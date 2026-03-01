@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -151,6 +152,11 @@ class MinerConfig:
     # BlockNet mining backends (optional)
     use_bn_p2pool: bool
     use_bn_randomx: bool
+
+    # NEW (optional scan toggles)
+    use_bn_p2pool_scan: bool
+    use_bn_randomx_scan: bool
+
     bn_api_relay: str
     bn_api_token: str
     bn_api_prefix: str
@@ -208,7 +214,8 @@ class MinerWorker(QThread):
                 host = "127.0.0.1"
                 port = 3333
 
-            self._miner = Miner(
+            # Build kwargs defensively so this GUI works with older Miner versions too
+            miner_kwargs: Dict[str, Any] = dict(
                 stratum_host=host,
                 stratum_port=port,
                 wallet=self.cfg.wallet.strip(),
@@ -225,6 +232,14 @@ class MinerWorker(QThread):
                 use_blocknet_randomx=bool(self.cfg.use_bn_randomx),
                 randomx_batch_size=int(self.cfg.bn_rx_batch),
             )
+
+            sig = inspect.signature(Miner.__init__)
+            if "use_blocknet_p2pool_scan" in sig.parameters:
+                miner_kwargs["use_blocknet_p2pool_scan"] = bool(self.cfg.use_bn_p2pool_scan)
+            if "use_blocknet_randomx_scan" in sig.parameters:
+                miner_kwargs["use_blocknet_randomx_scan"] = bool(self.cfg.use_bn_randomx_scan)
+
+            self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
 
@@ -300,6 +315,10 @@ class MainWindow(QMainWindow):
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
 
+        # For "Log focuses full width"
+        self._saved_main_split_sizes: Optional[list[int]] = None
+        self._log_focus_enabled: bool = False
+
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -338,6 +357,7 @@ class MainWindow(QMainWindow):
         right_l.setContentsMargins(0, 0, 0, 0)
 
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         right_l.addWidget(self.tabs)
         self.main_split.addWidget(right)
 
@@ -403,6 +423,10 @@ class MainWindow(QMainWindow):
         self.cb_bn_p2pool = QCheckBox("Use BlockNet P2Pool API (instead of direct Stratum TCP)")
         self.cb_bn_randomx = QCheckBox("Use BlockNet RandomX API (remote hashing)")
 
+        # NEW scan options
+        self.cb_bn_p2pool_scan = QCheckBox("Use BlockNet P2Pool scan (/p2pool/scan) — server-side scanning")
+        self.cb_bn_randomx_scan = QCheckBox("Use BlockNet RandomX scan (/randomx/scan) — server-side scanning")
+
         self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
         self.ed_bn_api_token = QLineEdit("")
         self.ed_bn_api_token.setEchoMode(QLineEdit.Password)
@@ -414,12 +438,18 @@ class MainWindow(QMainWindow):
 
         mfl.addRow(self.cb_bn_p2pool)
         mfl.addRow(self.cb_bn_randomx)
+        mfl.addRow(self.cb_bn_p2pool_scan)
+        mfl.addRow(self.cb_bn_randomx_scan)
         mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
         mfl.addRow("API Token", self.ed_bn_api_token)
         mfl.addRow("API Prefix", self.ed_bn_api_prefix)
         mfl.addRow("RandomX batch size", self.sp_bn_rx_batch)
 
         self.left_split.addWidget(gb_bn_mine)
+
+        self.cb_bn_p2pool.stateChanged.connect(self._sync_scan_checks)
+        self.cb_bn_randomx.stateChanged.connect(self._sync_scan_checks)
+        self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
         cl = QVBoxLayout(gb_ctrl)
@@ -483,7 +513,9 @@ class MainWindow(QMainWindow):
 
         log = QWidget()
         ll = QVBoxLayout(log)
-        ll.setContentsMargins(10, 10, 10, 10)
+        # maximize usable space in log view
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setFont(_mono_font())
@@ -503,11 +535,46 @@ class MainWindow(QMainWindow):
         self.uptime_timer.setInterval(500)
         self.uptime_timer.timeout.connect(self._tick_uptime)
 
-        self.left_split.setSizes([220, 150, 200, 200, 120])
+        self.left_split.setSizes([220, 150, 200, 220, 120])
         self.main_split.setSizes([560, 900])
 
         self._load_cfg()
         self.statusBar().showMessage("Ready")
+
+    def _sync_scan_checks(self) -> None:
+        p2 = bool(self.cb_bn_p2pool.isChecked())
+        rx = bool(self.cb_bn_randomx.isChecked())
+
+        # p2pool scan only makes sense with p2pool API enabled
+        self.cb_bn_p2pool_scan.setEnabled(p2)
+        if not p2:
+            self.cb_bn_p2pool_scan.setChecked(False)
+
+        # randomx scan only makes sense with randomx API enabled
+        self.cb_bn_randomx_scan.setEnabled(rx)
+        if not rx:
+            self.cb_bn_randomx_scan.setChecked(False)
+
+    def _on_tab_changed(self, idx: int) -> None:
+        # Make Log tab "cover settings fully" by hiding left panel while Log is selected.
+        tab_name = self.tabs.tabText(idx)
+        focus = (tab_name == "Log")
+        self._set_log_focus(focus)
+
+    def _set_log_focus(self, enable: bool) -> None:
+        if enable and not self._log_focus_enabled:
+            self._saved_main_split_sizes = self.main_split.sizes()
+            self.left_split.setVisible(False)
+            # ensure right expands now
+            self.main_split.setSizes([0, max(1, self.width())])
+            self._log_focus_enabled = True
+        elif (not enable) and self._log_focus_enabled:
+            self.left_split.setVisible(True)
+            if self._saved_main_split_sizes:
+                self.main_split.setSizes(self._saved_main_split_sizes)
+            else:
+                self.main_split.setSizes([560, 900])
+            self._log_focus_enabled = False
 
     @staticmethod
     def _hbox(*widgets: QWidget) -> QWidget:
@@ -586,6 +653,8 @@ class MainWindow(QMainWindow):
 
         use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
+        use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
+        use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
 
         if not wallet:
             QMessageBox.critical(self, "Missing Wallet", "Please enter your Monero wallet address.")
@@ -598,7 +667,7 @@ class MainWindow(QMainWindow):
 
         # If any BlockNet mining backend enabled, require API relay
         bn_api_relay = self.ed_bn_api_relay.text().strip()
-        if (use_bn_p2pool or use_bn_randomx) and not bn_api_relay:
+        if (use_bn_p2pool or use_bn_randomx or use_bn_p2pool_scan or use_bn_randomx_scan) and not bn_api_relay:
             QMessageBox.critical(self, "Missing BlockNet API Relay", "Please enter BlockNet API relay host:port (e.g. 1.2.3.4:38888).")
             return
 
@@ -620,6 +689,10 @@ class MainWindow(QMainWindow):
 
             use_bn_p2pool=use_bn_p2pool,
             use_bn_randomx=use_bn_randomx,
+
+            use_bn_p2pool_scan=use_bn_p2pool_scan,
+            use_bn_randomx_scan=use_bn_randomx_scan,
+
             bn_api_relay=bn_api_relay,
             bn_api_token=self.ed_bn_api_token.text().strip(),
             bn_api_prefix=self.ed_bn_api_prefix.text().strip() or "/v1",
@@ -700,6 +773,11 @@ class MainWindow(QMainWindow):
 
                 "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
                 "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
+
+                # NEW
+                "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
+                "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
+
                 "bn_api_relay": self.ed_bn_api_relay.text().strip(),
                 "bn_api_token": self.ed_bn_api_token.text().strip(),
                 "bn_api_prefix": self.ed_bn_api_prefix.text().strip(),
@@ -731,11 +809,17 @@ class MainWindow(QMainWindow):
 
             self.cb_bn_p2pool.setChecked(bool(j.get("bn_p2pool", False)))
             self.cb_bn_randomx.setChecked(bool(j.get("bn_randomx", False)))
+
+            # NEW
+            self.cb_bn_p2pool_scan.setChecked(bool(j.get("bn_p2pool_scan", False)))
+            self.cb_bn_randomx_scan.setChecked(bool(j.get("bn_randomx_scan", False)))
+
             self.ed_bn_api_relay.setText(j.get("bn_api_relay", self.ed_bn_api_relay.text()))
             self.ed_bn_api_token.setText(j.get("bn_api_token", self.ed_bn_api_token.text()))
             self.ed_bn_api_prefix.setText(j.get("bn_api_prefix", self.ed_bn_api_prefix.text()))
             self.sp_bn_rx_batch.setValue(int(j.get("bn_rx_batch", int(self.sp_bn_rx_batch.value()))))
 
+            self._sync_scan_checks()
             self.statusBar().showMessage("Config loaded", 1500)
         except Exception as e:
             self.statusBar().showMessage(f"Config load failed: {e}", 2000)

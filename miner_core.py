@@ -40,10 +40,14 @@ class JobState:
         self._job: Optional[MoneroJob] = None
         self._seq = 0
 
+        # NEW: shared nonce allocator (prevents overlap across worker threads)
+        self._nonce_cursor = secrets.randbits(32)
+
     def set(self, job: MoneroJob) -> None:
         with self._cv:
             self._job = job
             self._seq += 1
+            self._nonce_cursor = secrets.randbits(32)
             self._cv.notify_all()
 
     def wait(self, last_seq: int, timeout: float = 0.5) -> Tuple[int, Optional[MoneroJob]]:
@@ -55,6 +59,13 @@ class JobState:
     def get(self) -> Optional[MoneroJob]:
         with self._mu:
             return self._job
+
+    def alloc_nonce_block(self, n: int) -> int:
+        n = max(1, int(n))
+        with self._mu:
+            start = self._nonce_cursor & 0xFFFFFFFF
+            self._nonce_cursor = (self._nonce_cursor + n) & 0xFFFFFFFF
+            return start
 
     @property
     def seq(self) -> int:
@@ -77,12 +88,24 @@ class Miner:
         use_blocknet_p2pool: bool = False,
         use_blocknet_randomx: bool = False,
 
+        # NEW: server-side scanning modes
+        use_blocknet_p2pool_scan: bool = False,   # calls /p2pool/scan (requires p2pool session)
+        use_blocknet_randomx_scan: bool = False,  # calls /randomx/scan (blob+target provided)
+
+        # BlockNet API config
         blocknet_api_relay: str = "",
         blocknet_api_token: str = "",
         blocknet_api_prefix: str = "/v1",
         blocknet_verify_tls: bool = False,
 
+        # RandomX batch hashing config
         randomx_batch_size: int = 64,
+
+        # NEW: scan tuning
+        scan_iters: int = 200_000,
+        scan_max_results: int = 4,
+        scan_poll_first: bool = False,     # only used by /p2pool/scan
+        scan_nonce_offset: Optional[int] = None,  # override nonce offset (else job.nonce_offset)
     ) -> None:
         self.logger = logger or (lambda s: None)
 
@@ -96,12 +119,29 @@ class Miner:
         self.use_blocknet_p2pool = bool(use_blocknet_p2pool)
         self.use_blocknet_randomx = bool(use_blocknet_randomx)
 
+        self.use_blocknet_p2pool_scan = bool(use_blocknet_p2pool_scan)
+        self.use_blocknet_randomx_scan = bool(use_blocknet_randomx_scan)
+
+        self.scan_iters = max(1, int(scan_iters))
+        self.scan_max_results = max(1, int(scan_max_results))
+        self.scan_poll_first = bool(scan_poll_first)
+        self.scan_nonce_offset = scan_nonce_offset if scan_nonce_offset is None else int(scan_nonce_offset)
+
+        if self.use_blocknet_p2pool_scan and not self.use_blocknet_p2pool:
+            raise RuntimeError("use_blocknet_p2pool_scan=True requires use_blocknet_p2pool=True")
+
+        # If p2pool_scan is enabled, we do NOT need local RandomX nor /randomx/hash_batch
+        if self.use_blocknet_p2pool_scan:
+            self.use_blocknet_randomx = False
+            self.use_blocknet_randomx_scan = False
+
         self._bn_cfg: Optional[BlockNetApiCfg] = None
         self._bn_p2pool: Optional[BlockNetP2PoolBackend] = None
         self._bn_rx: Optional[BlockNetRandomXHasher] = None
         self._rx_batch = max(1, int(randomx_batch_size))
 
-        if self.use_blocknet_p2pool or self.use_blocknet_randomx:
+        need_blocknet = self.use_blocknet_p2pool or self.use_blocknet_randomx or self.use_blocknet_randomx_scan
+        if need_blocknet:
             relay = (blocknet_api_relay or "").strip()
             if not relay:
                 raise RuntimeError("BlockNet backend enabled but blocknet_api_relay is empty")
@@ -122,14 +162,22 @@ class Miner:
         self.rejected = 0
         self.last_err: str = ""
 
-        if self.use_blocknet_randomx:
+        # Setup hashing backends
+        if self.use_blocknet_randomx or self.use_blocknet_randomx_scan:
             assert self._bn_cfg is not None
-            self.logger("[Miner] Using BlockNet RandomX API for hashing...")
+            if self.use_blocknet_randomx_scan:
+                self.logger("[Miner] Using BlockNet RandomX SCAN API (/randomx/scan)...")
+            else:
+                self.logger("[Miner] Using BlockNet RandomX API (/randomx/hash_batch)...")
             self._bn_rx = BlockNetRandomXHasher(self._bn_cfg, batch_size=self._rx_batch, logger=self.logger)
             self.rx: Optional[RandomX] = None
         else:
-            self.logger("[Miner] Initializing local RandomX...")
-            self.rx = RandomX(self.logger)
+            if self.use_blocknet_p2pool_scan:
+                self.logger("[Miner] Using BlockNet P2Pool SCAN API (/p2pool/scan)...")
+                self.rx = None
+            else:
+                self.logger("[Miner] Initializing local RandomX...")
+                self.rx = RandomX(self.logger)
 
     def stop(self) -> None:
         self.logger("[Miner] Stop signal received.")
@@ -147,15 +195,14 @@ class Miner:
 
     def _worker(self, idx: int) -> None:
         self.logger(f"[Worker-{idx}] Started.")
+
         vm = None
+        blob_buf = None
+        nonce_ptr = None
 
         try:
             last_seq = 0
             cur_job: Optional[MoneroJob] = None
-            nonce = secrets.randbits(32)
-
-            blob_buf = None
-            nonce_ptr = None
 
             while not self._stop.is_set():
                 seq, job = self.job_state.wait(last_seq, timeout=0.1)
@@ -169,10 +216,8 @@ class Miner:
                     cur_job = job
                     last_seq = seq
 
-                    if self._stop.is_set():
-                        break
-
-                    if not self.use_blocknet_randomx:
+                    # job changed: reset local VM/buffers if used
+                    if not self.use_blocknet_randomx and not self.use_blocknet_randomx_scan and not self.use_blocknet_p2pool_scan:
                         if not self.rx:
                             raise RuntimeError("local RandomX not initialized")
 
@@ -187,7 +232,7 @@ class Miner:
                         offset = cur_job.nonce_offset
                         nonce_ptr = cast(byref(blob_buf, offset), POINTER(c_uint32))
                     else:
-                        # Remote hashing: no local VM/buffer
+                        # remote modes: no local VM/buffer
                         if vm is not None and self.rx:
                             self.rx.destroy_vm(vm)
                         vm = None
@@ -199,23 +244,100 @@ class Miner:
 
                 # ------------------- mining loop -------------------
 
-                if self.use_blocknet_randomx:
-                    # Remote hashing batch (SYNC call inside this worker thread)
-                    batch_n = self._rx_batch
-                    nonces: List[int] = []
+                if self.use_blocknet_p2pool_scan:
+                    # Server-side scan via /p2pool/scan
+                    try:
+                        assert self._bn_p2pool is not None
 
-                    for _ in range(batch_n):
-                        if self._stop.is_set() or self.job_state.seq != last_seq:
-                            break
-                        nonce = (nonce + 1) & 0xFFFFFFFF
-                        nonces.append(nonce)
+                        start_nonce = self.job_state.alloc_nonce_block(self.scan_iters)
+                        nonce_offset = (
+                            self.scan_nonce_offset
+                            if self.scan_nonce_offset is not None
+                            else (cur_job.nonce_offset if cur_job else 39)
+                        )
 
-                    if not nonces:
-                        continue
+                        resp = self._bn_p2pool.scan_sync(
+                            start_nonce=start_nonce,
+                            iters=self.scan_iters,
+                            max_results=self.scan_max_results,
+                            nonce_offset=nonce_offset,
+                            poll_first=self.scan_poll_first,
+                        )
 
+                        done = int(resp.get("hashes_done") or 0)
+                        if done > 0:
+                            self.add_hashes(done)
+
+                        job_id = str(resp.get("job_id") or "")
+                        found = resp.get("found") or []
+                        if job_id and isinstance(found, list):
+                            for one in found:
+                                try:
+                                    n = int(one.get("nonce_u32"))
+                                    hx = str(one.get("hash_hex") or "")
+                                    h32 = bytes.fromhex(hx)
+                                    if len(h32) == 32:
+                                        self.share_q.put(Share(job_id=job_id, nonce_u32=n, result32=h32))
+                                except Exception:
+                                    continue
+
+                        if done <= 0:
+                            time.sleep(0.05)
+
+                    except Exception as e:
+                        self.last_err = f"p2pool scan failed: {e}"
+                        self.logger(f"[Worker-{idx}] p2pool scan error: {e}")
+                        time.sleep(0.25)
+
+                elif self.use_blocknet_randomx_scan:
+                    # Server-side scan via /randomx/scan (blob+target provided)
                     try:
                         assert self._bn_rx is not None
                         self._bn_rx.set_seed(cur_job.seed_hash)
+
+                        start_nonce = self.job_state.alloc_nonce_block(self.scan_iters)
+                        resp = self._bn_rx.scan_sync(
+                            blob=cur_job.blob,
+                            nonce_offset=cur_job.nonce_offset,
+                            start_nonce=start_nonce,
+                            iters=self.scan_iters,
+                            target64=cur_job.target64,
+                            max_results=self.scan_max_results,
+                        )
+
+                        done = int(resp.get("hashes_done") or 0)
+                        if done > 0:
+                            self.add_hashes(done)
+
+                        found = resp.get("found") or []
+                        if isinstance(found, list):
+                            for one in found:
+                                try:
+                                    n = int(one.get("nonce_u32"))
+                                    hx = str(one.get("hash_hex") or "")
+                                    h32 = bytes.fromhex(hx)
+                                    if len(h32) == 32:
+                                        self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
+                                except Exception:
+                                    continue
+
+                        if done <= 0:
+                            time.sleep(0.05)
+
+                    except Exception as e:
+                        self.last_err = f"randomx scan failed: {e}"
+                        self.logger(f"[Worker-{idx}] randomx scan error: {e}")
+                        time.sleep(0.25)
+
+                elif self.use_blocknet_randomx:
+                    # Remote hashing batch (/randomx/hash_batch)
+                    try:
+                        assert self._bn_rx is not None
+                        self._bn_rx.set_seed(cur_job.seed_hash)
+
+                        batch_n = self._rx_batch
+                        start_nonce = self.job_state.alloc_nonce_block(batch_n)
+                        nonces = [(start_nonce + i) & 0xFFFFFFFF for i in range(batch_n)]
 
                         hashes_opt = self._bn_rx.hash_batch_blob_nonces_sync(
                             blob=cur_job.blob,
@@ -232,7 +354,6 @@ class Miner:
                             value = int.from_bytes(h32[24:32], "little", signed=False)
                             if value < cur_job.target64:
                                 self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {n}")
-                                # IMPORTANT: shares still go through SAME queue + submit_loop
                                 self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
 
                         if valid_hashes:
@@ -253,15 +374,15 @@ class Miner:
                     batch_size = 500
                     done = 0
 
-                    for _ in range(batch_size):
+                    start_nonce = self.job_state.alloc_nonce_block(batch_size)
+                    for i in range(batch_size):
                         if self._stop.is_set() or self.job_state.seq != last_seq:
                             break
 
-                        nonce = (nonce + 1) & 0xFFFFFFFF
+                        nonce = (start_nonce + i) & 0xFFFFFFFF
                         nonce_ptr[0] = nonce
 
                         h32 = self.rx.hash(vm, blob_buf)
-
                         value = int.from_bytes(h32[24:32], "little", signed=False)
                         if value < cur_job.target64:
                             self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {nonce}")
@@ -287,6 +408,7 @@ class Miner:
     async def run(self, *, on_stats: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         cli: Optional[StratumClient] = None
 
+        # create backends
         if self.use_blocknet_p2pool:
             assert self._bn_cfg is not None
             self._bn_p2pool = BlockNetP2PoolBackend(self._bn_cfg, logger=self.logger)
@@ -317,7 +439,7 @@ class Miner:
 
                 self.job_state.set(MoneroJob.from_stratum(login.job))
 
-            # ---------------- start CPU workers ----------------
+            # ---------------- start worker threads ----------------
             for i in range(self.threads):
                 t = threading.Thread(target=self._worker, args=(i,), name=f"Worker-{i}", daemon=True)
                 t.start()
@@ -394,6 +516,15 @@ class Miner:
                     current_job = self.job_state.get()
                     job_id_str = current_job.job_id if current_job else ""
 
+                    if self.use_blocknet_p2pool_scan:
+                        backend_rx = "blocknet_p2pool_scan"
+                    elif self.use_blocknet_randomx_scan:
+                        backend_rx = "blocknet_randomx_scan"
+                    elif self.use_blocknet_randomx:
+                        backend_rx = "blocknet_hash_batch"
+                    else:
+                        backend_rx = "local"
+
                     if on_stats:
                         on_stats({
                             "hashrate_hs": hps,
@@ -404,11 +535,13 @@ class Miner:
                             "height": (current_job.height if current_job else None),
                             "job_id": job_id_str,
                             "backend_p2pool": ("blocknet" if self.use_blocknet_p2pool else "stratum"),
-                            "backend_randomx": ("blocknet" if self.use_blocknet_randomx else "local"),
+                            "backend_randomx": backend_rx,
+                            "scan_iters": (self.scan_iters if (self.use_blocknet_p2pool_scan or self.use_blocknet_randomx_scan) else None),
                         })
 
             async def keepalive_loop() -> None:
                 if self.use_blocknet_p2pool:
+                    # HTTP polling keeps the session alive; nothing else required
                     while not self._stop.is_set():
                         for _ in range(300):
                             if self._stop.is_set():
