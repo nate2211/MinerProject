@@ -16,7 +16,7 @@ from randomx_ctypes import RandomX
 from stratum_client import StratumClient
 
 from blocknet_mining_backend import BlockNetApiCfg, BlockNetP2PoolBackend, BlockNetRandomXHasher
-from pythontools import yield_no_gil
+
 
 
 @dataclass
@@ -128,8 +128,6 @@ class Miner:
         self.scan_poll_first = bool(scan_poll_first)
         self.scan_nonce_offset = scan_nonce_offset if scan_nonce_offset is None else int(scan_nonce_offset)
 
-        self.yield_every_hashes = 8192
-        self.yield_seconds = 0.0
 
         if self.use_blocknet_p2pool_scan and not self.use_blocknet_p2pool:
             raise RuntimeError("use_blocknet_p2pool_scan=True requires use_blocknet_p2pool=True")
@@ -203,7 +201,6 @@ class Miner:
         vm = None
         blob_buf = None
         nonce_ptr = None
-        yield_ctr = 0
         last_seed: Optional[bytes] = None
         try:
             last_seq = 0
@@ -402,12 +399,6 @@ class Miner:
                             self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {nonce}")
                             self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=nonce, result32=bytes(out_buf)))
                         done += 1
-
-                        yield_ctr += 1
-                        if self.yield_every_hashes > 0 and yield_ctr >= self.yield_every_hashes:
-                            # releases GIL briefly and yields the OS thread
-                            yield_no_gil(self.yield_seconds)
-                            yield_ctr = 0
                     if done:
                         self.add_hashes(done)
 
