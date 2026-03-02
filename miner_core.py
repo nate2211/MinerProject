@@ -202,6 +202,13 @@ class Miner:
         blob_buf = None
         nonce_ptr = None
         last_seed: Optional[bytes] = None
+        out_buf = (c_ubyte * 32)()
+        value64 = c_uint64.from_buffer(out_buf, 24)
+        nonce_base = 0
+        nonce_i = 0
+        stride = self.threads
+        rx_hash_into = None
+        share_put = self.share_q.put
         try:
             last_seq = 0
             cur_job: Optional[MoneroJob] = None
@@ -217,7 +224,9 @@ class Miner:
                 if seq != last_seq:
                     cur_job = job
                     last_seq = seq
-
+                    nonce_base = self.job_state.alloc_nonce_block(stride)
+                    nonce_i = 0
+                    rx_hash_into = self.rx.hash_into
                     # job changed: reset local VM/buffers if used
                     if not self.use_blocknet_randomx and not self.use_blocknet_randomx_scan and not self.use_blocknet_p2pool_scan:
                         if not self.rx:
@@ -380,25 +389,27 @@ class Miner:
                     # Local hashing
                     if vm is None or blob_buf is None or nonce_ptr is None or self.rx is None:
                         continue
-                    out_buf = (c_ubyte * 32)()
-                    value64 = c_uint64.from_buffer(out_buf, 24)
-                    batch_size = 500
+                    batch_size = 1024
                     done = 0
 
-                    start_nonce = self.job_state.alloc_nonce_block(batch_size)
+                    target = cur_job.target64
+                    job_id = cur_job.job_id
+
+                    # (optional) check stop/job-change only every 64 iters to cut overhead
                     for i in range(batch_size):
-                        if self._stop.is_set() or self.job_state.seq != last_seq:
+                        if (i & 63) == 0 and (self._stop.is_set() or self.job_state.seq != last_seq):
                             break
 
-                        nonce = (start_nonce + i) & 0xFFFFFFFF
+                        nonce = (nonce_base + idx + (nonce_i + i) * stride) & 0xFFFFFFFF
                         nonce_ptr[0] = nonce
 
-                        self.rx.hash_into(vm, blob_buf, out_buf)
-                        if value64.value < cur_job.target64:
-                            # Only allocate bytes on share (rare)
+                        rx_hash_into(vm, blob_buf, out_buf)
+                        if value64.value < target:
                             self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {nonce}")
-                            self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=nonce, result32=bytes(out_buf)))
+                            share_put(Share(job_id=job_id, nonce_u32=nonce, result32=bytes(out_buf)))
                         done += 1
+
+                    nonce_i += done
                     if done:
                         self.add_hashes(done)
 
