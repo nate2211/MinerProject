@@ -23,7 +23,6 @@ a = Analysis(
         # Include the DLL.
         # (Source Path, Dest inside EXE) -> '.' means root of temp folder
         ('randomx-dll.dll', '.'),
-        ('pythontools', 'pythontools')
     ],
     datas=[],
     hiddenimports=hidden_imports,
