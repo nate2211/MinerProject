@@ -102,7 +102,7 @@ class Miner:
         randomx_batch_size: int = 64,
 
         # NEW: scan tuning
-        scan_iters: int = 100,
+        scan_iters: int = 1000,
         scan_max_results: int = 4,
         scan_poll_first: bool = False,     # only used by /p2pool/scan
         scan_nonce_offset: Optional[int] = None,  # override nonce offset (else job.nonce_offset)
