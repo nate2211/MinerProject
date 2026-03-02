@@ -7,7 +7,7 @@ import secrets
 import threading
 import time
 import traceback
-from ctypes import c_uint32, c_ubyte, byref, POINTER, cast, memmove
+from ctypes import c_uint32, c_ubyte, byref, POINTER, cast, memmove, c_uint64
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, List
 
@@ -17,6 +17,7 @@ from stratum_client import StratumClient
 
 from blocknet_mining_backend import BlockNetApiCfg, BlockNetP2PoolBackend, BlockNetRandomXHasher
 from pythontools import yield_no_gil
+
 
 @dataclass
 class Share:
@@ -378,10 +379,12 @@ class Miner:
                         time.sleep(0.25)
 
                 else:
+
                     # Local hashing
                     if vm is None or blob_buf is None or nonce_ptr is None or self.rx is None:
                         continue
-
+                    out_buf = (c_ubyte * 32)()
+                    value64 = c_uint64.from_buffer(out_buf, 24)
                     batch_size = 500
                     done = 0
 
@@ -393,13 +396,13 @@ class Miner:
                         nonce = (start_nonce + i) & 0xFFFFFFFF
                         nonce_ptr[0] = nonce
 
-                        h32 = self.rx.hash(vm, blob_buf)
-                        value = int.from_bytes(h32[24:32], "little", signed=False)
-                        if value < cur_job.target64:
+                        self.rx.hash_into(vm, blob_buf, out_buf)
+                        if value64.value < cur_job.target64:
+                            # Only allocate bytes on share (rare)
                             self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {nonce}")
-                            self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=nonce, result32=h32))
-
+                            self.share_q.put(Share(job_id=cur_job.job_id, nonce_u32=nonce, result32=bytes(out_buf)))
                         done += 1
+
                         yield_ctr += 1
                         if self.yield_every_hashes > 0 and yield_ctr >= self.yield_every_hashes:
                             # releases GIL briefly and yields the OS thread
@@ -463,6 +466,7 @@ class Miner:
 
             async def job_loop() -> None:
                 last_job_id = ""
+                last_key = None
                 while not self._stop.is_set():
                     if self.use_blocknet_p2pool:
                         assert self._bn_p2pool is not None
@@ -485,7 +489,12 @@ class Miner:
                     else:
                         assert cli is not None
                         j = await cli.next_job()
-                        self.job_state.set(MoneroJob.from_stratum(j))
+                        mj = MoneroJob.from_stratum(j)
+                        # Only update workers if something meaningful changed
+                        key = (mj.seed_hash, mj.target64, mj.blob)
+                        if key != last_key:
+                            last_key = key
+                            self.job_state.set(mj)
 
             async def submit_loop() -> None:
                 while not self._stop.is_set():

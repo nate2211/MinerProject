@@ -157,3 +157,7 @@ class RandomX:
         buf = (c_ubyte * len(data)).from_buffer_copy(data)
         self.randomx_calculate_hash(vm, buf, c_size_t(len(data)), out)
         return out.raw
+
+    def hash_into(self, vm, blob_buf, out32_buf) -> None:
+        # out32_buf must be a (c_ubyte * 32) or compatible writable buffer
+        self.randomx_calculate_hash(vm, blob_buf, len(blob_buf), out32_buf)
