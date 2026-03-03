@@ -231,7 +231,7 @@ class Miner:
                     if not self.use_blocknet_randomx and not self.use_blocknet_randomx_scan and not self.use_blocknet_p2pool_scan:
                         if not self.rx:
                             raise RuntimeError("local RandomX not initialized")
-
+                        rx_hash_into = self.rx.hash_into
                         # ---- only rebuild VM when seed changes ----
                         seed_changed = (last_seed != cur_job.seed_hash)
                         self.rx.ensure_seed(cur_job.seed_hash)
@@ -250,6 +250,7 @@ class Miner:
                         offset = cur_job.nonce_offset
                         nonce_ptr = cast(byref(blob_buf, offset), POINTER(c_uint32))
                     else:
+                        rx_hash_into = None
                         # remote modes: no local VM/buffer
                         if vm is not None and self.rx:
                             self.rx.destroy_vm(vm)
@@ -397,7 +398,7 @@ class Miner:
 
                     # (optional) check stop/job-change only every 64 iters to cut overhead
                     for i in range(batch_size):
-                        if (i & 63) == 0 and (self._stop.is_set() or self.job_state.seq != last_seq):
+                        if (i & 15) == 0 and (self._stop.is_set() or self.job_state.seq != last_seq):
                             break
 
                         nonce = (nonce_base + idx + (nonce_i + i) * stride) & 0xFFFFFFFF
