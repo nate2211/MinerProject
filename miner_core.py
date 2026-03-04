@@ -226,7 +226,6 @@ class Miner:
                     last_seq = seq
                     nonce_base = self.job_state.alloc_nonce_block(stride)
                     nonce_i = 0
-                    rx_hash_into = self.rx.hash_into
                     # job changed: reset local VM/buffers if used
                     if not self.use_blocknet_randomx and not self.use_blocknet_randomx_scan and not self.use_blocknet_p2pool_scan:
                         if not self.rx:
