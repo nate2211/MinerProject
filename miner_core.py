@@ -295,7 +295,8 @@ class Miner:
                                     hx = str(one.get("hash_hex") or "")
                                     h32 = bytes.fromhex(hx)
                                     if len(h32) == 32:
-                                        self.share_q.put(Share(job_id=job_id, nonce_u32=n, result32=h32))
+                                        self.logger(f"[Worker-{idx}] SHARE FOUND! Nonce: {n}")
+                                        share_put(Share(job_id=job_id, nonce_u32=n, result32=h32))
                                 except Exception:
                                     continue
 
