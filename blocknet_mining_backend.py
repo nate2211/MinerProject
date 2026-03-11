@@ -1,4 +1,3 @@
-# blocknet_mining_backend.py
 from __future__ import annotations
 
 import asyncio
@@ -40,7 +39,7 @@ class BlockNetApiCfg:
     relay: str
     token: str = ""
     prefix: str = "/v1"
-    timeout_s: float = 100
+    timeout_s: float = 100.0
     verify_tls: bool = False
     force_scheme: Optional[str] = None
 
@@ -49,7 +48,6 @@ class BlockNetApiCfg:
         if "://" not in r:
             scheme = (self.force_scheme or "").strip().lower()
             if not scheme:
-                # infer https on port 443, otherwise http
                 if r.endswith(":443") or r.split(":")[-1] == "443":
                     scheme = "https"
                 else:
@@ -59,6 +57,7 @@ class BlockNetApiCfg:
 
     def full_url(self, path: str) -> str:
         base = self.base_url()
+
         pref = (self.prefix or "/v1").strip()
         if not pref.startswith("/"):
             pref = "/" + pref
@@ -109,13 +108,23 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
             status = getattr(resp, "status", 200)
 
             if not raw:
-                return {"ok": False, "error": "empty response", "status": status, "headers": dict(resp.headers)}
+                return {
+                    "ok": False,
+                    "error": "empty response",
+                    "status": status,
+                    "headers": dict(resp.headers),
+                }
 
             try:
                 j = json.loads(raw.decode("utf-8", errors="replace"))
                 if isinstance(j, dict):
                     return j
-                return {"ok": False, "error": "json was not an object", "status": status, "value": j}
+                return {
+                    "ok": False,
+                    "error": "json was not an object",
+                    "status": status,
+                    "value": j,
+                }
             except Exception:
                 return {
                     "ok": False,
@@ -140,10 +149,22 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
             "headers": dict(getattr(e, "headers", {}) or {}),
             "body_preview": preview,
         }
+
     except URLError as e:
-        return {"ok": False, "error": f"connect failed: {e}", "status": 0, "headers": {}}
+        return {
+            "ok": False,
+            "error": f"connect failed: {e}",
+            "status": 0,
+            "headers": {},
+        }
+
     except Exception as e:
-        return {"ok": False, "error": f"request failed: {e}", "status": 0, "headers": {}}
+        return {
+            "ok": False,
+            "error": f"request failed: {e}",
+            "status": 0,
+            "headers": {},
+        }
 
 
 async def _post_json(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
@@ -170,30 +191,77 @@ class BlockNetP2PoolBackend:
         self.miner_id: str = ""
         self._opened = False
 
+    @property
+    def is_open(self) -> bool:
+        return bool(self._opened and self.session)
+
+    def _clear_state(self) -> None:
+        self._opened = False
+        self.session = ""
+        self.miner_id = ""
+
+    def invalidate_local(self) -> None:
+        self._clear_state()
+
+    def _maybe_invalidate_from_error(self, j: JsonDict) -> None:
+        if not isinstance(j, dict):
+            return
+        if j.get("ok"):
+            return
+
+        try:
+            s = json.dumps(j, sort_keys=True, default=str).lower()
+        except Exception:
+            s = str(j).lower()
+
+        if (
+            "unknown_session" in s
+            or "session_not_ready" in s
+            or "session socket invalid" in s
+            or "session not open" in s
+            or "p2pool session not open" in s
+        ):
+            self._clear_state()
+
     async def open(self) -> JsonDict:
         j = await _post_json(self.cfg, "/p2pool/open", {})
         if not j.get("ok"):
+            self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool open failed: {j}")
-        self.session = str(j.get("session") or "")
+
+        session = str(j.get("session") or "")
+        if not session:
+            self._clear_state()
+            raise RuntimeError(f"BlockNet p2pool open missing session: {j}")
+
+        self.session = session
         self.miner_id = str(j.get("miner_id") or "")
         self._opened = True
         return j.get("job") or {}
 
     async def poll(self, *, max_msgs: int = 32) -> JsonDict:
-        if not self._opened or not self.session:
+        if not self.is_open:
             raise RuntimeError("p2pool session not open")
-        payload: JsonDict = {"session": self.session, "max_msgs": int(max_msgs)}
+
+        payload: JsonDict = {
+            "session": self.session,
+            "max_msgs": int(max_msgs),
+        }
         j = await _post_json(self.cfg, "/p2pool/poll", payload)
         if not j.get("ok"):
+            self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool poll failed: {j}")
         return j
 
     async def job(self) -> JsonDict:
-        if not self._opened or not self.session:
+        if not self.is_open:
             raise RuntimeError("p2pool session not open")
+
         j = await _post_json(self.cfg, "/p2pool/job", {"session": self.session})
         if not j.get("ok"):
+            self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool job failed: {j}")
+
         if j.get("miner_id"):
             self.miner_id = str(j["miner_id"])
         return j.get("job") or {}
@@ -208,9 +276,10 @@ class BlockNetP2PoolBackend:
         return await self.job()
 
     async def submit(self, *, job_id: str, nonce_hex: str, result_hex: str) -> JsonDict:
-        if not self._opened or not self.session:
+        if not self.is_open:
             raise RuntimeError("p2pool session not open")
-        payload = {
+
+        payload: JsonDict = {
             "session": self.session,
             "job_id": str(job_id),
             "nonce": str(nonce_hex),
@@ -218,10 +287,9 @@ class BlockNetP2PoolBackend:
         }
         j = await _post_json(self.cfg, "/p2pool/submit", payload)
         if not j.get("ok"):
+            self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool submit failed: {j}")
         return j
-
-    # -------- NEW: scan (sync+async) --------
 
     def scan_sync(
         self,
@@ -232,8 +300,9 @@ class BlockNetP2PoolBackend:
         nonce_offset: Optional[int] = None,
         poll_first: bool = False,
     ) -> JsonDict:
-        if not self._opened or not self.session:
+        if not self.is_open:
             raise RuntimeError("p2pool session not open")
+
         payload: JsonDict = {
             "session": self.session,
             "start_nonce": int(start_nonce) & 0xFFFFFFFF,
@@ -243,8 +312,10 @@ class BlockNetP2PoolBackend:
         }
         if nonce_offset is not None:
             payload["nonce_offset"] = int(nonce_offset)
+
         j = _post_json_sync(self.cfg, "/p2pool/scan", payload)
         if not j.get("ok"):
+            self._maybe_invalidate_from_error(j)
             raise RuntimeError(f"BlockNet p2pool scan failed: {j}")
         return j
 
@@ -267,15 +338,18 @@ class BlockNetP2PoolBackend:
         )
 
     async def close(self) -> None:
-        if not self._opened:
+        session = self.session
+        was_open = self._opened
+
+        self._clear_state()
+
+        if not was_open or not session:
             return
+
         try:
-            if self.session:
-                await _post_json(self.cfg, "/p2pool/close", {"session": self.session})
-        finally:
-            self._opened = False
-            self.session = ""
-            self.miner_id = ""
+            await _post_json(self.cfg, "/p2pool/close", {"session": session})
+        except Exception:
+            pass
 
 
 class BlockNetRandomXHasher:
@@ -304,16 +378,18 @@ class BlockNetRandomXHasher:
             raise ValueError("empty seed_hash")
         self._seed_hex = _bytes_to_hex(seed_hash)
 
-    # -------- sync (for worker threads) --------
-
     def hash_batch_sync(self, items: List[bytes]) -> List[Optional[bytes]]:
         if not self._seed_hex:
             raise RuntimeError("seed not set")
+
         items = list(items or [])
         if not items:
             return []
 
-        payload = {"seed_hex": self._seed_hex, "items": [{"data_b64": _b64e(bytes(x))} for x in items]}
+        payload = {
+            "seed_hex": self._seed_hex,
+            "items": [{"data_b64": _b64e(bytes(x))} for x in items],
+        }
         j = _post_json_sync(self.cfg, "/randomx/hash_batch", payload)
         if not j.get("ok"):
             raise RuntimeError(f"BlockNet randomx/hash_batch failed: {j}")
@@ -357,8 +433,6 @@ class BlockNetRandomXHasher:
             items.append(bytes(b))
 
         return self.hash_batch_sync(items)
-
-    # -------- NEW: scan (sync+async) --------
 
     def scan_sync(
         self,
@@ -412,8 +486,6 @@ class BlockNetRandomXHasher:
             target64=target64,
             max_results=max_results,
         )
-
-    # -------- async helpers (optional) --------
 
     async def hash_batch(self, items: List[bytes]) -> List[Optional[bytes]]:
         return await asyncio.to_thread(self.hash_batch_sync, items)
