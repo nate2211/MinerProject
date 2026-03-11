@@ -105,8 +105,10 @@ class Miner:
 
         # RandomX batch hashing config
         randomx_batch_size: int = 64,
+        # NEW: parallel share submit workers
+        submit_workers: int = 1,
 
-        # NEW: scan tuning
+            # NEW: scan tuning
         scan_iters: int = 1000,
         scan_max_results: int = 4,
         scan_poll_first: bool = False,     # only used by /p2pool/scan
@@ -143,7 +145,7 @@ class Miner:
                 "Only one scan mode can be enabled at a time: "
                 "use_blocknet_p2pool_scan, use_blocknet_randomx_scan, use_blocknet_gpu_scan"
             )
-
+        self.submit_workers = max(1, int(submit_workers))
         if self.use_blocknet_p2pool_scan and not self.use_blocknet_p2pool:
             raise RuntimeError("use_blocknet_p2pool_scan=True requires use_blocknet_p2pool=True")
 
@@ -578,7 +580,7 @@ class Miner:
                             last_key = key
                             self.job_state.set(mj)
 
-            async def submit_loop() -> None:
+            async def submit_loop(worker_idx: int) -> None:
                 while not self._stop.is_set():
                     try:
                         share = await asyncio.to_thread(self.share_q.get, True, 0.5)
@@ -599,10 +601,10 @@ class Miner:
                                 )
 
                             self.accepted += 1
-                            self.logger("[Miner] Share accepted!")
+                            self.logger(f"[Submit-{worker_idx}] Share accepted!")
                         except Exception as e:
                             self.rejected += 1
-                            self.logger(f"[Miner] Share rejected: {e}")
+                            self.logger(f"[Submit-{worker_idx}] Share rejected: {e}")
                     except queue.Empty:
                         continue
 
@@ -644,8 +646,9 @@ class Miner:
                             "job_id": job_id_str,
                             "backend_p2pool": ("blocknet" if self.use_blocknet_p2pool else "stratum"),
                             "backend_randomx": backend_rx,
-                            "scan_iters": (self.scan_iters if (self.use_blocknet_p2pool_scan or self.use_blocknet_randomx_scan) else None),
-                        })
+                            "submit_workers": self.submit_workers,
+                            "scan_iters": (self.scan_iters if (
+                                        self.use_blocknet_p2pool_scan or self.use_blocknet_randomx_scan) else None),                        })
 
             async def keepalive_loop() -> None:
                 if self.use_blocknet_p2pool:
@@ -666,11 +669,12 @@ class Miner:
 
             tasks = [
                 asyncio.create_task(job_loop()),
-                asyncio.create_task(submit_loop()),
                 asyncio.create_task(stats_loop()),
                 asyncio.create_task(keepalive_loop()),
             ]
 
+            for i in range(self.submit_workers):
+                tasks.append(asyncio.create_task(submit_loop(i)))
             while not self._stop.is_set():
                 await asyncio.sleep(0.1)
 

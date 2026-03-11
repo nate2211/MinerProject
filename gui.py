@@ -188,7 +188,7 @@ class MinerConfig:
     bn_api_prefix: str
     bn_rx_batch: int
     scan_iters: int
-
+    submit_workers: int
 
 class MinerWorker(QThread):
     log_line = pyqtSignal(str)
@@ -258,9 +258,12 @@ class MinerWorker(QThread):
 
                 use_blocknet_randomx=bool(self.cfg.use_bn_randomx),
                 randomx_batch_size=int(self.cfg.bn_rx_batch),
+                submit_workers=int(self.cfg.submit_workers),
             )
 
             sig = inspect.signature(Miner.__init__)
+            if "submit_workers" in sig.parameters:
+                miner_kwargs["submit_workers"] = int(self.cfg.submit_workers)
             if "use_blocknet_p2pool_scan" in sig.parameters:
                 miner_kwargs["use_blocknet_p2pool_scan"] = bool(self.cfg.use_bn_p2pool_scan)
             if "use_blocknet_randomx_scan" in sig.parameters:
@@ -476,6 +479,10 @@ class MainWindow(QMainWindow):
         self.sp_bn_rx_batch.setRange(1, 4096)
         self.sp_bn_rx_batch.setValue(64)
 
+        self.sp_submit_workers = QSpinBox()
+        self.sp_submit_workers.setRange(1, 32)
+        self.sp_submit_workers.setValue(4)
+
         self.sp_scan_iters = QSpinBox()
         self.sp_scan_iters.setRange(1, 10_000_000)
         self.sp_scan_iters.setSingleStep(100)
@@ -490,6 +497,7 @@ class MainWindow(QMainWindow):
         mfl.addRow("API Token", self.ed_bn_api_token)
         mfl.addRow("API Prefix", self.ed_bn_api_prefix)
         mfl.addRow("RandomX batch size", self.sp_bn_rx_batch)
+        mfl.addRow("Share workers", self.sp_submit_workers)
         mfl.addRow("Scan iterations", self.sp_scan_iters)
 
         self.left_layout.addWidget(gb_bn_mine)
@@ -719,7 +727,7 @@ class MainWindow(QMainWindow):
         threads = int(self.sp_threads.value())
         randomx_lib = self.ed_randomx.text().strip()
         scan_iters = int(self.sp_scan_iters.value())
-
+        submit_workers = int(self.sp_submit_workers.value())
         use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
         use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
@@ -761,7 +769,7 @@ class MainWindow(QMainWindow):
             use_bn_gpu_scan=use_bn_gpu_scan,
             use_bn_p2pool_scan=use_bn_p2pool_scan,
             use_bn_randomx_scan=use_bn_randomx_scan,
-
+            submit_workers=submit_workers,
             bn_api_relay=bn_api_relay,
             bn_api_token=self.ed_bn_api_token.text().strip(),
             bn_api_prefix=self.ed_bn_api_prefix.text().strip() or "/v1",
@@ -846,7 +854,7 @@ class MainWindow(QMainWindow):
                 "bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
                 "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
                 "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
-
+                "submit_workers": int(self.sp_submit_workers.value()),
                 "bn_api_relay": self.ed_bn_api_relay.text().strip(),
                 "bn_api_token": self.ed_bn_api_token.text().strip(),
                 "bn_api_prefix": self.ed_bn_api_prefix.text().strip(),
@@ -870,6 +878,7 @@ class MainWindow(QMainWindow):
             self.ed_agent.setText(j.get("agent", self.ed_agent.text()))
             self.sp_threads.setValue(int(j.get("threads", int(self.sp_threads.value()))))
             self.ed_randomx.setText(j.get("randomx_lib", self.ed_randomx.text()))
+            self.sp_submit_workers.setValue(int(j.get("submit_workers", int(self.sp_submit_workers.value()))))
 
             self.cb_bn.setChecked(bool(j.get("blocknet_enabled", False)))
             self.ed_bn_relay.setText(j.get("blocknet_relay", self.ed_bn_relay.text()))
