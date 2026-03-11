@@ -15,8 +15,12 @@ from monero_job import MoneroJob
 from randomx_ctypes import RandomX
 from stratum_client import StratumClient
 
-from blocknet_mining_backend import BlockNetApiCfg, BlockNetP2PoolBackend, BlockNetRandomXHasher
-
+from blocknet_mining_backend import (
+    BlockNetApiCfg,
+    BlockNetP2PoolBackend,
+    BlockNetRandomXHasher,
+    BlockNetGpuScanner,
+)
 
 
 @dataclass
@@ -92,7 +96,7 @@ class Miner:
         # NEW: server-side scanning modes
         use_blocknet_p2pool_scan: bool = False,   # calls /p2pool/scan (requires p2pool session)
         use_blocknet_randomx_scan: bool = False,  # calls /randomx/scan (blob+target provided)
-
+        use_blocknet_gpu_scan: bool = False,
         # BlockNet API config
         blocknet_api_relay: str = "",
         blocknet_api_token: str = "",
@@ -122,27 +126,42 @@ class Miner:
 
         self.use_blocknet_p2pool_scan = bool(use_blocknet_p2pool_scan)
         self.use_blocknet_randomx_scan = bool(use_blocknet_randomx_scan)
-
+        self.use_blocknet_gpu_scan = bool(use_blocknet_gpu_scan)
         self.scan_iters = max(1, int(scan_iters))
         self.scan_max_results = max(1, int(scan_max_results))
         self.scan_poll_first = bool(scan_poll_first)
         self.scan_nonce_offset = scan_nonce_offset if scan_nonce_offset is None else int(scan_nonce_offset)
-
+        scan_mode_count = sum(
+            1 for x in (
+                self.use_blocknet_p2pool_scan,
+                self.use_blocknet_randomx_scan,
+                self.use_blocknet_gpu_scan,
+            ) if x
+        )
+        if scan_mode_count > 1:
+            raise RuntimeError(
+                "Only one scan mode can be enabled at a time: "
+                "use_blocknet_p2pool_scan, use_blocknet_randomx_scan, use_blocknet_gpu_scan"
+            )
 
         if self.use_blocknet_p2pool_scan and not self.use_blocknet_p2pool:
             raise RuntimeError("use_blocknet_p2pool_scan=True requires use_blocknet_p2pool=True")
 
         # If p2pool_scan is enabled, we do NOT need local RandomX nor /randomx/hash_batch
-        if self.use_blocknet_p2pool_scan:
+        if self.use_blocknet_p2pool_scan or self.use_blocknet_randomx_scan or self.use_blocknet_gpu_scan:
             self.use_blocknet_randomx = False
-            self.use_blocknet_randomx_scan = False
-
         self._bn_cfg: Optional[BlockNetApiCfg] = None
         self._bn_p2pool: Optional[BlockNetP2PoolBackend] = None
         self._bn_rx: Optional[BlockNetRandomXHasher] = None
+        self._bn_gpu: Optional[BlockNetGpuScanner] = None
         self._rx_batch = max(1, int(randomx_batch_size))
 
-        need_blocknet = self.use_blocknet_p2pool or self.use_blocknet_randomx or self.use_blocknet_randomx_scan
+        need_blocknet = (
+                self.use_blocknet_p2pool
+                or self.use_blocknet_randomx
+                or self.use_blocknet_randomx_scan
+                or self.use_blocknet_gpu_scan
+        )
         if need_blocknet:
             relay = (blocknet_api_relay or "").strip()
             if not relay:
@@ -165,15 +184,25 @@ class Miner:
         self.last_err: str = ""
 
         # Setup hashing backends
-        if self.use_blocknet_randomx or self.use_blocknet_randomx_scan:
+        if self.use_blocknet_gpu_scan:
+            assert self._bn_cfg is not None
+            self.logger("[Miner] Using BlockNet GPU SCAN API (/gpu/scan)...")
+            self._bn_gpu = BlockNetGpuScanner(self._bn_cfg, logger=self.logger)
+            self._bn_rx = None
+            self.rx: Optional[RandomX] = None
+
+        elif self.use_blocknet_randomx or self.use_blocknet_randomx_scan:
             assert self._bn_cfg is not None
             if self.use_blocknet_randomx_scan:
                 self.logger("[Miner] Using BlockNet RandomX SCAN API (/randomx/scan)...")
             else:
                 self.logger("[Miner] Using BlockNet RandomX API (/randomx/hash_batch)...")
             self._bn_rx = BlockNetRandomXHasher(self._bn_cfg, batch_size=self._rx_batch, logger=self.logger)
+            self._bn_gpu = None
             self.rx: Optional[RandomX] = None
+
         else:
+            self._bn_gpu = None
             if self.use_blocknet_p2pool_scan:
                 self.logger("[Miner] Using BlockNet P2Pool SCAN API (/p2pool/scan)...")
                 self.rx = None
@@ -227,7 +256,12 @@ class Miner:
                     nonce_base = self.job_state.alloc_nonce_block(stride)
                     nonce_i = 0
                     # job changed: reset local VM/buffers if used
-                    if not self.use_blocknet_randomx and not self.use_blocknet_randomx_scan and not self.use_blocknet_p2pool_scan:
+                    if (
+                            not self.use_blocknet_randomx
+                            and not self.use_blocknet_randomx_scan
+                            and not self.use_blocknet_p2pool_scan
+                            and not self.use_blocknet_gpu_scan
+                    ):
                         if not self.rx:
                             raise RuntimeError("local RandomX not initialized")
                         rx_hash_into = self.rx.hash_into
@@ -384,7 +418,52 @@ class Miner:
                         self.last_err = f"remote hash failed: {e}"
                         self.logger(f"[Worker-{idx}] remote hash error: {e}")
                         time.sleep(0.25)
+                elif self.use_blocknet_gpu_scan:
+                    # Server-side scan via /gpu/scan (blob+seed+target provided)
+                    try:
+                        assert self._bn_gpu is not None
 
+                        start_nonce = self.job_state.alloc_nonce_block(self.scan_iters)
+                        nonce_offset = (
+                            self.scan_nonce_offset
+                            if self.scan_nonce_offset is not None
+                            else (cur_job.nonce_offset if cur_job else 39)
+                        )
+
+                        resp = self._bn_gpu.scan_sync(
+                            seed_hash=cur_job.seed_hash,
+                            blob=cur_job.blob,
+                            nonce_offset=nonce_offset,
+                            start_nonce=start_nonce,
+                            iters=self.scan_iters,
+                            target64=cur_job.target64,
+                            max_results=self.scan_max_results,
+                        )
+
+                        done = int(resp.get("hashes_done") or 0)
+                        if done > 0:
+                            self.add_hashes(done)
+
+                        found = resp.get("found") or []
+                        if isinstance(found, list):
+                            for one in found:
+                                try:
+                                    n = int(one.get("nonce_u32"))
+                                    hx = str(one.get("hash_hex") or "")
+                                    h32 = bytes.fromhex(hx)
+                                    if len(h32) == 32:
+                                        self.logger(f"[Worker-{idx}] GPU SHARE FOUND! Nonce: {n}")
+                                        share_put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
+                                except Exception:
+                                    continue
+
+                        if done <= 0:
+                            time.sleep(0.05)
+
+                    except Exception as e:
+                        self.last_err = f"gpu scan failed: {e}"
+                        self.logger(f"[Worker-{idx}] gpu scan error: {e}")
+                        time.sleep(0.05)
                 else:
 
                     # Local hashing
@@ -545,6 +624,8 @@ class Miner:
 
                     if self.use_blocknet_p2pool_scan:
                         backend_rx = "blocknet_p2pool_scan"
+                    elif self.use_blocknet_gpu_scan:
+                        backend_rx = "blocknet_gpu_scan"
                     elif self.use_blocknet_randomx_scan:
                         backend_rx = "blocknet_randomx_scan"
                     elif self.use_blocknet_randomx:

@@ -156,6 +156,7 @@ class MinerConfig:
     # NEW (optional scan toggles)
     use_bn_p2pool_scan: bool
     use_bn_randomx_scan: bool
+    use_bn_gpu_scan: bool
 
     bn_api_relay: str
     bn_api_token: str
@@ -238,7 +239,8 @@ class MinerWorker(QThread):
                 miner_kwargs["use_blocknet_p2pool_scan"] = bool(self.cfg.use_bn_p2pool_scan)
             if "use_blocknet_randomx_scan" in sig.parameters:
                 miner_kwargs["use_blocknet_randomx_scan"] = bool(self.cfg.use_bn_randomx_scan)
-
+            if "use_blocknet_gpu_scan" in sig.parameters:
+                miner_kwargs["use_blocknet_gpu_scan"] = bool(self.cfg.use_bn_gpu_scan)
             self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
@@ -419,7 +421,7 @@ class MainWindow(QMainWindow):
 
         gb_bn_mine = QGroupBox("BlockNet Mining Backends (optional)")
         mfl = QFormLayout(gb_bn_mine)
-
+        self.cb_bn_gpu_scan = QCheckBox("Use BlockNet GPU scan (/gpu/scan) — OpenCL GPU server-side scanning")
         self.cb_bn_p2pool = QCheckBox("Use BlockNet P2Pool API (instead of direct Stratum TCP)")
         self.cb_bn_randomx = QCheckBox("Use BlockNet RandomX API (remote hashing)")
 
@@ -436,6 +438,7 @@ class MainWindow(QMainWindow):
         self.sp_bn_rx_batch.setRange(1, 4096)
         self.sp_bn_rx_batch.setValue(64)
 
+        mfl.addRow(self.cb_bn_gpu_scan)
         mfl.addRow(self.cb_bn_p2pool)
         mfl.addRow(self.cb_bn_randomx)
         mfl.addRow(self.cb_bn_p2pool_scan)
@@ -447,8 +450,9 @@ class MainWindow(QMainWindow):
 
         self.left_split.addWidget(gb_bn_mine)
 
-        self.cb_bn_p2pool.stateChanged.connect(self._sync_scan_checks)
-        self.cb_bn_randomx.stateChanged.connect(self._sync_scan_checks)
+        self.cb_bn_p2pool_scan.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_bn_randomx_scan.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_bn_gpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
@@ -540,6 +544,19 @@ class MainWindow(QMainWindow):
 
         self._load_cfg()
         self.statusBar().showMessage("Ready")
+    def _sync_scan_mode_exclusive(self) -> None:
+        sender = self.sender()
+        if not isinstance(sender, QCheckBox):
+            return
+        if not sender.isChecked():
+            return
+
+        for cb in (self.cb_bn_p2pool_scan, self.cb_bn_randomx_scan, self.cb_bn_gpu_scan):
+            if cb is sender:
+                continue
+            old = cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(old)
 
     def _sync_scan_checks(self) -> None:
         p2 = bool(self.cb_bn_p2pool.isChecked())
@@ -554,6 +571,10 @@ class MainWindow(QMainWindow):
         self.cb_bn_randomx_scan.setEnabled(rx)
         if not rx:
             self.cb_bn_randomx_scan.setChecked(False)
+
+        # gpu scan can work with either direct Stratum jobs or BlockNet P2Pool jobs,
+        # so it stays independently available as long as the API relay is configured.
+        self.cb_bn_gpu_scan.setEnabled(True)
 
     def _on_tab_changed(self, idx: int) -> None:
         # Make Log tab "cover settings fully" by hiding left panel while Log is selected.
@@ -655,7 +676,7 @@ class MainWindow(QMainWindow):
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
         use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
         use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
-
+        use_bn_gpu_scan = bool(self.cb_bn_gpu_scan.isChecked())
         if not wallet:
             QMessageBox.critical(self, "Missing Wallet", "Please enter your Monero wallet address.")
             return
@@ -667,7 +688,7 @@ class MainWindow(QMainWindow):
 
         # If any BlockNet mining backend enabled, require API relay
         bn_api_relay = self.ed_bn_api_relay.text().strip()
-        if (use_bn_p2pool or use_bn_randomx or use_bn_p2pool_scan or use_bn_randomx_scan) and not bn_api_relay:
+        if (use_bn_p2pool or use_bn_randomx or use_bn_p2pool_scan or use_bn_randomx_scan or use_bn_gpu_scan) and not bn_api_relay:
             QMessageBox.critical(self, "Missing BlockNet API Relay", "Please enter BlockNet API relay host:port (e.g. 1.2.3.4:38888).")
             return
 
@@ -689,7 +710,7 @@ class MainWindow(QMainWindow):
 
             use_bn_p2pool=use_bn_p2pool,
             use_bn_randomx=use_bn_randomx,
-
+            use_bn_gpu_scan=use_bn_gpu_scan,
             use_bn_p2pool_scan=use_bn_p2pool_scan,
             use_bn_randomx_scan=use_bn_randomx_scan,
 
@@ -773,7 +794,7 @@ class MainWindow(QMainWindow):
 
                 "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
                 "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
-
+                "bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
                 # NEW
                 "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
                 "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
@@ -809,7 +830,7 @@ class MainWindow(QMainWindow):
 
             self.cb_bn_p2pool.setChecked(bool(j.get("bn_p2pool", False)))
             self.cb_bn_randomx.setChecked(bool(j.get("bn_randomx", False)))
-
+            self.cb_bn_gpu_scan.setChecked(bool(j.get("bn_gpu_scan", False)))
             # NEW
             self.cb_bn_p2pool_scan.setChecked(bool(j.get("bn_p2pool_scan", False)))
             self.cb_bn_randomx_scan.setChecked(bool(j.get("bn_randomx_scan", False)))

@@ -431,3 +431,100 @@ class BlockNetRandomXHasher:
             nonce_offset=nonce_offset,
             nonces_u32=nonces_u32,
         )
+
+
+class BlockNetGpuScanner:
+    """
+    Docs:
+      POST /v1/gpu/scan
+
+      {
+        "seed_hex":"...",
+        "blob_hex":"...",
+        "nonce_offset":39,
+        "start_nonce":0,
+        "iters":65536,
+        "target64":"18446744073709551615",
+        "max_results":16
+      }
+    """
+
+    def __init__(
+        self,
+        cfg: BlockNetApiCfg,
+        *,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.logger = logger or (lambda s: None)
+
+    def scan_sync(
+        self,
+        *,
+        seed_hash: bytes,
+        blob: bytes,
+        nonce_offset: int,
+        start_nonce: int,
+        iters: int,
+        target64: int,
+        max_results: int = 4,
+        platform_index: Optional[int] = None,
+        device_index: Optional[int] = None,
+    ) -> JsonDict:
+        seed_hash = bytes(seed_hash or b"")
+        blob = bytes(blob or b"")
+
+        if not seed_hash:
+            raise ValueError("empty seed_hash")
+        if not blob:
+            raise ValueError("empty blob")
+
+        off = int(nonce_offset)
+        if off < 0 or off + 4 > len(blob):
+            raise ValueError(f"nonce_offset out of range: {off} for blob_len={len(blob)}")
+
+        payload: JsonDict = {
+            "seed_hex": _bytes_to_hex(seed_hash),
+            "blob_hex": _bytes_to_hex(blob),
+            "nonce_offset": off,
+            "start_nonce": int(start_nonce) & 0xFFFFFFFF,
+            "iters": int(iters),
+            "target64": str(int(target64)),
+            "max_results": int(max_results),
+        }
+
+        if platform_index is not None:
+            payload["platform_index"] = int(platform_index)
+        if device_index is not None:
+            payload["device_index"] = int(device_index)
+
+        j = _post_json_sync(self.cfg, "/gpu/scan", payload)
+        if not j.get("ok"):
+            raise RuntimeError(f"BlockNet gpu/scan failed: {j}")
+        return j
+
+    async def scan(
+        self,
+        *,
+        seed_hash: bytes,
+        blob: bytes,
+        nonce_offset: int,
+        start_nonce: int,
+        iters: int,
+        target64: int,
+        max_results: int = 4,
+        platform_index: Optional[int] = None,
+        device_index: Optional[int] = None,
+    ) -> JsonDict:
+        return await asyncio.to_thread(
+            self.scan_sync,
+            seed_hash=seed_hash,
+            blob=blob,
+            nonce_offset=nonce_offset,
+            start_nonce=start_nonce,
+            iters=iters,
+            target64=target64,
+            max_results=max_results,
+            platform_index=platform_index,
+            device_index=device_index,
+        )
