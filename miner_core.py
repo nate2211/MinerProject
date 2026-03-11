@@ -253,7 +253,7 @@ class Miner:
                 if seq != last_seq:
                     cur_job = job
                     last_seq = seq
-                    nonce_base = self.job_state.alloc_nonce_block(stride)
+                    nonce_base = self.job_state.alloc_nonce_block(1)
                     nonce_i = 0
                     # job changed: reset local VM/buffers if used
                     if (
@@ -480,7 +480,7 @@ class Miner:
                         if (i & 15) == 0 and (self._stop.is_set() or self.job_state.seq != last_seq):
                             break
 
-                        nonce = (nonce_base + idx + (nonce_i + i) * stride) & 0xFFFFFFFF
+                        nonce = (nonce_base + (nonce_i + i) * stride) & 0xFFFFFFFF
                         nonce_ptr[0] = nonce
 
                         rx_hash_into(vm, blob_buf, out_buf)
@@ -565,9 +565,9 @@ class Miner:
                         except Exception as e:
                             self.last_err = f"p2pool poll error: {e}"
                             self.logger(f"[Miner] p2pool poll error: {e}")
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.05)
 
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(0.05)
                     else:
                         assert cli is not None
                         j = await cli.next_job()
