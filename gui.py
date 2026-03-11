@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QSizePolicy,
+    QScrollArea,
 )
 
 from miner_core import Miner
@@ -130,6 +131,30 @@ def apply_dark_theme(app: QApplication) -> None:
         QSplitter::handle { background: #3a3a3a; }
         QSplitter::handle:horizontal { width: 10px; border-radius: 5px; }
         QSplitter::handle:vertical { height: 10px; border-radius: 5px; }
+        QScrollArea {
+            border: none;
+            background: transparent;
+        }
+        QScrollBar:vertical {
+            background: #1b1b1b;
+            width: 12px;
+            margin: 0px;
+            border-radius: 6px;
+        }
+        QScrollBar::handle:vertical {
+            background: #4a4a4a;
+            min-height: 24px;
+            border-radius: 6px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #5a5a5a;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: transparent;
+        }
     """)
 
 
@@ -162,6 +187,7 @@ class MinerConfig:
     bn_api_token: str
     bn_api_prefix: str
     bn_rx_batch: int
+    scan_iters: int
 
 
 class MinerWorker(QThread):
@@ -241,6 +267,9 @@ class MinerWorker(QThread):
                 miner_kwargs["use_blocknet_randomx_scan"] = bool(self.cfg.use_bn_randomx_scan)
             if "use_blocknet_gpu_scan" in sig.parameters:
                 miner_kwargs["use_blocknet_gpu_scan"] = bool(self.cfg.use_bn_gpu_scan)
+            if "scan_iters" in sig.parameters:
+                miner_kwargs["scan_iters"] = int(self.cfg.scan_iters)
+
             self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
@@ -347,12 +376,21 @@ class MainWindow(QMainWindow):
         self.main_split.setHandleWidth(10)
         root.addWidget(self.main_split, 1)
 
-        self.left_split = QSplitter(Qt.Vertical)
-        self.left_split.setChildrenCollapsible(False)
-        self.left_split.setHandleWidth(10)
-        self.left_split.setMinimumWidth(420)
-        self.left_split.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.main_split.addWidget(self.left_split)
+        # LEFT SIDE: scrollable settings
+        self.left_scroll = QScrollArea()
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.left_scroll.setMinimumWidth(420)
+        self.left_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.left_container = QWidget()
+        self.left_scroll.setWidget(self.left_container)
+
+        self.left_layout = QVBoxLayout(self.left_container)
+        self.left_layout.setContentsMargins(0, 0, 8, 0)
+        self.left_layout.setSpacing(10)
+
+        self.main_split.addWidget(self.left_scroll)
 
         right = QWidget()
         right_l = QVBoxLayout(right)
@@ -381,7 +419,7 @@ class MainWindow(QMainWindow):
         fl.addRow("Password", self.ed_pass)
         fl.addRow("Agent", self.ed_agent)
 
-        self.left_split.addWidget(gb_conn)
+        self.left_layout.addWidget(gb_conn)
 
         gb_perf = QGroupBox("Performance")
         pfl = QFormLayout(gb_perf)
@@ -397,7 +435,7 @@ class MainWindow(QMainWindow):
         pfl.addRow("Threads", self.sp_threads)
         pfl.addRow("RandomX lib (local only)", self._hbox(self.ed_randomx, self.btn_browse_randomx))
 
-        self.left_split.addWidget(gb_perf)
+        self.left_layout.addWidget(gb_perf)
 
         gb_bn = QGroupBox("BlockNet Reporting (optional)")
         bfl = QFormLayout(gb_bn)
@@ -417,7 +455,7 @@ class MainWindow(QMainWindow):
         bfl.addRow("Heartbeat ID", self.ed_bn_id)
         bfl.addRow("PUT key", self.ed_bn_key)
 
-        self.left_split.addWidget(gb_bn)
+        self.left_layout.addWidget(gb_bn)
 
         gb_bn_mine = QGroupBox("BlockNet Mining Backends (optional)")
         mfl = QFormLayout(gb_bn_mine)
@@ -438,6 +476,11 @@ class MainWindow(QMainWindow):
         self.sp_bn_rx_batch.setRange(1, 4096)
         self.sp_bn_rx_batch.setValue(64)
 
+        self.sp_scan_iters = QSpinBox()
+        self.sp_scan_iters.setRange(1, 10_000_000)
+        self.sp_scan_iters.setSingleStep(100)
+        self.sp_scan_iters.setValue(1000)
+
         mfl.addRow(self.cb_bn_gpu_scan)
         mfl.addRow(self.cb_bn_p2pool)
         mfl.addRow(self.cb_bn_randomx)
@@ -447,9 +490,12 @@ class MainWindow(QMainWindow):
         mfl.addRow("API Token", self.ed_bn_api_token)
         mfl.addRow("API Prefix", self.ed_bn_api_prefix)
         mfl.addRow("RandomX batch size", self.sp_bn_rx_batch)
+        mfl.addRow("Scan iterations", self.sp_scan_iters)
 
-        self.left_split.addWidget(gb_bn_mine)
+        self.left_layout.addWidget(gb_bn_mine)
 
+        self.cb_bn_p2pool.toggled.connect(self._sync_scan_checks)
+        self.cb_bn_randomx.toggled.connect(self._sync_scan_checks)
         self.cb_bn_p2pool_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_randomx_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_gpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
@@ -485,7 +531,8 @@ class MainWindow(QMainWindow):
         btn_row2.addWidget(self.btn_clear)
         cl.addLayout(btn_row2)
 
-        self.left_split.addWidget(gb_ctrl)
+        self.left_layout.addWidget(gb_ctrl)
+        self.left_layout.addStretch(1)
 
         # ---------------- Right tabs ----------------
 
@@ -539,11 +586,11 @@ class MainWindow(QMainWindow):
         self.uptime_timer.setInterval(500)
         self.uptime_timer.timeout.connect(self._tick_uptime)
 
-        self.left_split.setSizes([220, 150, 200, 220, 120])
         self.main_split.setSizes([560, 900])
 
         self._load_cfg()
         self.statusBar().showMessage("Ready")
+
     def _sync_scan_mode_exclusive(self) -> None:
         sender = self.sender()
         if not isinstance(sender, QCheckBox):
@@ -585,12 +632,12 @@ class MainWindow(QMainWindow):
     def _set_log_focus(self, enable: bool) -> None:
         if enable and not self._log_focus_enabled:
             self._saved_main_split_sizes = self.main_split.sizes()
-            self.left_split.setVisible(False)
+            self.left_scroll.setVisible(False)
             # ensure right expands now
             self.main_split.setSizes([0, max(1, self.width())])
             self._log_focus_enabled = True
         elif (not enable) and self._log_focus_enabled:
-            self.left_split.setVisible(True)
+            self.left_scroll.setVisible(True)
             if self._saved_main_split_sizes:
                 self.main_split.setSizes(self._saved_main_split_sizes)
             else:
@@ -671,6 +718,7 @@ class MainWindow(QMainWindow):
         agent = self.ed_agent.text().strip() or "py-blockminer/0.1"
         threads = int(self.sp_threads.value())
         randomx_lib = self.ed_randomx.text().strip()
+        scan_iters = int(self.sp_scan_iters.value())
 
         use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
@@ -718,6 +766,7 @@ class MainWindow(QMainWindow):
             bn_api_token=self.ed_bn_api_token.text().strip(),
             bn_api_prefix=self.ed_bn_api_prefix.text().strip() or "/v1",
             bn_rx_batch=int(self.sp_bn_rx_batch.value()),
+            scan_iters=scan_iters,
         )
 
         self._save_cfg()
@@ -795,7 +844,6 @@ class MainWindow(QMainWindow):
                 "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
                 "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
                 "bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
-                # NEW
                 "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
                 "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
 
@@ -803,6 +851,7 @@ class MainWindow(QMainWindow):
                 "bn_api_token": self.ed_bn_api_token.text().strip(),
                 "bn_api_prefix": self.ed_bn_api_prefix.text().strip(),
                 "bn_rx_batch": int(self.sp_bn_rx_batch.value()),
+                "scan_iters": int(self.sp_scan_iters.value()),
             }
             CFG_PATH.write_text(json.dumps(j, indent=2), encoding="utf-8")
             self.statusBar().showMessage("Config saved", 1500)
@@ -831,7 +880,6 @@ class MainWindow(QMainWindow):
             self.cb_bn_p2pool.setChecked(bool(j.get("bn_p2pool", False)))
             self.cb_bn_randomx.setChecked(bool(j.get("bn_randomx", False)))
             self.cb_bn_gpu_scan.setChecked(bool(j.get("bn_gpu_scan", False)))
-            # NEW
             self.cb_bn_p2pool_scan.setChecked(bool(j.get("bn_p2pool_scan", False)))
             self.cb_bn_randomx_scan.setChecked(bool(j.get("bn_randomx_scan", False)))
 
@@ -839,6 +887,7 @@ class MainWindow(QMainWindow):
             self.ed_bn_api_token.setText(j.get("bn_api_token", self.ed_bn_api_token.text()))
             self.ed_bn_api_prefix.setText(j.get("bn_api_prefix", self.ed_bn_api_prefix.text()))
             self.sp_bn_rx_batch.setValue(int(j.get("bn_rx_batch", int(self.sp_bn_rx_batch.value()))))
+            self.sp_scan_iters.setValue(int(j.get("scan_iters", int(self.sp_scan_iters.value()))))
 
             self._sync_scan_checks()
             self.statusBar().showMessage("Config loaded", 1500)
