@@ -1,4 +1,3 @@
-# blocknet_mining_backend.py
 from __future__ import annotations
 
 import asyncio
@@ -49,7 +48,6 @@ class BlockNetApiCfg:
         if "://" not in r:
             scheme = (self.force_scheme or "").strip().lower()
             if not scheme:
-                # infer https on port 443, otherwise http
                 if r.endswith(":443") or r.split(":")[-1] == "443":
                     scheme = "https"
                 else:
@@ -145,7 +143,66 @@ def _post_json_sync(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
     except Exception as e:
         return {"ok": False, "error": f"request failed: {e}", "status": 0, "headers": {}}
 
+def _get_json_sync(cfg: BlockNetApiCfg, path: str) -> JsonDict:
+    url = cfg.full_url(path)
 
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "BlockNetPythonClient/1.0",
+    }
+
+    tok = (cfg.token or "").strip()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+        headers["X-Token"] = tok
+        headers["X-BlockNet-Token"] = tok
+
+    req = Request(url, headers=headers, method="GET")
+
+    ssl_ctx = None
+    if urlsplit(url).scheme.lower() == "https":
+        ssl_ctx = _make_ssl_context(cfg.verify_tls)
+
+    try:
+        with urlopen(req, timeout=float(cfg.timeout_s), context=ssl_ctx) as resp:
+            raw = resp.read() or b""
+            status = getattr(resp, "status", 200)
+
+            if not raw:
+                return {"ok": False, "error": "empty response", "status": status}
+
+            try:
+                j = json.loads(raw.decode("utf-8", errors="replace"))
+                return j if isinstance(j, dict) else {
+                    "ok": False,
+                    "error": "json was not an object",
+                    "status": status,
+                }
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "non-json response",
+                    "status": status,
+                    "body_preview": raw[:4000].decode("utf-8", errors="replace"),
+                }
+
+    except HTTPError as e:
+        raw = b""
+        try:
+            raw = e.read() or b""
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "error": f"http error {getattr(e, 'code', 0)}",
+            "status": getattr(e, "code", 0),
+            "headers": dict(getattr(e, "headers", {}) or {}),
+            "body_preview": raw[:4000].decode("utf-8", errors="replace") if raw else "",
+        }
+    except URLError as e:
+        return {"ok": False, "error": f"connect failed: {e}", "status": 0}
+    except Exception as e:
+        return {"ok": False, "error": f"request failed: {e}", "status": 0}
 async def _post_json(cfg: BlockNetApiCfg, path: str, body: JsonDict) -> JsonDict:
     return await asyncio.to_thread(_post_json_sync, cfg, path, body)
 
@@ -221,8 +278,6 @@ class BlockNetP2PoolBackend:
             raise RuntimeError(f"BlockNet p2pool submit failed: {j}")
         return j
 
-    # -------- NEW: scan (sync+async) --------
-
     def scan_sync(
         self,
         *,
@@ -283,7 +338,7 @@ class BlockNetRandomXHasher:
     Docs:
       POST /v1/randomx/hash
       POST /v1/randomx/hash_batch
-      POST /v1/randomx/scan   (optional, if server implements it)
+      POST /v1/randomx/scan
     """
 
     def __init__(
@@ -303,8 +358,6 @@ class BlockNetRandomXHasher:
         if not seed_hash:
             raise ValueError("empty seed_hash")
         self._seed_hex = _bytes_to_hex(seed_hash)
-
-    # -------- sync (for worker threads) --------
 
     def hash_batch_sync(self, items: List[bytes]) -> List[Optional[bytes]]:
         if not self._seed_hex:
@@ -357,8 +410,6 @@ class BlockNetRandomXHasher:
             items.append(bytes(b))
 
         return self.hash_batch_sync(items)
-
-    # -------- NEW: scan (sync+async) --------
 
     def scan_sync(
         self,
@@ -413,8 +464,6 @@ class BlockNetRandomXHasher:
             max_results=max_results,
         )
 
-    # -------- async helpers (optional) --------
-
     async def hash_batch(self, items: List[bytes]) -> List[Optional[bytes]]:
         return await asyncio.to_thread(self.hash_batch_sync, items)
 
@@ -436,17 +485,9 @@ class BlockNetRandomXHasher:
 class BlockNetGpuScanner:
     """
     Docs:
+      GET  /v1/gpu/status
+      POST /v1/gpu/build
       POST /v1/gpu/scan
-
-      {
-        "seed_hex":"...",
-        "blob_hex":"...",
-        "nonce_offset":39,
-        "start_nonce":0,
-        "iters":65536,
-        "target64":"18446744073709551615",
-        "max_results":16
-      }
     """
 
     def __init__(
@@ -457,6 +498,35 @@ class BlockNetGpuScanner:
     ) -> None:
         self.cfg = cfg
         self.logger = logger or (lambda s: None)
+
+    def status_sync(self) -> JsonDict:
+        j = _get_json_sync(self.cfg, "/gpu/status")
+        if not j.get("ok"):
+            raise RuntimeError(f"BlockNet gpu/status failed: {j}")
+        return j
+
+    def build_sync(
+        self,
+        *,
+        path: str = "blocknet_randomx_vm_opencl.cl",
+        build_options: str = "-cl-std=CL1.2",
+    ) -> JsonDict:
+        payload: JsonDict = {
+            "path": path,
+            "build_options": build_options,
+
+            # Recommended host defaults
+            "scan_entry_base": "blocknet_randomx_vm_scan",
+            "scan_entry_ext": "blocknet_randomx_vm_scan_ext",
+            "hash_batch_entry_base": "blocknet_randomx_vm_hash_batch",
+            "hash_batch_entry_ext": "blocknet_randomx_vm_hash_batch_ext",
+            "bench_entry": "blocknet_vm_bench",
+        }
+
+        j = _post_json_sync(self.cfg, "/gpu/build", payload)
+        if not j.get("ok"):
+            raise RuntimeError(f"BlockNet gpu/build failed: {j}")
+        return j
 
     def scan_sync(
         self,
@@ -503,6 +573,21 @@ class BlockNetGpuScanner:
             raise RuntimeError(f"BlockNet gpu/scan failed: {j}")
         return j
 
+    async def status(self) -> JsonDict:
+        return await asyncio.to_thread(self.status_sync)
+
+    async def build(
+        self,
+        *,
+        path: str = "blocknet_randomx_vm_opencl.cl",
+        build_options: str = "-cl-std=CL1.2",
+    ) -> JsonDict:
+        return await asyncio.to_thread(
+            self.build_sync,
+            path=path,
+            build_options=build_options,
+        )
+
     async def scan(
         self,
         *,
@@ -527,4 +612,98 @@ class BlockNetGpuScanner:
             max_results=max_results,
             platform_index=platform_index,
             device_index=device_index,
+        )
+
+
+class BlockNetCpuScanner:
+    """
+    Docs:
+      POST /v1/cpu/scan
+
+      Expected shape:
+      {
+        "seed_hex":"...",
+        "blob_hex":"...",
+        "nonce_offset":39,
+        "start_nonce":0,
+        "iters":65536,
+        "target64":"18446744073709551615",
+        "max_results":16,
+        "threads":4
+      }
+    """
+
+    def __init__(
+        self,
+        cfg: BlockNetApiCfg,
+        *,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.logger = logger or (lambda s: None)
+
+    def scan_sync(
+        self,
+        *,
+        seed_hash: bytes,
+        blob: bytes,
+        nonce_offset: int,
+        start_nonce: int,
+        iters: int,
+        target64: int,
+        max_results: int = 4,
+        threads: Optional[int] = None,
+    ) -> JsonDict:
+        seed_hash = bytes(seed_hash or b"")
+        blob = bytes(blob or b"")
+
+        if not seed_hash:
+            raise ValueError("empty seed_hash")
+        if not blob:
+            raise ValueError("empty blob")
+
+        off = int(nonce_offset)
+        if off < 0 or off + 4 > len(blob):
+            raise ValueError(f"nonce_offset out of range: {off} for blob_len={len(blob)}")
+
+        payload: JsonDict = {
+            "seed_hex": _bytes_to_hex(seed_hash),
+            "blob_hex": _bytes_to_hex(blob),
+            "nonce_offset": off,
+            "start_nonce": int(start_nonce) & 0xFFFFFFFF,
+            "iters": int(iters),
+            "target64": str(int(target64)),
+            "max_results": int(max_results),
+        }
+
+        if threads is not None and int(threads) > 0:
+            payload["threads"] = int(threads)
+
+        j = _post_json_sync(self.cfg, "/cpu/scan", payload)
+        if not j.get("ok"):
+            raise RuntimeError(f"BlockNet cpu/scan failed: {j}")
+        return j
+
+    async def scan(
+        self,
+        *,
+        seed_hash: bytes,
+        blob: bytes,
+        nonce_offset: int,
+        start_nonce: int,
+        iters: int,
+        target64: int,
+        max_results: int = 4,
+        threads: Optional[int] = None,
+    ) -> JsonDict:
+        return await asyncio.to_thread(
+            self.scan_sync,
+            seed_hash=seed_hash,
+            blob=blob,
+            nonce_offset=nonce_offset,
+            start_nonce=start_nonce,
+            iters=iters,
+            target64=target64,
+            max_results=max_results,
+            threads=threads,
         )

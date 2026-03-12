@@ -178,10 +178,11 @@ class MinerConfig:
     use_bn_p2pool: bool
     use_bn_randomx: bool
 
-    # NEW (optional scan toggles)
+    # scan toggles
     use_bn_p2pool_scan: bool
     use_bn_randomx_scan: bool
     use_bn_gpu_scan: bool
+    use_bn_cpu_scan: bool
 
     bn_api_relay: str
     bn_api_token: str
@@ -189,6 +190,7 @@ class MinerConfig:
     bn_rx_batch: int
     scan_iters: int
     submit_workers: int
+
 
 class MinerWorker(QThread):
     log_line = pyqtSignal(str)
@@ -241,7 +243,6 @@ class MinerWorker(QThread):
                 host = "127.0.0.1"
                 port = 3333
 
-            # Build kwargs defensively so this GUI works with older Miner versions too
             miner_kwargs: Dict[str, Any] = dict(
                 stratum_host=host,
                 stratum_port=port,
@@ -270,6 +271,8 @@ class MinerWorker(QThread):
                 miner_kwargs["use_blocknet_randomx_scan"] = bool(self.cfg.use_bn_randomx_scan)
             if "use_blocknet_gpu_scan" in sig.parameters:
                 miner_kwargs["use_blocknet_gpu_scan"] = bool(self.cfg.use_bn_gpu_scan)
+            if "use_blocknet_cpu_scan" in sig.parameters:
+                miner_kwargs["use_blocknet_cpu_scan"] = bool(self.cfg.use_bn_cpu_scan)
             if "scan_iters" in sig.parameters:
                 miner_kwargs["scan_iters"] = int(self.cfg.scan_iters)
 
@@ -294,7 +297,6 @@ class MinerWorker(QThread):
                     f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | job={job_id} | p2pool={b_p2} rx={b_rx}"
                 )
 
-                # Optional BlockNet reporting
                 if self._bn_heartbeat:
                     try:
                         self._bn_heartbeat.execute(
@@ -349,7 +351,6 @@ class MainWindow(QMainWindow):
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
 
-        # For "Log focuses full width"
         self._saved_main_split_sizes: Optional[list[int]] = None
         self._log_focus_enabled: bool = False
 
@@ -379,7 +380,6 @@ class MainWindow(QMainWindow):
         self.main_split.setHandleWidth(10)
         root.addWidget(self.main_split, 1)
 
-        # LEFT SIDE: scrollable settings
         self.left_scroll = QScrollArea()
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -462,11 +462,12 @@ class MainWindow(QMainWindow):
 
         gb_bn_mine = QGroupBox("BlockNet Mining Backends (optional)")
         mfl = QFormLayout(gb_bn_mine)
+
         self.cb_bn_gpu_scan = QCheckBox("Use BlockNet GPU scan (/gpu/scan) — OpenCL GPU server-side scanning")
+        self.cb_bn_cpu_scan = QCheckBox("Use BlockNet CPU scan (/cpu/scan) — CPU server-side scanning")
         self.cb_bn_p2pool = QCheckBox("Use BlockNet P2Pool API (instead of direct Stratum TCP)")
         self.cb_bn_randomx = QCheckBox("Use BlockNet RandomX API (remote hashing)")
 
-        # NEW scan options
         self.cb_bn_p2pool_scan = QCheckBox("Use BlockNet P2Pool scan (/p2pool/scan) — server-side scanning")
         self.cb_bn_randomx_scan = QCheckBox("Use BlockNet RandomX scan (/randomx/scan) — server-side scanning")
 
@@ -489,6 +490,7 @@ class MainWindow(QMainWindow):
         self.sp_scan_iters.setValue(1000)
 
         mfl.addRow(self.cb_bn_gpu_scan)
+        mfl.addRow(self.cb_bn_cpu_scan)
         mfl.addRow(self.cb_bn_p2pool)
         mfl.addRow(self.cb_bn_randomx)
         mfl.addRow(self.cb_bn_p2pool_scan)
@@ -507,6 +509,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_p2pool_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_randomx_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_gpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_bn_cpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
@@ -572,7 +575,6 @@ class MainWindow(QMainWindow):
 
         log = QWidget()
         ll = QVBoxLayout(log)
-        # maximize usable space in log view
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
         self.txt_log = QPlainTextEdit()
@@ -606,7 +608,12 @@ class MainWindow(QMainWindow):
         if not sender.isChecked():
             return
 
-        for cb in (self.cb_bn_p2pool_scan, self.cb_bn_randomx_scan, self.cb_bn_gpu_scan):
+        for cb in (
+            self.cb_bn_p2pool_scan,
+            self.cb_bn_randomx_scan,
+            self.cb_bn_gpu_scan,
+            self.cb_bn_cpu_scan,
+        ):
             if cb is sender:
                 continue
             old = cb.blockSignals(True)
@@ -617,22 +624,19 @@ class MainWindow(QMainWindow):
         p2 = bool(self.cb_bn_p2pool.isChecked())
         rx = bool(self.cb_bn_randomx.isChecked())
 
-        # p2pool scan only makes sense with p2pool API enabled
         self.cb_bn_p2pool_scan.setEnabled(p2)
         if not p2:
             self.cb_bn_p2pool_scan.setChecked(False)
 
-        # randomx scan only makes sense with randomx API enabled
         self.cb_bn_randomx_scan.setEnabled(rx)
         if not rx:
             self.cb_bn_randomx_scan.setChecked(False)
 
-        # gpu scan can work with either direct Stratum jobs or BlockNet P2Pool jobs,
-        # so it stays independently available as long as the API relay is configured.
+        # gpu/cpu scan can work with direct jobs or BlockNet P2Pool jobs
         self.cb_bn_gpu_scan.setEnabled(True)
+        self.cb_bn_cpu_scan.setEnabled(True)
 
     def _on_tab_changed(self, idx: int) -> None:
-        # Make Log tab "cover settings fully" by hiding left panel while Log is selected.
         tab_name = self.tabs.tabText(idx)
         focus = (tab_name == "Log")
         self._set_log_focus(focus)
@@ -641,7 +645,6 @@ class MainWindow(QMainWindow):
         if enable and not self._log_focus_enabled:
             self._saved_main_split_sizes = self.main_split.sizes()
             self.left_scroll.setVisible(False)
-            # ensure right expands now
             self.main_split.setSizes([0, max(1, self.width())])
             self._log_focus_enabled = True
         elif (not enable) and self._log_focus_enabled:
@@ -728,23 +731,24 @@ class MainWindow(QMainWindow):
         randomx_lib = self.ed_randomx.text().strip()
         scan_iters = int(self.sp_scan_iters.value())
         submit_workers = int(self.sp_submit_workers.value())
+
         use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
         use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
         use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
         use_bn_gpu_scan = bool(self.cb_bn_gpu_scan.isChecked())
+        use_bn_cpu_scan = bool(self.cb_bn_cpu_scan.isChecked())
+
         if not wallet:
             QMessageBox.critical(self, "Missing Wallet", "Please enter your Monero wallet address.")
             return
 
-        # Stratum is only required if NOT using BlockNet P2Pool backend
         if (not use_bn_p2pool) and (":" not in stratum):
             QMessageBox.critical(self, "Invalid Stratum", "Stratum must be host:port (e.g. 127.0.0.1:3333).")
             return
 
-        # If any BlockNet mining backend enabled, require API relay
         bn_api_relay = self.ed_bn_api_relay.text().strip()
-        if (use_bn_p2pool or use_bn_randomx or use_bn_p2pool_scan or use_bn_randomx_scan or use_bn_gpu_scan) and not bn_api_relay:
+        if (use_bn_p2pool or use_bn_randomx or use_bn_p2pool_scan or use_bn_randomx_scan or use_bn_gpu_scan or use_bn_cpu_scan) and not bn_api_relay:
             QMessageBox.critical(self, "Missing BlockNet API Relay", "Please enter BlockNet API relay host:port (e.g. 1.2.3.4:38888).")
             return
 
@@ -767,8 +771,10 @@ class MainWindow(QMainWindow):
             use_bn_p2pool=use_bn_p2pool,
             use_bn_randomx=use_bn_randomx,
             use_bn_gpu_scan=use_bn_gpu_scan,
+            use_bn_cpu_scan=use_bn_cpu_scan,
             use_bn_p2pool_scan=use_bn_p2pool_scan,
             use_bn_randomx_scan=use_bn_randomx_scan,
+
             submit_workers=submit_workers,
             bn_api_relay=bn_api_relay,
             bn_api_token=self.ed_bn_api_token.text().strip(),
@@ -852,8 +858,10 @@ class MainWindow(QMainWindow):
                 "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
                 "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
                 "bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
+                "bn_cpu_scan": bool(self.cb_bn_cpu_scan.isChecked()),
                 "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
                 "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
+
                 "submit_workers": int(self.sp_submit_workers.value()),
                 "bn_api_relay": self.ed_bn_api_relay.text().strip(),
                 "bn_api_token": self.ed_bn_api_token.text().strip(),
@@ -889,6 +897,7 @@ class MainWindow(QMainWindow):
             self.cb_bn_p2pool.setChecked(bool(j.get("bn_p2pool", False)))
             self.cb_bn_randomx.setChecked(bool(j.get("bn_randomx", False)))
             self.cb_bn_gpu_scan.setChecked(bool(j.get("bn_gpu_scan", False)))
+            self.cb_bn_cpu_scan.setChecked(bool(j.get("bn_cpu_scan", False)))
             self.cb_bn_p2pool_scan.setChecked(bool(j.get("bn_p2pool_scan", False)))
             self.cb_bn_randomx_scan.setChecked(bool(j.get("bn_randomx_scan", False)))
 
