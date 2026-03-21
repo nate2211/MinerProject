@@ -59,6 +59,10 @@ class JobState:
                 self._cv.wait(timeout=timeout)
             return self._seq, self._job
 
+    def wake_all(self) -> None:
+        with self._cv:
+            self._cv.notify_all()
+
     def get(self) -> Optional[MoneroJob]:
         with self._mu:
             return self._job
@@ -195,6 +199,7 @@ class Miner:
         self.job_state = JobState()
         self.share_q: "queue.Queue[Share]" = queue.Queue()
         self._stop = threading.Event()
+        self._worker_threads: List[threading.Thread] = []
 
         self._hashes = 0
         self._hash_mu = threading.Lock()
@@ -240,8 +245,11 @@ class Miner:
                 self.rx = RandomX(self.logger)
 
     def stop(self) -> None:
+        if self._stop.is_set():
+            return
         self.logger("[Miner] Stop signal received.")
         self._stop.set()
+        self.job_state.wake_all()
 
     def add_hashes(self, n: int) -> None:
         with self._hash_mu:
@@ -606,8 +614,10 @@ class Miner:
 
                 self.job_state.set(MoneroJob.from_stratum(login.job))
 
+            self._worker_threads = []
             for i in range(self.threads):
                 t = threading.Thread(target=self._worker, args=(i,), name=f"Worker-{i}", daemon=True)
+                self._worker_threads.append(t)
                 t.start()
 
             async def job_loop() -> None:

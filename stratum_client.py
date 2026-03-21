@@ -176,18 +176,22 @@ class StratumClient:
         self._closed = True
         self._connected_evt.clear()
         self._logged_in_evt.clear()
+        self._auto_login_enabled = False
+        self._client_id = ""
 
-        if self._reconnect_task:
-            self._reconnect_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._reconnect_task
-            self._reconnect_task = None
+        reconnect_task = self._reconnect_task
+        self._reconnect_task = None
+        if reconnect_task:
+            reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_task
 
-        if self._reader_task:
-            self._reader_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._reader_task
-            self._reader_task = None
+        reader_task = self._reader_task
+        self._reader_task = None
+        if reader_task:
+            reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reader_task
 
         await self._shutdown_transport()
         self._fail_all_pending(StratumDisconnected("client closed"))
@@ -274,10 +278,12 @@ class StratumClient:
         self._connected_evt.set()
         self.logger("[Stratum] Connected.")
 
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._reader_task
+        old_reader_task = self._reader_task
+        self._reader_task = None
+        if old_reader_task and not old_reader_task.done():
+            old_reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await old_reader_task
 
         self._reader_task = asyncio.create_task(self._reader_loop())
 
@@ -443,16 +449,18 @@ class StratumClient:
         self._writer = None
 
         current = asyncio.current_task()
-        if self._reader_task and self._reader_task is not current:
-            self._reader_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._reader_task
+        reader_task = self._reader_task
         self._reader_task = None
+
+        if reader_task and reader_task is not current:
+            reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reader_task
 
         if writer is not None:
             with contextlib.suppress(Exception):
                 writer.close()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await writer.wait_closed()
 
     def _fail_all_pending(self, exc: BaseException) -> None:

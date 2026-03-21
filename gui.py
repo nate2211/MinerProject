@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -202,11 +204,13 @@ class MinerWorker(QThread):
         super().__init__()
         self.cfg = cfg
         self._miner: Optional[Miner] = None
+        self._stopping = False
 
         self._bn_heartbeat = None
         self._bn_put = None
 
     def stop(self) -> None:
+        self._stopping = True
         if self._miner:
             try:
                 self._miner.stop()
@@ -227,13 +231,11 @@ class MinerWorker(QThread):
         try:
             self.state_changed.emit("RUNNING")
 
-            # Only matters for LOCAL RandomX
             if (not self.cfg.use_bn_randomx) and self.cfg.randomx_lib.strip():
                 os.environ["RANDOMX_LIB"] = self.cfg.randomx_lib.strip()
 
             self._setup_blocknet_reporting()
 
-            # Stratum host/port is only required when NOT using BlockNet P2Pool backend
             stratum = (self.cfg.stratum or "").strip()
             if ":" in stratum:
                 host, port_s = stratum.rsplit(":", 1)
@@ -325,23 +327,39 @@ class MinerWorker(QThread):
                     except Exception as e:
                         self.log_line.emit(f"[blocknet] put error: {e}")
 
-            import asyncio
             asyncio.run(self._miner.run(on_stats=on_stats))
 
-            self.state_changed.emit("STOPPED")
-
+        except asyncio.CancelledError:
+            self.log_line.emit("[worker] cancelled during shutdown")
         except Exception:
-            import traceback
+            tb = traceback.format_exc()
+            if self._stopping:
+                self.log_line.emit(tb)
+            else:
+                self.fatal_error.emit(tb)
+        finally:
             self.state_changed.emit("STOPPED")
-            self.fatal_error.emit(traceback.format_exc())
+            self._miner = None
 
+def _mono_font(point_size: int = 10) -> QFont:
+    """
+    Return a readable fixed-width font for log/raw text panes.
+    Tries common monospace families first, then falls back to Qt's
+    monospace style hint if the platform substitutes a different font.
+    """
+    for family in ("Consolas", "Cascadia Mono", "Courier New", "Menlo", "Monaco", "DejaVu Sans Mono"):
+        font = QFont(family)
+        font.setStyleHint(QFont.Monospace)
+        font.setFixedPitch(True)
+        font.setPointSize(point_size)
+        if font.exactMatch():
+            return font
 
-def _mono_font() -> QFont:
-    f = QFont("Consolas")
-    f.setStyleHint(QFont.Monospace)
-    f.setPointSize(10)
-    return f
-
+    font = QFont()
+    font.setStyleHint(QFont.Monospace)
+    font.setFixedPitch(True)
+    font.setPointSize(point_size)
+    return font
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -800,6 +818,8 @@ class MainWindow(QMainWindow):
     def _stop(self) -> None:
         if self.worker and self.worker.isRunning():
             self._append_log("[gui] stopping…")
+            self.btn_stop.setDisabled(True)
+            self.btn_start.setDisabled(True)
             self.worker.stop()
         else:
             self._set_running(False)
@@ -915,10 +935,18 @@ class MainWindow(QMainWindow):
     def closeEvent(self, ev) -> None:
         try:
             if self.worker and self.worker.isRunning():
+                self._append_log("[gui] closing window: stopping miner first…")
+                self.btn_start.setDisabled(True)
+                self.btn_stop.setDisabled(True)
                 self.worker.stop()
-                self.worker.wait(2000)
-        except Exception:
-            pass
+
+                if not self.worker.wait(10000):
+                    self._append_log("[gui] miner is still shutting down; close canceled to avoid a crash.")
+                    ev.ignore()
+                    return
+        except Exception as e:
+            self._append_log(f"[gui] closeEvent warning: {e}")
+
         super().closeEvent(ev)
 
 
