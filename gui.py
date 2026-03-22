@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import (
 )
 
 from miner_core import Miner
+from virtualasic import resolve_resource_path
 
 from registry import BLOCKS
 import blocks_blocknet  # registers blocknet_heartbeat / blocknet_put
@@ -55,6 +56,55 @@ def app_data_dir(app_name: str = "MoneroMinerGUI") -> Path:
 
 
 CFG_PATH = app_data_dir() / "miner_gui_config.json"
+
+
+def _resource_roots() -> list[Path]:
+    roots: list[Path] = []
+    try:
+        roots.append(Path.cwd())
+    except Exception:
+        pass
+    try:
+        roots.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            roots.append(Path(meipass))
+        except Exception:
+            pass
+    exe = getattr(sys, "executable", "")
+    if exe:
+        try:
+            roots.append(Path(exe).resolve().parent)
+        except Exception:
+            pass
+
+    out: list[Path] = []
+    seen = set()
+    for p in roots:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        key = str(rp).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(rp)
+    return out
+
+
+def _pick_existing_path(current_text: str, fallback_names: tuple[str, ...]) -> str:
+    resolved = resolve_resource_path(current_text, fallback_names=fallback_names)
+    if resolved and Path(resolved).exists():
+        return resolved
+    for root in _resource_roots():
+        for name in fallback_names:
+            p = root / name
+            if p.exists():
+                return str(p)
+    return current_text or str(Path.home())
 
 
 def apply_dark_theme(app: QApplication) -> None:
@@ -75,7 +125,8 @@ def apply_dark_theme(app: QApplication) -> None:
     pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
     app.setPalette(pal)
 
-    app.setStyleSheet("""
+    app.setStyleSheet(
+        """
         QWidget { font-size: 12px; }
         QGroupBox {
             border: 1px solid #3a3a3a;
@@ -157,7 +208,8 @@ def apply_dark_theme(app: QApplication) -> None:
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
             background: transparent;
         }
-    """)
+        """
+    )
 
 
 @dataclass
@@ -169,22 +221,24 @@ class MinerConfig:
     agent: str
     randomx_lib: str
 
-    # BlockNet reporting (optional)
     use_blocknet: bool
     blocknet_relay: str
     blocknet_token: str
     blocknet_id: str
     blocknet_key: str
 
-    # BlockNet mining backends (optional)
     use_bn_p2pool: bool
     use_bn_randomx: bool
-
-    # scan toggles
     use_bn_p2pool_scan: bool
     use_bn_randomx_scan: bool
     use_bn_gpu_scan: bool
     use_bn_cpu_scan: bool
+
+    use_virtualasic_scan: bool
+    virtualasic_dll: str
+    virtualasic_kernel: str
+    virtualasic_kernel_name: str
+    virtualasic_core_count: int
 
     bn_api_relay: str
     bn_api_token: str
@@ -197,7 +251,7 @@ class MinerConfig:
 class MinerWorker(QThread):
     log_line = pyqtSignal(str)
     stats_updated = pyqtSignal(dict)
-    state_changed = pyqtSignal(str)   # "RUNNING" | "STOPPED"
+    state_changed = pyqtSignal(str)
     fatal_error = pyqtSignal(str)
 
     def __init__(self, cfg: MinerConfig) -> None:
@@ -234,6 +288,11 @@ class MinerWorker(QThread):
             if (not self.cfg.use_bn_randomx) and self.cfg.randomx_lib.strip():
                 os.environ["RANDOMX_LIB"] = self.cfg.randomx_lib.strip()
 
+            if self.cfg.virtualasic_dll.strip():
+                os.environ["VIRTUALASIC_LIB"] = self.cfg.virtualasic_dll.strip()
+            if self.cfg.virtualasic_kernel.strip():
+                os.environ["VIRTUALASIC_KERNEL"] = self.cfg.virtualasic_kernel.strip()
+
             self._setup_blocknet_reporting()
 
             stratum = (self.cfg.stratum or "").strip()
@@ -253,12 +312,10 @@ class MinerWorker(QThread):
                 threads=int(self.cfg.threads),
                 agent=self.cfg.agent.strip() or "py-blockminer/0.1",
                 logger=self.log_line.emit,
-
                 use_blocknet_p2pool=bool(self.cfg.use_bn_p2pool),
                 blocknet_api_relay=self.cfg.bn_api_relay.strip(),
                 blocknet_api_token=self.cfg.bn_api_token.strip(),
                 blocknet_api_prefix=(self.cfg.bn_api_prefix.strip() or "/v1"),
-
                 use_blocknet_randomx=bool(self.cfg.use_bn_randomx),
                 randomx_batch_size=int(self.cfg.bn_rx_batch),
                 submit_workers=int(self.cfg.submit_workers),
@@ -275,6 +332,16 @@ class MinerWorker(QThread):
                 miner_kwargs["use_blocknet_gpu_scan"] = bool(self.cfg.use_bn_gpu_scan)
             if "use_blocknet_cpu_scan" in sig.parameters:
                 miner_kwargs["use_blocknet_cpu_scan"] = bool(self.cfg.use_bn_cpu_scan)
+            if "use_virtualasic_scan" in sig.parameters:
+                miner_kwargs["use_virtualasic_scan"] = bool(self.cfg.use_virtualasic_scan)
+            if "virtualasic_dll" in sig.parameters:
+                miner_kwargs["virtualasic_dll"] = self.cfg.virtualasic_dll.strip()
+            if "virtualasic_kernel" in sig.parameters:
+                miner_kwargs["virtualasic_kernel"] = self.cfg.virtualasic_kernel.strip()
+            if "virtualasic_kernel_name" in sig.parameters:
+                miner_kwargs["virtualasic_kernel_name"] = self.cfg.virtualasic_kernel_name.strip() or "monero_scan"
+            if "virtualasic_core_count" in sig.parameters:
+                miner_kwargs["virtualasic_core_count"] = int(self.cfg.virtualasic_core_count)
             if "scan_iters" in sig.parameters:
                 miner_kwargs["scan_iters"] = int(self.cfg.scan_iters)
 
@@ -341,12 +408,8 @@ class MinerWorker(QThread):
             self.state_changed.emit("STOPPED")
             self._miner = None
 
+
 def _mono_font(point_size: int = 10) -> QFont:
-    """
-    Return a readable fixed-width font for log/raw text panes.
-    Tries common monospace families first, then falls back to Qt's
-    monospace style hint if the platform substitutes a different font.
-    """
     for family in ("Consolas", "Cascadia Mono", "Courier New", "Menlo", "Monaco", "DejaVu Sans Mono"):
         font = QFont(family)
         font.setStyleHint(QFont.Monospace)
@@ -361,10 +424,11 @@ def _mono_font(point_size: int = 10) -> QFont:
     font.setPointSize(point_size)
     return font
 
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet Edition")
+        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC")
 
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
@@ -401,7 +465,7 @@ class MainWindow(QMainWindow):
         self.left_scroll = QScrollArea()
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.left_scroll.setMinimumWidth(420)
+        self.left_scroll.setMinimumWidth(460)
         self.left_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.left_container = QWidget()
@@ -424,8 +488,6 @@ class MainWindow(QMainWindow):
 
         self.main_split.setStretchFactor(0, 1)
         self.main_split.setStretchFactor(1, 2)
-
-        # ---------------- Controls groups ----------------
 
         gb_conn = QGroupBox("Mining (P2Pool Stratum)")
         fl = QFormLayout(gb_conn)
@@ -478,21 +540,37 @@ class MainWindow(QMainWindow):
 
         self.left_layout.addWidget(gb_bn)
 
-        gb_bn_mine = QGroupBox("BlockNet Mining Backends (optional)")
+        gb_bn_mine = QGroupBox("Mining Backends / Scan Modes")
         mfl = QFormLayout(gb_bn_mine)
 
-        self.cb_bn_gpu_scan = QCheckBox("Use BlockNet GPU scan (/gpu/scan) — OpenCL GPU server-side scanning")
-        self.cb_bn_cpu_scan = QCheckBox("Use BlockNet CPU scan (/cpu/scan) — CPU server-side scanning")
+        self.cb_bn_gpu_scan = QCheckBox("Use BlockNet GPU scan (/gpu/scan) — server-side GPU scanning")
+        self.cb_bn_cpu_scan = QCheckBox("Use BlockNet CPU scan (/cpu/scan) — server-side CPU scanning")
         self.cb_bn_p2pool = QCheckBox("Use BlockNet P2Pool API (instead of direct Stratum TCP)")
         self.cb_bn_randomx = QCheckBox("Use BlockNet RandomX API (remote hashing)")
-
         self.cb_bn_p2pool_scan = QCheckBox("Use BlockNet P2Pool scan (/p2pool/scan) — server-side scanning")
         self.cb_bn_randomx_scan = QCheckBox("Use BlockNet RandomX scan (/randomx/scan) — server-side scanning")
+
+        self.cb_vasic_scan = QCheckBox("Use VirtualASIC local scan — loads VirtualASIC.dll and a compatible scan kernel")
 
         self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
         self.ed_bn_api_token = QLineEdit("")
         self.ed_bn_api_token.setEchoMode(QLineEdit.Password)
         self.ed_bn_api_prefix = QLineEdit("/v1")
+
+        self.ed_vasic_dll = QLineEdit("")
+        self.btn_browse_vasic_dll = QPushButton("Browse…")
+        self.btn_browse_vasic_dll.clicked.connect(self._browse_virtualasic_dll)
+
+        self.ed_vasic_kernel = QLineEdit("")
+        self.btn_browse_vasic_kernel = QPushButton("Browse…")
+        self.btn_browse_vasic_kernel.clicked.connect(self._browse_virtualasic_kernel)
+
+        self.ed_vasic_kernel_name = QLineEdit("monero_scan")
+
+        self.sp_vasic_core_count = QSpinBox()
+        self.sp_vasic_core_count.setRange(0, 1024)
+        self.sp_vasic_core_count.setValue(0)
+        self.sp_vasic_core_count.setToolTip("0 lets VirtualASIC choose its preferred local size.")
 
         self.sp_bn_rx_batch = QSpinBox()
         self.sp_bn_rx_batch.setRange(1, 4096)
@@ -513,12 +591,25 @@ class MainWindow(QMainWindow):
         mfl.addRow(self.cb_bn_randomx)
         mfl.addRow(self.cb_bn_p2pool_scan)
         mfl.addRow(self.cb_bn_randomx_scan)
+        mfl.addRow(self.cb_vasic_scan)
         mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
         mfl.addRow("API Token", self.ed_bn_api_token)
         mfl.addRow("API Prefix", self.ed_bn_api_prefix)
+        mfl.addRow("VirtualASIC DLL", self._hbox(self.ed_vasic_dll, self.btn_browse_vasic_dll))
+        mfl.addRow("VirtualASIC kernel", self._hbox(self.ed_vasic_kernel, self.btn_browse_vasic_kernel))
+        mfl.addRow("VirtualASIC kernel name", self.ed_vasic_kernel_name)
+        mfl.addRow("VirtualASIC core count", self.sp_vasic_core_count)
         mfl.addRow("RandomX batch size", self.sp_bn_rx_batch)
         mfl.addRow("Share workers", self.sp_submit_workers)
         mfl.addRow("Scan iterations", self.sp_scan_iters)
+
+        info = QLabel(
+            "VirtualASIC mode expects a compatible kernel that writes result records as "
+            "[nonce_u32 little-endian][32-byte hash] and a count buffer."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#bcbcbc;")
+        mfl.addRow(info)
 
         self.left_layout.addWidget(gb_bn_mine)
 
@@ -528,6 +619,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_randomx_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_gpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_cpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_vasic_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
@@ -553,7 +645,8 @@ class MainWindow(QMainWindow):
 
         self.btn_save.clicked.connect(self._save_cfg)
         self.btn_load.clicked.connect(self._load_cfg)
-        self.btn_clear.clicked.connect(lambda: self.txt_log.setPlainText(""))
+        btn_clear_target = lambda: self.txt_log.setPlainText("")
+        self.btn_clear.clicked.connect(btn_clear_target)
 
         btn_row2.addWidget(self.btn_save)
         btn_row2.addWidget(self.btn_load)
@@ -562,8 +655,6 @@ class MainWindow(QMainWindow):
 
         self.left_layout.addWidget(gb_ctrl)
         self.left_layout.addStretch(1)
-
-        # ---------------- Right tabs ----------------
 
         dash = QWidget()
         dl = QVBoxLayout(dash)
@@ -614,10 +705,24 @@ class MainWindow(QMainWindow):
         self.uptime_timer.setInterval(500)
         self.uptime_timer.timeout.connect(self._tick_uptime)
 
-        self.main_split.setSizes([560, 900])
+        self.main_split.setSizes([620, 900])
 
         self._load_cfg()
+        self._autofill_resource_guesses()
         self.statusBar().showMessage("Ready")
+
+    def _autofill_resource_guesses(self) -> None:
+        if not self.ed_vasic_dll.text().strip():
+            guess = resolve_resource_path("", fallback_names=("VirtualASIC.dll", "virtualasic.dll"))
+            if guess:
+                self.ed_vasic_dll.setText(guess)
+        if not self.ed_vasic_kernel.text().strip():
+            guess = resolve_resource_path(
+                "",
+                fallback_names=("monero_scan.cl", "virtualasic_monero_scan.cl", "randomx_scan.cl"),
+            )
+            if guess:
+                self.ed_vasic_kernel.setText(guess)
 
     def _sync_scan_mode_exclusive(self) -> None:
         sender = self.sender()
@@ -631,6 +736,7 @@ class MainWindow(QMainWindow):
             self.cb_bn_randomx_scan,
             self.cb_bn_gpu_scan,
             self.cb_bn_cpu_scan,
+            self.cb_vasic_scan,
         ):
             if cb is sender:
                 continue
@@ -650,14 +756,13 @@ class MainWindow(QMainWindow):
         if not rx:
             self.cb_bn_randomx_scan.setChecked(False)
 
-        # gpu/cpu scan can work with direct jobs or BlockNet P2Pool jobs
         self.cb_bn_gpu_scan.setEnabled(True)
         self.cb_bn_cpu_scan.setEnabled(True)
+        self.cb_vasic_scan.setEnabled(True)
 
     def _on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
-        focus = (tab_name == "Log")
-        self._set_log_focus(focus)
+        self._set_log_focus(tab_name == "Log")
 
     def _set_log_focus(self, enable: bool) -> None:
         if enable and not self._log_focus_enabled:
@@ -670,7 +775,7 @@ class MainWindow(QMainWindow):
             if self._saved_main_split_sizes:
                 self.main_split.setSizes(self._saved_main_split_sizes)
             else:
-                self.main_split.setSizes([560, 900])
+                self.main_split.setSizes([620, 900])
             self._log_focus_enabled = False
 
     @staticmethod
@@ -689,12 +794,12 @@ class MainWindow(QMainWindow):
             return
         self.txt_log.appendPlainText(s)
 
-        MAX_BLOCKS = 5000
+        max_blocks = 5000
         doc = self.txt_log.document()
-        if doc.blockCount() > MAX_BLOCKS:
+        if doc.blockCount() > max_blocks:
             cur = self.txt_log.textCursor()
             cur.movePosition(cur.Start)
-            for _ in range(doc.blockCount() - MAX_BLOCKS):
+            for _ in range(doc.blockCount() - max_blocks):
                 cur.select(cur.LineUnderCursor)
                 cur.removeSelectedText()
                 cur.deleteChar()
@@ -711,21 +816,40 @@ class MainWindow(QMainWindow):
         self.btn_stop.setDisabled(not running)
 
     def _browse_randomx(self) -> None:
-        start = str(Path.home())
-        cur = self.ed_randomx.text().strip()
-        if cur:
-            p = Path(cur)
-            if p.exists():
-                start = str(p.parent)
-
+        start = _pick_existing_path(self.ed_randomx.text().strip(), ("randomx-dll.dll", "randomx.dll"))
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select RandomX library",
             start,
-            "RandomX Library (*.dll *.so *.dylib);;All files (*.*)"
+            "RandomX Library (*.dll *.so *.dylib);;All files (*.*)",
         )
         if path:
             self.ed_randomx.setText(path)
+
+    def _browse_virtualasic_dll(self) -> None:
+        start = _pick_existing_path(self.ed_vasic_dll.text().strip(), ("VirtualASIC.dll", "virtualasic.dll"))
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select VirtualASIC DLL",
+            start,
+            "VirtualASIC (*.dll *.so *.dylib);;All files (*.*)",
+        )
+        if path:
+            self.ed_vasic_dll.setText(path)
+
+    def _browse_virtualasic_kernel(self) -> None:
+        start = _pick_existing_path(
+            self.ed_vasic_kernel.text().strip(),
+            ("monero_scan.cl", "virtualasic_monero_scan.cl", "randomx_scan.cl"),
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select VirtualASIC kernel",
+            start,
+            "OpenCL Kernel (*.cl *.txt);;All files (*.*)",
+        )
+        if path:
+            self.ed_vasic_kernel.setText(path)
 
     def _tick_uptime(self) -> None:
         if not self.started_at:
@@ -756,6 +880,7 @@ class MainWindow(QMainWindow):
         use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
         use_bn_gpu_scan = bool(self.cb_bn_gpu_scan.isChecked())
         use_bn_cpu_scan = bool(self.cb_bn_cpu_scan.isChecked())
+        use_virtualasic_scan = bool(self.cb_vasic_scan.isChecked())
 
         if not wallet:
             QMessageBox.critical(self, "Missing Wallet", "Please enter your Monero wallet address.")
@@ -765,10 +890,37 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Invalid Stratum", "Stratum must be host:port (e.g. 127.0.0.1:3333).")
             return
 
+        needs_blocknet_api = any(
+            (
+                use_bn_p2pool,
+                use_bn_randomx,
+                use_bn_p2pool_scan,
+                use_bn_randomx_scan,
+                use_bn_gpu_scan,
+                use_bn_cpu_scan,
+            )
+        )
         bn_api_relay = self.ed_bn_api_relay.text().strip()
-        if (use_bn_p2pool or use_bn_randomx or use_bn_p2pool_scan or use_bn_randomx_scan or use_bn_gpu_scan or use_bn_cpu_scan) and not bn_api_relay:
+        if needs_blocknet_api and not bn_api_relay:
             QMessageBox.critical(self, "Missing BlockNet API Relay", "Please enter BlockNet API relay host:port (e.g. 1.2.3.4:38888).")
             return
+
+        vasic_dll = self.ed_vasic_dll.text().strip()
+        vasic_kernel = self.ed_vasic_kernel.text().strip()
+        vasic_kernel_name = self.ed_vasic_kernel_name.text().strip() or "monero_scan"
+        if use_virtualasic_scan:
+            if not vasic_kernel and not resolve_resource_path(
+                "",
+                fallback_names=("monero_scan.cl", "virtualasic_monero_scan.cl", "randomx_scan.cl"),
+            ):
+                QMessageBox.critical(
+                    self,
+                    "Missing VirtualASIC Kernel",
+                    "VirtualASIC scan requires a compatible kernel file. Pick one or bundle it next to the EXE/_MEIPASS.",
+                )
+                return
+            if threads > 1:
+                self._append_log("[gui] warning: VirtualASIC with threads > 1 creates one engine per worker and may reduce GPU efficiency.")
 
         use_bn_reporting = bool(self.cb_bn.isChecked())
 
@@ -779,20 +931,22 @@ class MainWindow(QMainWindow):
             threads=threads,
             agent=agent,
             randomx_lib=randomx_lib,
-
             use_blocknet=use_bn_reporting,
             blocknet_relay=self.ed_bn_relay.text().strip(),
             blocknet_token=self.ed_bn_token.text().strip(),
             blocknet_id=self.ed_bn_id.text().strip() or "miner1",
             blocknet_key=self.ed_bn_key.text().strip(),
-
             use_bn_p2pool=use_bn_p2pool,
             use_bn_randomx=use_bn_randomx,
             use_bn_gpu_scan=use_bn_gpu_scan,
             use_bn_cpu_scan=use_bn_cpu_scan,
             use_bn_p2pool_scan=use_bn_p2pool_scan,
             use_bn_randomx_scan=use_bn_randomx_scan,
-
+            use_virtualasic_scan=use_virtualasic_scan,
+            virtualasic_dll=vasic_dll,
+            virtualasic_kernel=vasic_kernel,
+            virtualasic_kernel_name=vasic_kernel_name,
+            virtualasic_core_count=int(self.sp_vasic_core_count.value()),
             submit_workers=submit_workers,
             bn_api_relay=bn_api_relay,
             bn_api_token=self.ed_bn_api_token.text().strip(),
@@ -804,6 +958,12 @@ class MainWindow(QMainWindow):
         self._save_cfg()
 
         self.txt_log.appendPlainText("[gui] starting miner…")
+        if use_virtualasic_scan:
+            self.txt_log.appendPlainText(
+                f"[gui] virtualasic dll={resolve_resource_path(vasic_dll, fallback_names=('VirtualASIC.dll', 'virtualasic.dll'))} "
+                f"kernel={resolve_resource_path(vasic_kernel, fallback_names=('monero_scan.cl', 'virtualasic_monero_scan.cl', 'randomx_scan.cl'))} "
+                f"kernel_name={vasic_kernel_name}"
+            )
         self._set_running(True)
         self.started_at = time.time()
         self.uptime_timer.start()
@@ -868,20 +1028,22 @@ class MainWindow(QMainWindow):
                 "agent": self.ed_agent.text().strip(),
                 "threads": int(self.sp_threads.value()),
                 "randomx_lib": self.ed_randomx.text().strip(),
-
                 "blocknet_enabled": bool(self.cb_bn.isChecked()),
                 "blocknet_relay": self.ed_bn_relay.text().strip(),
                 "blocknet_token": self.ed_bn_token.text().strip(),
                 "blocknet_id": self.ed_bn_id.text().strip(),
                 "blocknet_key": self.ed_bn_key.text().strip(),
-
                 "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
                 "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
                 "bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
                 "bn_cpu_scan": bool(self.cb_bn_cpu_scan.isChecked()),
                 "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
                 "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
-
+                "virtualasic_scan": bool(self.cb_vasic_scan.isChecked()),
+                "virtualasic_dll": self.ed_vasic_dll.text().strip(),
+                "virtualasic_kernel": self.ed_vasic_kernel.text().strip(),
+                "virtualasic_kernel_name": self.ed_vasic_kernel_name.text().strip(),
+                "virtualasic_core_count": int(self.sp_vasic_core_count.value()),
                 "submit_workers": int(self.sp_submit_workers.value()),
                 "bn_api_relay": self.ed_bn_api_relay.text().strip(),
                 "bn_api_token": self.ed_bn_api_token.text().strip(),
@@ -920,6 +1082,12 @@ class MainWindow(QMainWindow):
             self.cb_bn_cpu_scan.setChecked(bool(j.get("bn_cpu_scan", False)))
             self.cb_bn_p2pool_scan.setChecked(bool(j.get("bn_p2pool_scan", False)))
             self.cb_bn_randomx_scan.setChecked(bool(j.get("bn_randomx_scan", False)))
+            self.cb_vasic_scan.setChecked(bool(j.get("virtualasic_scan", False)))
+
+            self.ed_vasic_dll.setText(j.get("virtualasic_dll", self.ed_vasic_dll.text()))
+            self.ed_vasic_kernel.setText(j.get("virtualasic_kernel", self.ed_vasic_kernel.text()))
+            self.ed_vasic_kernel_name.setText(j.get("virtualasic_kernel_name", self.ed_vasic_kernel_name.text()))
+            self.sp_vasic_core_count.setValue(int(j.get("virtualasic_core_count", int(self.sp_vasic_core_count.value()))))
 
             self.ed_bn_api_relay.setText(j.get("bn_api_relay", self.ed_bn_api_relay.text()))
             self.ed_bn_api_token.setText(j.get("bn_api_token", self.ed_bn_api_token.text()))
@@ -928,6 +1096,7 @@ class MainWindow(QMainWindow):
             self.sp_scan_iters.setValue(int(j.get("scan_iters", int(self.sp_scan_iters.value()))))
 
             self._sync_scan_checks()
+            self._autofill_resource_guesses()
             self.statusBar().showMessage("Config loaded", 1500)
         except Exception as e:
             self.statusBar().showMessage(f"Config load failed: {e}", 2000)
@@ -955,7 +1124,7 @@ def main() -> int:
     apply_dark_theme(app)
 
     w = MainWindow()
-    w.resize(1280, 820)
+    w.resize(1320, 860)
     w.show()
     return app.exec_()
 

@@ -14,6 +14,7 @@ hidden_imports = [
     'miner_core',
     'randomx_ctypes',
     'stratum_client'
+    'virtualasic'
 ]
 
 a = Analysis(
@@ -23,6 +24,7 @@ a = Analysis(
         # Include the DLL.
         # (Source Path, Dest inside EXE) -> '.' means root of temp folder
         ('randomx-dll.dll', '.'),
+        ('VirtualASIC.dll', '.'),
     ],
     datas=[],
     hiddenimports=hidden_imports,
