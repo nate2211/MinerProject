@@ -2,9 +2,8 @@
 
 block_cipher = None
 
-# List your hidden imports to ensure they are packed
 hidden_imports = [
-    "blocknet_mining_backend.py",
+    'blocknet_mining_backend',
     'blocks_blocknet',
     'blocks_miner',
     'blocknet_client',
@@ -13,20 +12,20 @@ hidden_imports = [
     'monero_job',
     'miner_core',
     'randomx_ctypes',
-    'stratum_client'
-    'virtualasic'
+    'stratum_client',
+    'virtualasic',
 ]
 
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[
-        # Include the DLL.
-        # (Source Path, Dest inside EXE) -> '.' means root of temp folder
         ('randomx-dll.dll', '.'),
         ('VirtualASIC.dll', '.'),
     ],
-    datas=[],
+    datas=[
+        ('virtualasic_monero_scan.cl', '.'),
+    ],
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
@@ -40,13 +39,12 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# In One-File mode, we combine everything into the EXE step
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,   # <--- Binaries are now included here
-    a.zipfiles,   # <--- Zipfiles are now included here
-    a.datas,      # <--- Data files are now included here
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
     name='NatesMoneroMiner',
     debug=False,
@@ -55,7 +53,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True, # Keep True to see mining stats
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
