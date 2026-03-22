@@ -6,6 +6,12 @@
 // This keeps only the strongest few candidates per workgroup instead of
 // appending every screening hit, which reduces CPU verify waste.
 //
+// VirtualASIC metadata:
+// @vasic_mode candidate_merge
+// @vasic_count_arg 8
+// @vasic_merge_buffer 9:36
+// @vasic_partition global_offset
+//
 // ABI:
 //   0:  __global const uchar* seed_hash
 //   1:  __global const uchar* blob
@@ -40,9 +46,18 @@
 //
 // Example stricter build:
 //   -D RX_STRICT_SCREEN=1 -D RX_SECONDARY_MASK_BITS=4 -D RX_TOPK=4
+//
+// VirtualASIC CPU-lane note:
+//   VirtualASIC may compile a CPU-lane variant with -DVASIC_CPU_LANE=1.
+//   The section below reduces work for that path so CPU-side merged candidates
+//   can contribute without exploding overhead.
 
 #pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
 #pragma OPENCL EXTENSION cl_khr_local_int32_base_atomics  : enable
+
+#ifndef VASIC_CPU_LANE
+#define VASIC_CPU_LANE 0
+#endif
 
 #ifndef RX_MAX_BLOB
 #define RX_MAX_BLOB 256u
@@ -90,6 +105,23 @@
 
 #ifndef RX_LOCAL_MAX
 #define RX_LOCAL_MAX 256u
+#endif
+
+#if VASIC_CPU_LANE
+    #undef RX_TOPK
+    #define RX_TOPK 2u
+
+    #undef RX_CACHE_SAMPLE_COUNT
+    #define RX_CACHE_SAMPLE_COUNT 2u
+
+    #undef RX_DATASET_SAMPLE_COUNT
+    #define RX_DATASET_SAMPLE_COUNT 2u
+
+    #undef RX_FINAL_PASSES
+    #define RX_FINAL_PASSES 1u
+
+    #undef RX_VM_SAMPLE_BYTES
+    #define RX_VM_SAMPLE_BYTES 32u
 #endif
 
 __constant ulong KECCAKF_RNDC[24] = {

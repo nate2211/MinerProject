@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -9,7 +8,6 @@ from ctypes import (
     CDLL,
     POINTER,
     addressof,
-    byref,
     c_char,
     c_char_p,
     c_int,
@@ -24,6 +22,13 @@ from typing import Dict, List, Optional, Sequence
 
 RANDOMX_DATASET_ITEM_BYTES = 64
 DEFAULT_RANDOMX_CACHE_BYTES = 256 * 1024 * 1024
+
+_SNAPSHOT_ALLOW_CACHE = True
+_SNAPSHOT_ALLOW_DATASET = True
+
+
+class VirtualASICError(RuntimeError):
+    pass
 
 
 def _as_void_p_from_buffer(buf) -> c_void_p:
@@ -120,10 +125,6 @@ def resolve_resource_path(user_value: str, *, env_var: str = "", fallback_names:
     return raw
 
 
-class VirtualASICError(RuntimeError):
-    pass
-
-
 class _VirtualASICDll:
     def __init__(self, dll_path: str = "", logger=None) -> None:
         self.logger = _logger_or_nop(logger)
@@ -133,9 +134,7 @@ class _VirtualASICDll:
             fallback_names=("VirtualASIC.dll", "virtualasic.dll"),
         )
         if not self.dll_path:
-            raise VirtualASICError(
-                "Could not resolve VirtualASIC.dll. Set VIRTUALASIC_LIB or provide a DLL path."
-            )
+            raise VirtualASICError("Could not resolve VirtualASIC.dll. Set VIRTUALASIC_LIB or provide a DLL path.")
 
         self._dll_dirs: List[object] = []
         self.lib = self._load_cdll(self.dll_path)
@@ -165,55 +164,38 @@ class _VirtualASICDll:
 
     def _bind(self) -> None:
         L = self.lib
-
         L.vasic_create.restype = c_void_p
         L.vasic_create.argtypes = []
-
         L.vasic_create_ex.restype = c_void_p
         L.vasic_create_ex.argtypes = [c_uint32]
-
         L.vasic_destroy.restype = None
         L.vasic_destroy.argtypes = [c_void_p]
-
         L.vasic_reset.restype = c_int
         L.vasic_reset.argtypes = [c_void_p]
-
         L.vasic_set_core_count.restype = c_int
         L.vasic_set_core_count.argtypes = [c_void_p, c_uint32]
-
         L.vasic_get_core_count.restype = c_uint32
         L.vasic_get_core_count.argtypes = [c_void_p]
-
         L.vasic_copy_last_error.restype = c_int
         L.vasic_copy_last_error.argtypes = [c_void_p, POINTER(c_char), c_uint32]
-
         L.vasic_create_buffer.restype = c_uint32
         L.vasic_create_buffer.argtypes = [c_void_p, c_uint32]
-
         L.vasic_release_buffer.restype = c_int
         L.vasic_release_buffer.argtypes = [c_void_p, c_uint32]
-
         L.vasic_write_buffer.restype = c_int
         L.vasic_write_buffer.argtypes = [c_void_p, c_uint32, c_uint32, c_void_p, c_uint32]
-
         L.vasic_read_buffer.restype = c_int
         L.vasic_read_buffer.argtypes = [c_void_p, c_uint32, c_uint32, c_void_p, c_uint32]
-
         L.vasic_load_kernel_source.restype = c_uint32
         L.vasic_load_kernel_source.argtypes = [c_void_p, c_char_p, c_char_p]
-
         L.vasic_load_kernel_file.restype = c_uint32
         L.vasic_load_kernel_file.argtypes = [c_void_p, c_char_p, c_char_p]
-
         L.vasic_release_kernel.restype = c_int
         L.vasic_release_kernel.argtypes = [c_void_p, c_uint32]
-
         L.vasic_set_kernel_arg_buffer.restype = c_int
         L.vasic_set_kernel_arg_buffer.argtypes = [c_void_p, c_uint32, c_uint32, c_uint32]
-
         L.vasic_set_kernel_arg_u32.restype = c_int
         L.vasic_set_kernel_arg_u32.argtypes = [c_void_p, c_uint32, c_uint32, c_uint32]
-
         L.vasic_enqueue_ndrange.restype = c_int
         L.vasic_enqueue_ndrange.argtypes = [c_void_p, c_uint32, c_uint32]
 
@@ -240,7 +222,7 @@ def build_vm_descriptor(*, flags: int, dataset_items: int, cache_ptr: int, datas
     seed_hi = int.from_bytes(seed[8:16], "little", signed=False)
     return struct.pack(
         "<8Q",
-        0x5641534943564D31,  # "VASICVM1"
+        0x5641534943564D31,
         int(flags) & 0xFFFFFFFFFFFFFFFF,
         int(dataset_items) & 0xFFFFFFFFFFFFFFFF,
         int(cache_ptr) & 0xFFFFFFFFFFFFFFFF,
@@ -317,35 +299,6 @@ def snapshot_randomx_state(
 
 
 class VirtualASICScanner:
-    """
-    Thin Python wrapper around VirtualASIC.dll for a result-buffer based scan kernel.
-
-    Core kernel signature/order:
-        0: __global uchar* seed_hash
-        1: __global uchar* blob
-        2: uint blob_len
-        3: uint nonce_offset
-        4: uint start_nonce
-        5: uint target_lo
-        6: uint target_hi
-        7: uint max_results
-        8: __global uint* out_count
-        9: __global uchar* out_records
-
-    Optional RandomX-state extension args, if your kernel supports them:
-        10: __global uchar* randomx_cache
-        11: uint randomx_cache_bytes
-        12: __global uchar* randomx_dataset
-        13: uint randomx_dataset_bytes
-        14: __global uchar* randomx_vm_descriptor
-        15: uint randomx_vm_descriptor_bytes
-
-    Result layout in out_records:
-        repeated fixed-size records of 36 bytes:
-            [0:4]   little-endian nonce_u32
-            [4:36]  32-byte hash
-    """
-
     RECORD_SIZE = 36
 
     def __init__(
@@ -378,6 +331,7 @@ class VirtualASICScanner:
             kernel_path,
             env_var="VIRTUALASIC_KERNEL",
             fallback_names=(
+                "randomx_scan_extended_topk.cl",
                 "randomx_scan_extended.cl",
                 "randomx_scan.cl",
                 "monero_scan.cl",
@@ -386,9 +340,7 @@ class VirtualASICScanner:
             ),
         )
         if not self.kernel_path:
-            raise VirtualASICError(
-                "No VirtualASIC kernel path resolved. Provide a kernel file path or set VIRTUALASIC_KERNEL."
-            )
+            raise VirtualASICError("No VirtualASIC kernel path resolved. Provide a kernel file path or set VIRTUALASIC_KERNEL.")
 
         self.default_max_results = max(1, int(default_max_results))
         self.seed_bytes = max(1, int(seed_bytes))
@@ -471,21 +423,34 @@ class VirtualASICScanner:
         if int(ok) != 1:
             self._raise(msg)
 
+    def _log_kernel_metadata(self, path: Path) -> None:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return
+
+        has_mode = "@vasic_mode candidate_merge" in text
+        has_count = "@vasic_count_arg 8" in text
+        has_merge = "@vasic_merge_buffer 9:36" in text
+        has_partition = "@vasic_partition global_offset" in text
+
+        if has_mode and has_count and has_merge:
+            self.logger("[VirtualASIC] Kernel metadata detected: candidate_merge enabled; CPU-lane build/merge can be used by the DLL.")
+            if has_partition:
+                self.logger("[VirtualASIC] Kernel metadata detected: global_offset partitioning enabled.")
+        else:
+            self.logger("[VirtualASIC] Kernel metadata warning: candidate_merge metadata not fully detected.")
+
     def _load_kernel(self) -> None:
         path = Path(self.kernel_path)
         if not path.exists():
             raise VirtualASICError(f"VirtualASIC kernel file not found: {path}")
-        kid = int(
-            self.lib.vasic_load_kernel_file(
-                self.engine,
-                self.kernel_name.encode("utf-8"),
-                str(path).encode("utf-8"),
-            )
-        )
+        kid = int(self.lib.vasic_load_kernel_file(self.engine, self.kernel_name.encode("utf-8"), str(path).encode("utf-8")))
         if kid == 0:
             self._raise(f"vasic_load_kernel_file failed for '{path}'")
         self.kernel_id = _u32(kid)
         self.logger(f"[VirtualASIC] Kernel loaded: name={self.kernel_name} path={path}")
+        self._log_kernel_metadata(path)
 
     def _release_buffer(self, buf_id: int) -> None:
         if self.engine and int(buf_id):
@@ -503,21 +468,18 @@ class VirtualASICScanner:
     def _alloc_seed_buffer(self, size_bytes: int) -> None:
         if int(self.buf_seed.value):
             self._release_buffer(int(self.buf_seed.value))
-            self.buf_seed = c_uint32(0)
         self.buf_seed = self._alloc_buffer(size_bytes)
 
     def _alloc_blob_buffer(self, size_bytes: int) -> None:
         size_bytes = max(64, int(size_bytes))
         if int(self.buf_blob.value):
             self._release_buffer(int(self.buf_blob.value))
-            self.buf_blob = c_uint32(0)
         self.buf_blob = self._alloc_buffer(size_bytes)
         self._blob_capacity = size_bytes
 
     def _alloc_count_buffer(self) -> None:
         if int(self.buf_count.value):
             self._release_buffer(int(self.buf_count.value))
-            self.buf_count = c_uint32(0)
         self.buf_count = self._alloc_buffer(4)
 
     def _alloc_results_buffer(self, max_results: int) -> None:
@@ -525,7 +487,6 @@ class VirtualASICScanner:
         bytes_needed = max_results * self.RECORD_SIZE
         if int(self.buf_results.value):
             self._release_buffer(int(self.buf_results.value))
-            self.buf_results = c_uint32(0)
         self.buf_results = self._alloc_buffer(bytes_needed)
         self._result_capacity = max_results
 
@@ -563,7 +524,6 @@ class VirtualASICScanner:
 
         raise VirtualASICError(f"Unknown RandomX buffer kind: {which}")
 
-
     def _ensure_placeholder_buffer(self, size_bytes: int = 4) -> c_uint32:
         need = max(1, int(size_bytes))
         if need <= self._rx_placeholder_capacity and int(self.buf_rx_placeholder.value):
@@ -588,53 +548,12 @@ class VirtualASICScanner:
         raise VirtualASICError(f"Unknown RandomX buffer kind: {which}")
 
     def _bind_static_args(self) -> None:
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(0), self.buf_seed),
-            "bind arg0 seed buffer failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(1), self.buf_blob),
-            "bind arg1 blob buffer failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(8), self.buf_count),
-            "bind arg8 count buffer failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(9), self.buf_results),
-            "bind arg9 results buffer failed",
-        )
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(0), self.buf_seed), "bind arg0 seed buffer failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(1), self.buf_blob), "bind arg1 blob buffer failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(8), self.buf_count), "bind arg8 count buffer failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, c_uint32(9), self.buf_results), "bind arg9 results buffer failed")
         if self.enable_randomx_state_args:
             self._bind_extended_args(force=True)
-
-    def _try_set_buffer_arg(self, arg_index: Optional[int], buf: c_uint32, desc: str) -> bool:
-        if arg_index is None:
-            return True
-        ok = int(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(arg_index), buf))
-        if ok == 1:
-            return True
-        if self.strict_randomx_state_args:
-            self._raise(f"bind {desc} buffer failed")
-        self.logger(f"[VirtualASIC] RandomX-state kernel arg not supported for {desc}; continuing without it.")
-        return False
-
-    def _try_set_u32_arg(self, arg_index: Optional[int], value: int, desc: str) -> bool:
-        if arg_index is None:
-            return True
-        ok = int(
-            self.lib.vasic_set_kernel_arg_u32(
-                self.engine,
-                self.kernel_id,
-                _u32(arg_index),
-                _u32(value),
-            )
-        )
-        if ok == 1:
-            return True
-        if self.strict_randomx_state_args:
-            self._raise(f"set {desc} size arg failed")
-        self.logger(f"[VirtualASIC] RandomX-state size arg not supported for {desc}; continuing without it.")
-        return False
 
     def _bind_extended_args(self, force: bool = False) -> bool:
         if not self.enable_randomx_state_args:
@@ -646,30 +565,12 @@ class VirtualASICScanner:
         dataset_buf = self._get_bound_randomx_buffer("dataset")
         vm_buf = self._get_bound_randomx_buffer("vm_state")
 
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(int(self.cache_arg_index)), cache_buf),
-            f"bind arg{self.cache_arg_index} cache buffer failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(int(self.cache_bytes_arg_index)), _u32(int(self._bound_cache_size))),
-            f"set arg{self.cache_bytes_arg_index} cache size failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(int(self.dataset_arg_index)), dataset_buf),
-            f"bind arg{self.dataset_arg_index} dataset buffer failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(int(self.dataset_bytes_arg_index)), _u32(int(self._bound_dataset_size))),
-            f"set arg{self.dataset_bytes_arg_index} dataset size failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(int(self.vm_state_arg_index)), vm_buf),
-            f"bind arg{self.vm_state_arg_index} vm-state buffer failed",
-        )
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(int(self.vm_state_bytes_arg_index)), _u32(int(self._bound_vm_state_size))),
-            f"set arg{self.vm_state_bytes_arg_index} vm-state size failed",
-        )
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(int(self.cache_arg_index)), cache_buf), f"bind arg{self.cache_arg_index} cache buffer failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(int(self.cache_bytes_arg_index)), _u32(int(self._bound_cache_size))), f"set arg{self.cache_bytes_arg_index} cache size failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(int(self.dataset_arg_index)), dataset_buf), f"bind arg{self.dataset_arg_index} dataset buffer failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(int(self.dataset_bytes_arg_index)), _u32(int(self._bound_dataset_size))), f"set arg{self.dataset_bytes_arg_index} dataset size failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_buffer(self.engine, self.kernel_id, _u32(int(self.vm_state_arg_index)), vm_buf), f"bind arg{self.vm_state_arg_index} vm-state buffer failed")
+        self._call_ok(self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(int(self.vm_state_bytes_arg_index)), _u32(int(self._bound_vm_state_size))), f"set arg{self.vm_state_bytes_arg_index} vm-state size failed")
         self._randomx_args_supported = True
         return True
 
@@ -679,7 +580,7 @@ class VirtualASICScanner:
         self._alloc_blob_buffer(max(n, self._blob_capacity * 2 if self._blob_capacity else self.initial_blob_bytes))
         self._bind_static_args()
         if self._last_blob:
-            self._write_buffer(self.buf_blob.value, self._last_blob)
+            self._write_buffer(int(self.buf_blob.value), self._last_blob)
 
     def _ensure_results_capacity(self, max_results: int) -> None:
         if max_results <= self._result_capacity and int(self.buf_results.value):
@@ -693,50 +594,18 @@ class VirtualASICScanner:
             return
         arr = create_string_buffer(payload, len(payload))
         ptr = _as_void_p_from_buffer(arr)
-        self._call_ok(
-            self.lib.vasic_write_buffer(
-                self.engine,
-                _u32(buffer_id),
-                _u32(offset),
-                ptr,
-                _u32(len(payload)),
-            ),
-            f"write buffer {buffer_id} failed",
-        )
+        self._call_ok(self.lib.vasic_write_buffer(self.engine, _u32(buffer_id), _u32(offset), ptr, _u32(len(payload))), f"write buffer {buffer_id} failed")
 
     def _read_buffer(self, buffer_id: int, size_bytes: int, offset: int = 0) -> bytes:
         out = create_string_buffer(int(size_bytes))
         ptr = _as_void_p_from_buffer(out)
-        self._call_ok(
-            self.lib.vasic_read_buffer(
-                self.engine,
-                _u32(buffer_id),
-                _u32(offset),
-                ptr,
-                _u32(size_bytes),
-            ),
-            f"read buffer {buffer_id} failed",
-        )
+        self._call_ok(self.lib.vasic_read_buffer(self.engine, _u32(buffer_id), _u32(offset), ptr, _u32(size_bytes)), f"read buffer {buffer_id} failed")
         return bytes(out.raw)
 
     def _set_u32(self, arg_index: int, value: int) -> None:
-        self._call_ok(
-            self.lib.vasic_set_kernel_arg_u32(
-                self.engine,
-                self.kernel_id,
-                _u32(arg_index),
-                _u32(value),
-            ),
-            f"set arg{arg_index} failed",
-        )
+        self._call_ok(self.lib.vasic_set_kernel_arg_u32(self.engine, self.kernel_id, _u32(arg_index), _u32(value)), f"set arg{arg_index} failed")
 
-    def upload_randomx_state(
-        self,
-        *,
-        cache_bytes: bytes = b"",
-        dataset_bytes: bytes = b"",
-        vm_state_bytes: bytes = b"",
-    ) -> bool:
+    def upload_randomx_state(self, *, cache_bytes: bytes = b"", dataset_bytes: bytes = b"", vm_state_bytes: bytes = b"") -> bool:
         with self._mu:
             cache_payload = bytes(cache_bytes or b"")
             dataset_payload = bytes(dataset_bytes or b"")
@@ -763,21 +632,10 @@ class VirtualASICScanner:
             self._bound_cache_size = len(cache_payload)
             self._bound_dataset_size = len(dataset_payload)
             self._bound_vm_state_size = len(vm_payload)
-
             self._bind_extended_args(force=True)
             return True
 
-    def scan_sync(
-        self,
-        *,
-        seed_hash: bytes,
-        blob: bytes,
-        nonce_offset: int,
-        start_nonce: int,
-        iters: int,
-        target64: int,
-        max_results: Optional[int] = None,
-    ) -> Dict[str, object]:
+    def scan_sync(self, *, seed_hash: bytes, blob: bytes, nonce_offset: int, start_nonce: int, iters: int, target64: int, max_results: Optional[int] = None) -> Dict[str, object]:
         seed_hash = bytes(seed_hash or b"")
         blob = bytes(blob or b"")
         if not seed_hash:
@@ -812,10 +670,7 @@ class VirtualASICScanner:
             if self.enable_randomx_state_args:
                 self._bind_extended_args(force=True)
 
-            self._call_ok(
-                self.lib.vasic_enqueue_ndrange(self.engine, self.kernel_id, _u32(max(1, int(iters)))),
-                "vasic_enqueue_ndrange failed",
-            )
+            self._call_ok(self.lib.vasic_enqueue_ndrange(self.engine, self.kernel_id, _u32(max(1, int(iters)))), "vasic_enqueue_ndrange failed")
 
             count_raw = self._read_buffer(int(self.buf_count.value), 4)
             found_count = int.from_bytes(count_raw[:4], "little", signed=False)
@@ -833,19 +688,9 @@ class VirtualASICScanner:
                     hash32 = rec[4:36]
                     if len(hash32) != 32:
                         continue
-                    found.append(
-                        {
-                            "nonce_u32": nonce_u32,
-                            "hash_hex": hash32.hex(),
-                        }
-                    )
+                    found.append({"nonce_u32": nonce_u32, "hash_hex": hash32.hex()})
 
-            return {
-                "hashes_done": max(1, int(iters)),
-                "found": found,
-                "start_nonce": int(start_nonce) & 0xFFFFFFFF,
-                "iters": max(1, int(iters)),
-            }
+            return {"hashes_done": max(1, int(iters)), "found": found, "start_nonce": int(start_nonce) & 0xFFFFFFFF, "iters": max(1, int(iters))}
 
     def close(self) -> None:
         with self._mu:
@@ -859,14 +704,8 @@ class VirtualASICScanner:
                         self.kernel_id = c_uint32(0)
 
                     for buf in (
-                        self.buf_seed,
-                        self.buf_blob,
-                        self.buf_count,
-                        self.buf_results,
-                        self.buf_rx_cache,
-                        self.buf_rx_dataset,
-                        self.buf_rx_vm_state,
-                        self.buf_rx_placeholder,
+                        self.buf_seed, self.buf_blob, self.buf_count, self.buf_results,
+                        self.buf_rx_cache, self.buf_rx_dataset, self.buf_rx_vm_state, self.buf_rx_placeholder,
                     ):
                         if int(buf.value):
                             try:
