@@ -18,7 +18,6 @@ from virtualasic import (
     VirtualASICScanner,
     snapshot_randomx_state,
 )
-
 from blocknet_mining_backend import (
     BlockNetApiCfg,
     BlockNetP2PoolBackend,
@@ -26,6 +25,7 @@ from blocknet_mining_backend import (
     BlockNetGpuScanner,
     BlockNetCpuScanner,
 )
+from parallel_python_worker import ParallelMoneroScanner
 
 
 @dataclass
@@ -106,11 +106,9 @@ class Miner:
         virtualasic_kernel: str = "",
         virtualasic_kernel_name: str = "monero_scan",
         virtualasic_core_count: int = 0,
-        # kept for GUI/config compatibility; intentionally unused in this build
         virtualasic_cpu_assist: bool = False,
         virtualasic_cpu_assist_batch: int = 256,
         virtualasic_cpu_assist_max_batch: int = 2048,
-        # RandomX state staging into the VirtualASIC kernel
         virtualasic_stage_randomx_cache: bool = False,
         virtualasic_stage_randomx_dataset: bool = False,
         virtualasic_stage_vm_descriptor: bool = True,
@@ -127,6 +125,10 @@ class Miner:
         scan_poll_first: bool = False,
         scan_nonce_offset: Optional[int] = None,
         cpu_scan_threads: Optional[int] = None,
+        use_parallel_monero_scan: bool = False,
+        parallel_monero_threads: Optional[int] = None,
+        parallel_monero_chunk_size: int = 8192,
+        parallel_monero_max_results_per_chunk: int = 32,
     ) -> None:
         self.logger = logger or (lambda s: None)
 
@@ -144,11 +146,16 @@ class Miner:
         self.use_blocknet_gpu_scan = bool(use_blocknet_gpu_scan)
         self.use_blocknet_cpu_scan = bool(use_blocknet_cpu_scan)
         self.use_virtualasic_scan = bool(use_virtualasic_scan)
+        self.use_parallel_monero_scan = bool(use_parallel_monero_scan)
 
         self.virtualasic_dll = str(virtualasic_dll or "").strip()
         self.virtualasic_kernel = str(virtualasic_kernel or "").strip()
         self.virtualasic_kernel_name = str(virtualasic_kernel_name or "monero_scan").strip() or "monero_scan"
         self.virtualasic_core_count = max(0, int(virtualasic_core_count))
+
+        self.virtualasic_cpu_assist = bool(virtualasic_cpu_assist)
+        self.virtualasic_cpu_assist_batch = max(1, int(virtualasic_cpu_assist_batch))
+        self.virtualasic_cpu_assist_max_batch = max(1, int(virtualasic_cpu_assist_max_batch))
 
         self.virtualasic_stage_randomx_cache = bool(virtualasic_stage_randomx_cache)
         self.virtualasic_stage_randomx_dataset = bool(virtualasic_stage_randomx_dataset)
@@ -162,6 +169,10 @@ class Miner:
         self.scan_nonce_offset = scan_nonce_offset if scan_nonce_offset is None else int(scan_nonce_offset)
         self.cpu_scan_threads = None if cpu_scan_threads is None else int(cpu_scan_threads)
 
+        self.parallel_monero_threads = max(1, int(parallel_monero_threads or self.threads))
+        self.parallel_monero_chunk_size = max(1, int(parallel_monero_chunk_size))
+        self.parallel_monero_max_results_per_chunk = max(1, int(parallel_monero_max_results_per_chunk))
+
         scan_mode_count = sum(
             1 for x in (
                 self.use_blocknet_p2pool_scan,
@@ -169,13 +180,15 @@ class Miner:
                 self.use_blocknet_gpu_scan,
                 self.use_blocknet_cpu_scan,
                 self.use_virtualasic_scan,
+                self.use_parallel_monero_scan,
             ) if x
         )
         if scan_mode_count > 1:
             raise RuntimeError(
                 "Only one scan mode can be enabled at a time: "
                 "use_blocknet_p2pool_scan, use_blocknet_randomx_scan, "
-                "use_blocknet_gpu_scan, use_blocknet_cpu_scan, use_virtualasic_scan"
+                "use_blocknet_gpu_scan, use_blocknet_cpu_scan, "
+                "use_virtualasic_scan, use_parallel_monero_scan"
             )
 
         self.submit_workers = max(1, int(submit_workers))
@@ -191,12 +204,19 @@ class Miner:
                 f"with one RandomX hash before submit. threads={self.threads}"
             )
 
+        if self.use_parallel_monero_scan:
+            self.logger(
+                f"[Miner] Parallel Monero scan enabled: miner_workers=1 internal_threads={self.parallel_monero_threads} "
+                f"chunk_size={self.parallel_monero_chunk_size} max_results_per_chunk={self.parallel_monero_max_results_per_chunk}"
+            )
+
         if (
             self.use_blocknet_p2pool_scan
             or self.use_blocknet_randomx_scan
             or self.use_blocknet_gpu_scan
             or self.use_blocknet_cpu_scan
             or self.use_virtualasic_scan
+            or self.use_parallel_monero_scan
         ):
             self.use_blocknet_randomx = False
 
@@ -237,6 +257,7 @@ class Miner:
         self._hash_mu = threading.Lock()
         self._verify_hashes = 0
         self._verify_hash_mu = threading.Lock()
+
         self.verified_shares = 0
         self.verify_rejected = 0
         self.verify_mismatches = 0
@@ -250,12 +271,29 @@ class Miner:
         self._rx_state_cache_blob: bytes = b""
         self._rx_state_dataset_blob: bytes = b""
 
+        self._pp_scan: Optional[ParallelMoneroScanner] = None
+
         if self.use_virtualasic_scan:
             self.logger("[Miner] Using local VirtualASIC scan backend with per-candidate CPU verification...")
             self._bn_gpu = None
             self._bn_cpu = None
             self._bn_rx = None
             self.rx = RandomX(self.logger)
+
+        elif self.use_parallel_monero_scan:
+            self.logger("[Miner] Using local Parallel Monero scan backend...")
+            self._bn_gpu = None
+            self._bn_cpu = None
+            self._bn_rx = None
+            self.rx = RandomX(self.logger)
+            self._pp_scan = ParallelMoneroScanner(
+                threads=self.parallel_monero_threads,
+                logger=self.logger,
+                randomx=self.rx,
+                chunk_size=self.parallel_monero_chunk_size,
+                max_results_per_chunk=self.parallel_monero_max_results_per_chunk,
+            )
+
         elif self.use_blocknet_gpu_scan:
             assert self._bn_cfg is not None
             self.logger("[Miner] Using BlockNet GPU SCAN API (/gpu/scan)...")
@@ -263,6 +301,7 @@ class Miner:
             self._bn_cpu = None
             self._bn_rx = None
             self.rx = None
+
         elif self.use_blocknet_cpu_scan:
             assert self._bn_cfg is not None
             self.logger("[Miner] Using BlockNet CPU SCAN API (/cpu/scan)...")
@@ -270,6 +309,7 @@ class Miner:
             self._bn_gpu = None
             self._bn_rx = None
             self.rx = None
+
         elif self.use_blocknet_randomx or self.use_blocknet_randomx_scan:
             assert self._bn_cfg is not None
             if self.use_blocknet_randomx_scan:
@@ -280,6 +320,7 @@ class Miner:
             self._bn_gpu = None
             self._bn_cpu = None
             self.rx = None
+
         else:
             self._bn_gpu = None
             self._bn_cpu = None
@@ -293,9 +334,16 @@ class Miner:
     def stop(self) -> None:
         if self._stop.is_set():
             return
+
         self.logger("[Miner] Stop signal received.")
         self._stop.set()
         self.job_state.wake_all()
+
+        if self._pp_scan is not None:
+            try:
+                self._pp_scan.stop()
+            except Exception:
+                pass
 
         loop = self._async_loop
         cli = self._active_cli
@@ -396,6 +444,7 @@ class Miner:
             if self.virtualasic_stage_randomx_cache and not cache_blob:
                 self.virtualasic_stage_randomx_cache = False
                 self.logger("[Miner] VirtualASIC cache staging disabled because no safe cache snapshot is available.")
+
             if self.virtualasic_stage_randomx_dataset and not dataset_blob:
                 self.virtualasic_stage_randomx_dataset = False
                 self.logger("[Miner] VirtualASIC dataset staging disabled because no safe dataset snapshot is available.")
@@ -438,7 +487,14 @@ class Miner:
             return 0.0
         return float(t / v)
 
-    def _describe_verified_share(self, *, job: MoneroJob, nonce_u32: int, verified_hash32: bytes, gpu_hash32: bytes) -> str:
+    def _describe_verified_share(
+        self,
+        *,
+        job: MoneroJob,
+        nonce_u32: int,
+        verified_hash32: bytes,
+        gpu_hash32: bytes,
+    ) -> str:
         value64 = int.from_bytes(verified_hash32[24:32], "little", signed=False)
         target64 = int(job.target64)
         quality = self._share_quality_ratio(value64, target64)
@@ -503,6 +559,7 @@ class Miner:
         rx_hash_into = None
         share_put = self.share_q.put
         vasic: Optional[VirtualASICScanner] = None
+        last_parallel_diag = 0.0
 
         local_randomx_mode = (
             not self.use_blocknet_randomx
@@ -511,6 +568,7 @@ class Miner:
             and not self.use_blocknet_gpu_scan
             and not self.use_blocknet_cpu_scan
             and not self.use_virtualasic_scan
+            and not self.use_parallel_monero_scan
         )
         needs_local_vm = local_randomx_mode or self.use_virtualasic_scan
 
@@ -538,6 +596,7 @@ class Miner:
                     if needs_local_vm:
                         if not self.rx:
                             raise RuntimeError("local RandomX verifier not initialized")
+
                         rx_hash_into = self.rx.hash_into
                         seed_changed = (last_seed != cur_job.seed_hash)
                         self.rx.ensure_seed(cur_job.seed_hash)
@@ -571,6 +630,12 @@ class Miner:
                         vm = None
                         blob_buf = None
                         nonce_ptr = None
+
+                        if self._pp_scan is not None:
+                            try:
+                                self._pp_scan.reset_stop()
+                            except Exception:
+                                pass
 
                 if cur_job is None:
                     continue
@@ -657,6 +722,50 @@ class Miner:
                         self.last_err = f"randomx scan failed: {self._fmt_exc(e)}"
                         self.logger(f"[Worker-{idx}] randomx scan error: {self._fmt_exc(e)}")
                         time.sleep(0.25)
+
+
+                elif self.use_parallel_monero_scan:
+                    try:
+                        assert self._pp_scan is not None
+
+                        start_nonce = self.job_state.alloc_nonce_block(self.scan_iters)
+                        resp = self._pp_scan.scan_sync(
+                            job=cur_job,
+                            start_nonce=start_nonce,
+                            iters=self.scan_iters,
+                            max_results=self.scan_max_results,
+                        )
+                        done = int(resp.get("hashes_done") or 0)
+
+                        if done > 0:
+                            self.add_hashes(done)
+
+                        found = resp.get("found") or []
+
+                        if isinstance(found, list):
+                            for one in found:
+                                try:
+                                    n = int(one.get("nonce_u32"))
+                                    hx = str(one.get("hash_hex") or "")
+                                    h32 = bytes.fromhex(hx)
+
+                                    if len(h32) == 32:
+                                        share_put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
+
+                                except Exception:
+                                    continue
+
+                        if done <= 0:
+                            time.sleep(0.002)
+
+
+                    except Exception as e:
+
+                        self.last_err = f"parallel monero scan failed: {self._fmt_exc(e)}"
+
+                        self.logger(f"[Worker-{idx}] parallel monero scan error: {self._fmt_exc(e)}")
+
+                        time.sleep(0.05)
 
                 elif self.use_virtualasic_scan:
                     try:
@@ -843,7 +952,6 @@ class Miner:
                             if not h32 or len(h32) != 32:
                                 continue
                             valid_hashes += 1
-
                             value = int.from_bytes(h32[24:32], "little", signed=False)
                             if value < cur_job.target64:
                                 share_put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
@@ -873,8 +981,8 @@ class Miner:
 
                         nonce = (nonce_base + (nonce_i + i) * stride) & 0xFFFFFFFF
                         nonce_ptr[0] = nonce
-
                         rx_hash_into(vm, blob_buf, out_buf)
+
                         if value64.value < target:
                             share_put(Share(job_id=job_id, nonce_u32=nonce, result32=bytes(out_buf)))
                         done += 1
@@ -889,15 +997,26 @@ class Miner:
             traceback.print_exc()
         finally:
             try:
+                if self._pp_scan is not None:
+                    try:
+                        self._pp_scan.stop()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
                 if vm and self.rx:
                     self.rx.destroy_vm(vm)
             except Exception:
                 pass
+
             try:
                 if vasic is not None:
                     vasic.close()
             except Exception:
                 pass
+
             self.logger(f"[Worker-{idx}] Stopped.")
 
     async def run(self, *, on_stats: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
@@ -936,7 +1055,9 @@ class Miner:
                 self.job_state.set(MoneroJob.from_stratum(login.job))
 
             self._worker_threads = []
-            for i in range(self.threads):
+            worker_count = 1 if self.use_parallel_monero_scan else self.threads
+
+            for i in range(worker_count):
                 t = threading.Thread(target=self._worker, args=(i,), name=f"Worker-{i}", daemon=True)
                 self._worker_threads.append(t)
                 t.start()
@@ -944,6 +1065,7 @@ class Miner:
             async def job_loop() -> None:
                 last_job_id = ""
                 last_key = None
+
                 while not self._stop.is_set():
                     if self.use_blocknet_p2pool:
                         assert self._bn_p2pool is not None
@@ -971,6 +1093,7 @@ class Miner:
                             if self._stop.is_set():
                                 return
                             raise
+
                         mj = MoneroJob.from_stratum(j)
                         key = (mj.seed_hash, mj.target64, mj.blob)
                         if key != last_key:
@@ -1002,7 +1125,8 @@ class Miner:
                             diff_est = self._share_difficulty_from_value(value64) if value64 else 0.0
                             self.logger(
                                 f"[Submit-{worker_idx}] Share accepted! "
-                                f"nonce={share.nonce_u32} value64={self._u64_hex(value64)} share_diff_est={diff_est:,.2f} job={share.job_id}"
+                                f"nonce={share.nonce_u32} value64={self._u64_hex(value64)} "
+                                f"share_diff_est={diff_est:,.2f} job={share.job_id}"
                             )
                         except Exception as e:
                             self.rejected += 1
@@ -1010,13 +1134,15 @@ class Miner:
                             diff_est = self._share_difficulty_from_value(value64) if value64 else 0.0
                             self.logger(
                                 f"[Submit-{worker_idx}] Share rejected: {self._fmt_exc(e)} "
-                                f"nonce={share.nonce_u32} value64={self._u64_hex(value64)} share_diff_est={diff_est:,.2f} job={share.job_id}"
+                                f"nonce={share.nonce_u32} value64={self._u64_hex(value64)} "
+                                f"share_diff_est={diff_est:,.2f} job={share.job_id}"
                             )
                     except queue.Empty:
                         continue
 
             async def stats_loop() -> None:
                 last_t = time.time()
+
                 while not self._stop.is_set():
                     for _ in range(20):
                         if self._stop.is_set():
@@ -1026,7 +1152,7 @@ class Miner:
                     now = time.time()
                     dt = max(1e-9, now - last_t)
                     hps = self.pop_hashes() / dt
-                    verify_hps = (self.pop_verify_hashes() / dt) if self.use_virtualasic_scan else None
+                    verify_hps = self.pop_verify_hashes() / dt if self.use_virtualasic_scan else None
                     last_t = now
 
                     current_job = self.job_state.get()
@@ -1035,6 +1161,8 @@ class Miner:
 
                     if self.use_virtualasic_scan:
                         backend_rx = "virtualasic_gpu_scan_cpu_verify_submit"
+                    elif self.use_parallel_monero_scan:
+                        backend_rx = "parallel_monero_scan"
                     elif self.use_blocknet_p2pool_scan:
                         backend_rx = "blocknet_p2pool_scan"
                     elif self.use_blocknet_gpu_scan:
@@ -1052,7 +1180,8 @@ class Miner:
                         on_stats({
                             "hashrate_hs": hps,
                             "verify_hashrate_hs": verify_hps,
-                            "threads": self.threads,
+                            "threads": (self.parallel_monero_threads if self.use_parallel_monero_scan else self.threads),
+                            "miner_worker_threads": len(self._worker_threads),
                             "accepted": self.accepted,
                             "rejected": self.rejected,
                             "last_error": self.last_err,
@@ -1060,10 +1189,18 @@ class Miner:
                             "job_id": job_id_str,
                             "backend_p2pool": ("blocknet" if self.use_blocknet_p2pool else "stratum"),
                             "backend_randomx": backend_rx,
+                            "backend_parallel_monero_scan": self.use_parallel_monero_scan,
+                            "parallel_monero_enabled": self.use_parallel_monero_scan,
+                            "parallel_monero_threads": (self.parallel_monero_threads if self.use_parallel_monero_scan else None),
+                            "parallel_monero_chunk_size": (self.parallel_monero_chunk_size if self.use_parallel_monero_scan else None),
+                            "parallel_monero_max_results_per_chunk": (
+                                self.parallel_monero_max_results_per_chunk if self.use_parallel_monero_scan else None
+                            ),
                             "submit_workers": self.submit_workers,
                             "scan_iters": (
                                 self.scan_iters if (
                                     self.use_virtualasic_scan
+                                    or self.use_parallel_monero_scan
                                     or self.use_blocknet_p2pool_scan
                                     or self.use_blocknet_randomx_scan
                                     or self.use_blocknet_gpu_scan
@@ -1074,9 +1211,15 @@ class Miner:
                             "verify_rejected": (verify_failed if self.use_virtualasic_scan else None),
                             "verify_mismatches": (verify_mismatches if self.use_virtualasic_scan else None),
                             "virtualasic_gpu_candidates": (vasic_gpu_candidates if self.use_virtualasic_scan else None),
-                            "virtualasic_stage_randomx_cache": (self.virtualasic_stage_randomx_cache if self.use_virtualasic_scan else None),
-                            "virtualasic_stage_randomx_dataset": (self.virtualasic_stage_randomx_dataset if self.use_virtualasic_scan else None),
-                            "virtualasic_stage_vm_descriptor": (self.virtualasic_stage_vm_descriptor if self.use_virtualasic_scan else None),
+                            "virtualasic_stage_randomx_cache": (
+                                self.virtualasic_stage_randomx_cache if self.use_virtualasic_scan else None
+                            ),
+                            "virtualasic_stage_randomx_dataset": (
+                                self.virtualasic_stage_randomx_dataset if self.use_virtualasic_scan else None
+                            ),
+                            "virtualasic_stage_vm_descriptor": (
+                                self.virtualasic_stage_vm_descriptor if self.use_virtualasic_scan else None
+                            ),
                         })
 
             async def keepalive_loop() -> None:
@@ -1135,6 +1278,7 @@ class Miner:
             self.logger("[Miner] Shutting down tasks...")
             for t in tasks:
                 t.cancel()
+
             try:
                 await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3.0)
             except Exception:
@@ -1149,13 +1293,29 @@ class Miner:
                     await cli.close()
             except Exception:
                 pass
+
             self._stop.set()
             self.job_state.wake_all()
+
+            if self._pp_scan is not None:
+                try:
+                    self._pp_scan.stop()
+                except Exception:
+                    pass
+
             for t in self._worker_threads:
                 try:
                     t.join(timeout=2.0)
                 except Exception:
                     pass
+
+            if self._pp_scan is not None:
+                try:
+                    self._pp_scan.close()
+                except Exception:
+                    pass
+                self._pp_scan = None
+
             self._active_cli = None
             self._async_loop = None
             self.logger("[Miner] Shutdown complete.")

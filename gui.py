@@ -7,7 +7,7 @@ import os
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -188,26 +188,6 @@ def apply_dark_theme(app: QApplication) -> None:
             border: none;
             background: transparent;
         }
-        QScrollBar:vertical {
-            background: #1b1b1b;
-            width: 12px;
-            margin: 0px;
-            border-radius: 6px;
-        }
-        QScrollBar::handle:vertical {
-            background: #4a4a4a;
-            min-height: 24px;
-            border-radius: 6px;
-        }
-        QScrollBar::handle:vertical:hover {
-            background: #5a5a5a;
-        }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-            height: 0px;
-        }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-            background: transparent;
-        }
         """
     )
 
@@ -246,6 +226,12 @@ class MinerConfig:
     bn_rx_batch: int
     scan_iters: int
     submit_workers: int
+
+    # --- optional addition: local parallel monero scan ---
+    use_parallel_monero_scan: bool = False
+    parallel_monero_threads: int = 1
+    parallel_monero_chunk_size: int = 8192
+    parallel_monero_max_results_per_chunk: int = 32
 
 
 class MinerWorker(QThread):
@@ -345,6 +331,15 @@ class MinerWorker(QThread):
             if "scan_iters" in sig.parameters:
                 miner_kwargs["scan_iters"] = int(self.cfg.scan_iters)
 
+            if "use_parallel_monero_scan" in sig.parameters:
+                miner_kwargs["use_parallel_monero_scan"] = bool(self.cfg.use_parallel_monero_scan)
+            if "parallel_monero_threads" in sig.parameters:
+                miner_kwargs["parallel_monero_threads"] = int(self.cfg.parallel_monero_threads)
+            if "parallel_monero_chunk_size" in sig.parameters:
+                miner_kwargs["parallel_monero_chunk_size"] = int(self.cfg.parallel_monero_chunk_size)
+            if "parallel_monero_max_results_per_chunk" in sig.parameters:
+                miner_kwargs["parallel_monero_max_results_per_chunk"] = int(self.cfg.parallel_monero_max_results_per_chunk)
+
             self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
@@ -361,9 +356,11 @@ class MinerWorker(QThread):
                 job_id = (last_stats.get("job_id") or "")[:10]
                 b_p2 = last_stats.get("backend_p2pool")
                 b_rx = last_stats.get("backend_randomx")
+                b_pp = last_stats.get("backend_parallel_monero_scan")
 
                 self.log_line.emit(
-                    f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | job={job_id} | p2pool={b_p2} rx={b_rx}"
+                    f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | "
+                    f"job={job_id} | p2pool={b_p2} rx={b_rx} parallel={b_pp}"
                 )
 
                 if self._bn_heartbeat:
@@ -428,7 +425,7 @@ def _mono_font(point_size: int = 10) -> QFont:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC")
+        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + Parallel Monero")
 
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
@@ -549,8 +546,11 @@ class MainWindow(QMainWindow):
         self.cb_bn_randomx = QCheckBox("Use BlockNet RandomX API (remote hashing)")
         self.cb_bn_p2pool_scan = QCheckBox("Use BlockNet P2Pool scan (/p2pool/scan) — server-side scanning")
         self.cb_bn_randomx_scan = QCheckBox("Use BlockNet RandomX scan (/randomx/scan) — server-side scanning")
-
         self.cb_vasic_scan = QCheckBox("Use VirtualASIC local scan — loads VirtualASIC.dll and a compatible scan kernel")
+
+        self.cb_parallel_monero_scan = QCheckBox(
+            "Use Parallel Monero local scan — shared RandomX dataset with threaded local nonce scanning"
+        )
 
         self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
         self.ed_bn_api_token = QLineEdit("")
@@ -585,6 +585,18 @@ class MainWindow(QMainWindow):
         self.sp_scan_iters.setSingleStep(100)
         self.sp_scan_iters.setValue(1000)
 
+        self.sp_parallel_monero_threads = QSpinBox()
+        self.sp_parallel_monero_threads.setRange(1, 256)
+        self.sp_parallel_monero_threads.setValue(4)
+
+        self.sp_parallel_monero_chunk_size = QSpinBox()
+        self.sp_parallel_monero_chunk_size.setRange(1, 10_000_000)
+        self.sp_parallel_monero_chunk_size.setValue(8192)
+
+        self.sp_parallel_monero_max_results_per_chunk = QSpinBox()
+        self.sp_parallel_monero_max_results_per_chunk.setRange(1, 4096)
+        self.sp_parallel_monero_max_results_per_chunk.setValue(32)
+
         mfl.addRow(self.cb_bn_gpu_scan)
         mfl.addRow(self.cb_bn_cpu_scan)
         mfl.addRow(self.cb_bn_p2pool)
@@ -592,6 +604,10 @@ class MainWindow(QMainWindow):
         mfl.addRow(self.cb_bn_p2pool_scan)
         mfl.addRow(self.cb_bn_randomx_scan)
         mfl.addRow(self.cb_vasic_scan)
+        mfl.addRow(self.cb_parallel_monero_scan)
+        mfl.addRow("Parallel Monero threads", self.sp_parallel_monero_threads)
+        mfl.addRow("Parallel Monero chunk size", self.sp_parallel_monero_chunk_size)
+        mfl.addRow("Parallel Monero max results/chunk", self.sp_parallel_monero_max_results_per_chunk)
         mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
         mfl.addRow("API Token", self.ed_bn_api_token)
         mfl.addRow("API Prefix", self.ed_bn_api_prefix)
@@ -604,7 +620,9 @@ class MainWindow(QMainWindow):
         mfl.addRow("Scan iterations", self.sp_scan_iters)
 
         info = QLabel(
-            "VirtualASIC mode expects a compatible kernel that writes result records as "
+            "Only one scan mode should be enabled at a time. "
+            "Parallel Monero mode is local CPU-side threaded scanning using a shared RandomX dataset. "
+            "VirtualASIC expects a compatible kernel that writes result records as "
             "[nonce_u32 little-endian][32-byte hash] and a count buffer."
         )
         info.setWordWrap(True)
@@ -620,6 +638,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_gpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_cpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_vasic_scan.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_parallel_monero_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
@@ -645,8 +664,7 @@ class MainWindow(QMainWindow):
 
         self.btn_save.clicked.connect(self._save_cfg)
         self.btn_load.clicked.connect(self._load_cfg)
-        btn_clear_target = lambda: self.txt_log.setPlainText("")
-        self.btn_clear.clicked.connect(btn_clear_target)
+        self.btn_clear.clicked.connect(lambda: self.txt_log.setPlainText(""))
 
         btn_row2.addWidget(self.btn_save)
         btn_row2.addWidget(self.btn_load)
@@ -737,6 +755,7 @@ class MainWindow(QMainWindow):
             self.cb_bn_gpu_scan,
             self.cb_bn_cpu_scan,
             self.cb_vasic_scan,
+            self.cb_parallel_monero_scan,
         ):
             if cb is sender:
                 continue
@@ -759,6 +778,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_gpu_scan.setEnabled(True)
         self.cb_bn_cpu_scan.setEnabled(True)
         self.cb_vasic_scan.setEnabled(True)
+        self.cb_parallel_monero_scan.setEnabled(True)
 
     def _on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
@@ -855,76 +875,81 @@ class MainWindow(QMainWindow):
         if not self.started_at:
             self.lbl_uptime.setText("Uptime: 00:00:00")
             return
-        dt = int(max(0, time.time() - self.started_at))
-        h = dt // 3600
-        m = (dt % 3600) // 60
-        s = dt % 60
+        elapsed = max(0, int(time.time() - self.started_at))
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        s = elapsed % 60
         self.lbl_uptime.setText(f"Uptime: {h:02d}:{m:02d}:{s:02d}")
 
-    def _start(self) -> None:
-        if self.worker and self.worker.isRunning():
-            return
+    def _on_stats(self, stats: Dict[str, Any]) -> None:
+        hps = float(stats.get("hashrate_hs") or 0.0)
+        acc = int(stats.get("accepted") or 0)
+        rej = int(stats.get("rejected") or 0)
+        height = stats.get("height")
+        threads = stats.get("threads")
+        self.lbl_hashrate.setText(f"{hps:,.0f} H/s")
+        self.lbl_sub.setText(f"Accepted: {acc}    Rejected: {rej}    Height: {height}    Threads: {threads}")
+        self.txt_raw.setPlainText(json.dumps(stats, indent=2, sort_keys=True))
 
+    def _on_state(self, s: str) -> None:
+        if s == "RUNNING":
+            self._set_running(True)
+        else:
+            self._set_running(False)
+            self.started_at = 0.0
+            self.uptime_timer.stop()
+            self._tick_uptime()
+            self._append_log("[gui] stopped")
+
+    def _on_fatal(self, tb: str) -> None:
+        self._set_running(False)
+        self.started_at = 0.0
+        self.uptime_timer.stop()
+        self._tick_uptime()
+        self._append_log(tb)
+        QMessageBox.critical(self, "Miner Error", tb)
+
+    def _build_cfg(self) -> MinerConfig:
         stratum = self.ed_stratum.text().strip()
         wallet = self.ed_wallet.text().strip()
         password = self.ed_pass.text()
-        agent = self.ed_agent.text().strip() or "py-blockminer/0.1"
         threads = int(self.sp_threads.value())
+        agent = self.ed_agent.text().strip() or "py-blockminer/0.1"
         randomx_lib = self.ed_randomx.text().strip()
-        scan_iters = int(self.sp_scan_iters.value())
-        submit_workers = int(self.sp_submit_workers.value())
 
         use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
-        use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
-        use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
         use_bn_gpu_scan = bool(self.cb_bn_gpu_scan.isChecked())
         use_bn_cpu_scan = bool(self.cb_bn_cpu_scan.isChecked())
+        use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
+        use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
         use_virtualasic_scan = bool(self.cb_vasic_scan.isChecked())
+        use_parallel_monero_scan = bool(self.cb_parallel_monero_scan.isChecked())
 
-        if not wallet:
-            QMessageBox.critical(self, "Missing Wallet", "Please enter your Monero wallet address.")
-            return
-
-        if (not use_bn_p2pool) and (":" not in stratum):
-            QMessageBox.critical(self, "Invalid Stratum", "Stratum must be host:port (e.g. 127.0.0.1:3333).")
-            return
-
-        needs_blocknet_api = any(
-            (
-                use_bn_p2pool,
-                use_bn_randomx,
-                use_bn_p2pool_scan,
-                use_bn_randomx_scan,
-                use_bn_gpu_scan,
-                use_bn_cpu_scan,
-            )
-        )
         bn_api_relay = self.ed_bn_api_relay.text().strip()
-        if needs_blocknet_api and not bn_api_relay:
-            QMessageBox.critical(self, "Missing BlockNet API Relay", "Please enter BlockNet API relay host:port (e.g. 1.2.3.4:38888).")
-            return
+        submit_workers = int(self.sp_submit_workers.value())
+        scan_iters = int(self.sp_scan_iters.value())
 
         vasic_dll = self.ed_vasic_dll.text().strip()
         vasic_kernel = self.ed_vasic_kernel.text().strip()
         vasic_kernel_name = self.ed_vasic_kernel_name.text().strip() or "monero_scan"
+
         if use_virtualasic_scan:
-            if not vasic_kernel and not resolve_resource_path(
-                "",
-                fallback_names=("monero_scan.cl", "virtualasic_monero_scan.cl", "randomx_scan.cl"),
-            ):
-                QMessageBox.critical(
-                    self,
-                    "Missing VirtualASIC Kernel",
-                    "VirtualASIC scan requires a compatible kernel file. Pick one or bundle it next to the EXE/_MEIPASS.",
-                )
-                return
+            if not vasic_dll:
+                QMessageBox.warning(self, "Missing VirtualASIC DLL", "Please choose a VirtualASIC DLL path.")
+                raise ValueError("missing VirtualASIC DLL")
+            if not vasic_kernel:
+                QMessageBox.warning(self, "Missing VirtualASIC kernel", "Please choose a VirtualASIC kernel path.")
+                raise ValueError("missing VirtualASIC kernel")
             if threads > 1:
                 self._append_log("[gui] warning: VirtualASIC with threads > 1 creates one engine per worker and may reduce GPU efficiency.")
 
+        if use_parallel_monero_scan and threads <= 0:
+            raise ValueError("Parallel Monero scan requires at least one worker thread.")
+
         use_bn_reporting = bool(self.cb_bn.isChecked())
 
-        cfg = MinerConfig(
+        return MinerConfig(
             stratum=stratum,
             wallet=wallet,
             password=password,
@@ -953,17 +978,38 @@ class MainWindow(QMainWindow):
             bn_api_prefix=self.ed_bn_api_prefix.text().strip() or "/v1",
             bn_rx_batch=int(self.sp_bn_rx_batch.value()),
             scan_iters=scan_iters,
+            use_parallel_monero_scan=use_parallel_monero_scan,
+            parallel_monero_threads=int(self.sp_parallel_monero_threads.value()),
+            parallel_monero_chunk_size=int(self.sp_parallel_monero_chunk_size.value()),
+            parallel_monero_max_results_per_chunk=int(self.sp_parallel_monero_max_results_per_chunk.value()),
         )
+
+    def _start(self) -> None:
+        try:
+            cfg = self._build_cfg()
+        except Exception as e:
+            self._append_log(f"[gui] start aborted: {e}")
+            return
 
         self._save_cfg()
 
         self.txt_log.appendPlainText("[gui] starting miner…")
-        if use_virtualasic_scan:
+
+        if cfg.use_virtualasic_scan:
             self.txt_log.appendPlainText(
-                f"[gui] virtualasic dll={resolve_resource_path(vasic_dll, fallback_names=('VirtualASIC.dll', 'virtualasic.dll'))} "
-                f"kernel={resolve_resource_path(vasic_kernel, fallback_names=('monero_scan.cl', 'virtualasic_monero_scan.cl', 'randomx_scan.cl'))} "
-                f"kernel_name={vasic_kernel_name}"
+                f"[gui] virtualasic dll={resolve_resource_path(cfg.virtualasic_dll, fallback_names=('VirtualASIC.dll', 'virtualasic.dll'))} "
+                f"kernel={resolve_resource_path(cfg.virtualasic_kernel, fallback_names=('monero_scan.cl', 'virtualasic_monero_scan.cl', 'randomx_scan.cl'))} "
+                f"kernel_name={cfg.virtualasic_kernel_name}"
             )
+
+        if cfg.use_parallel_monero_scan:
+            self.txt_log.appendPlainText(
+                f"[gui] parallel monero scan enabled: "
+                f"threads={cfg.parallel_monero_threads} "
+                f"chunk_size={cfg.parallel_monero_chunk_size} "
+                f"max_results_per_chunk={cfg.parallel_monero_max_results_per_chunk}"
+            )
+
         self._set_running(True)
         self.started_at = time.time()
         self.uptime_timer.start()
@@ -984,147 +1030,127 @@ class MainWindow(QMainWindow):
         else:
             self._set_running(False)
 
-    def _on_state(self, s: str) -> None:
-        if s == "RUNNING":
-            self._set_running(True)
-        else:
-            self._set_running(False)
-            self.started_at = 0.0
-            self.uptime_timer.stop()
-            self._tick_uptime()
-            self._append_log("[gui] stopped")
-
-    def _on_fatal(self, msg: str) -> None:
-        self._append_log(f"[fatal] {msg}")
-        QMessageBox.critical(self, "Miner Error", msg)
-        self._set_running(False)
-        self.started_at = 0.0
-        self.uptime_timer.stop()
-        self._tick_uptime()
-
-    def _on_stats(self, stats: dict) -> None:
-        hps = float(stats.get("hashrate_hs") or 0.0)
-        acc = int(stats.get("accepted") or 0)
-        rej = int(stats.get("rejected") or 0)
-        height = stats.get("height")
-        th = int(stats.get("threads") or self.sp_threads.value())
-
-        self.lbl_hashrate.setText(f"{hps:,.0f} H/s")
-        self.lbl_sub.setText(
-            f"Accepted: {acc}    Rejected: {rej}    Height: {height if height is not None else '—'}    Threads: {th}"
-        )
-
-        try:
-            self.txt_raw.setPlainText(json.dumps(stats, indent=2))
-        except Exception:
-            self.txt_raw.setPlainText(str(stats))
-
     def _save_cfg(self) -> None:
         try:
-            j = {
-                "stratum": self.ed_stratum.text().strip(),
-                "wallet": self.ed_wallet.text().strip(),
-                "pass": self.ed_pass.text(),
-                "agent": self.ed_agent.text().strip(),
+            cfg = self._build_cfg()
+        except Exception:
+            cfg = None
+
+        data: Dict[str, Any] = {}
+        if cfg is not None:
+            data = asdict(cfg)
+        else:
+            data = {
+                "stratum": self.ed_stratum.text(),
+                "wallet": self.ed_wallet.text(),
+                "password": self.ed_pass.text(),
                 "threads": int(self.sp_threads.value()),
-                "randomx_lib": self.ed_randomx.text().strip(),
-                "blocknet_enabled": bool(self.cb_bn.isChecked()),
-                "blocknet_relay": self.ed_bn_relay.text().strip(),
-                "blocknet_token": self.ed_bn_token.text().strip(),
-                "blocknet_id": self.ed_bn_id.text().strip(),
-                "blocknet_key": self.ed_bn_key.text().strip(),
-                "bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
-                "bn_randomx": bool(self.cb_bn_randomx.isChecked()),
-                "bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
-                "bn_cpu_scan": bool(self.cb_bn_cpu_scan.isChecked()),
-                "bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
-                "bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
-                "virtualasic_scan": bool(self.cb_vasic_scan.isChecked()),
-                "virtualasic_dll": self.ed_vasic_dll.text().strip(),
-                "virtualasic_kernel": self.ed_vasic_kernel.text().strip(),
-                "virtualasic_kernel_name": self.ed_vasic_kernel_name.text().strip(),
+                "agent": self.ed_agent.text(),
+                "randomx_lib": self.ed_randomx.text(),
+                "use_blocknet": bool(self.cb_bn.isChecked()),
+                "blocknet_relay": self.ed_bn_relay.text(),
+                "blocknet_token": self.ed_bn_token.text(),
+                "blocknet_id": self.ed_bn_id.text(),
+                "blocknet_key": self.ed_bn_key.text(),
+                "use_bn_p2pool": bool(self.cb_bn_p2pool.isChecked()),
+                "use_bn_randomx": bool(self.cb_bn_randomx.isChecked()),
+                "use_bn_p2pool_scan": bool(self.cb_bn_p2pool_scan.isChecked()),
+                "use_bn_randomx_scan": bool(self.cb_bn_randomx_scan.isChecked()),
+                "use_bn_gpu_scan": bool(self.cb_bn_gpu_scan.isChecked()),
+                "use_bn_cpu_scan": bool(self.cb_bn_cpu_scan.isChecked()),
+                "use_virtualasic_scan": bool(self.cb_vasic_scan.isChecked()),
+                "virtualasic_dll": self.ed_vasic_dll.text(),
+                "virtualasic_kernel": self.ed_vasic_kernel.text(),
+                "virtualasic_kernel_name": self.ed_vasic_kernel_name.text(),
                 "virtualasic_core_count": int(self.sp_vasic_core_count.value()),
-                "submit_workers": int(self.sp_submit_workers.value()),
-                "bn_api_relay": self.ed_bn_api_relay.text().strip(),
-                "bn_api_token": self.ed_bn_api_token.text().strip(),
-                "bn_api_prefix": self.ed_bn_api_prefix.text().strip(),
+                "bn_api_relay": self.ed_bn_api_relay.text(),
+                "bn_api_token": self.ed_bn_api_token.text(),
+                "bn_api_prefix": self.ed_bn_api_prefix.text(),
                 "bn_rx_batch": int(self.sp_bn_rx_batch.value()),
                 "scan_iters": int(self.sp_scan_iters.value()),
+                "submit_workers": int(self.sp_submit_workers.value()),
+                "use_parallel_monero_scan": bool(self.cb_parallel_monero_scan.isChecked()),
+                "parallel_monero_threads": int(self.sp_parallel_monero_threads.value()),
+                "parallel_monero_chunk_size": int(self.sp_parallel_monero_chunk_size.value()),
+                "parallel_monero_max_results_per_chunk": int(self.sp_parallel_monero_max_results_per_chunk.value()),
             }
-            CFG_PATH.write_text(json.dumps(j, indent=2), encoding="utf-8")
-            self.statusBar().showMessage("Config saved", 1500)
+
+        try:
+            CFG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self.statusBar().showMessage(f"Saved config: {CFG_PATH}", 4000)
         except Exception as e:
-            self.statusBar().showMessage(f"Config save failed: {e}", 2000)
+            self._append_log(f"[gui] save config failed: {e}")
 
     def _load_cfg(self) -> None:
         if not CFG_PATH.exists():
             return
+
         try:
-            j = json.loads(CFG_PATH.read_text(encoding="utf-8"))
-
-            self.ed_stratum.setText(j.get("stratum", self.ed_stratum.text()))
-            self.ed_wallet.setText(j.get("wallet", self.ed_wallet.text()))
-            self.ed_pass.setText(j.get("pass", self.ed_pass.text()))
-            self.ed_agent.setText(j.get("agent", self.ed_agent.text()))
-            self.sp_threads.setValue(int(j.get("threads", int(self.sp_threads.value()))))
-            self.ed_randomx.setText(j.get("randomx_lib", self.ed_randomx.text()))
-            self.sp_submit_workers.setValue(int(j.get("submit_workers", int(self.sp_submit_workers.value()))))
-
-            self.cb_bn.setChecked(bool(j.get("blocknet_enabled", False)))
-            self.ed_bn_relay.setText(j.get("blocknet_relay", self.ed_bn_relay.text()))
-            self.ed_bn_token.setText(j.get("blocknet_token", self.ed_bn_token.text()))
-            self.ed_bn_id.setText(j.get("blocknet_id", self.ed_bn_id.text()))
-            self.ed_bn_key.setText(j.get("blocknet_key", self.ed_bn_key.text()))
-
-            self.cb_bn_p2pool.setChecked(bool(j.get("bn_p2pool", False)))
-            self.cb_bn_randomx.setChecked(bool(j.get("bn_randomx", False)))
-            self.cb_bn_gpu_scan.setChecked(bool(j.get("bn_gpu_scan", False)))
-            self.cb_bn_cpu_scan.setChecked(bool(j.get("bn_cpu_scan", False)))
-            self.cb_bn_p2pool_scan.setChecked(bool(j.get("bn_p2pool_scan", False)))
-            self.cb_bn_randomx_scan.setChecked(bool(j.get("bn_randomx_scan", False)))
-            self.cb_vasic_scan.setChecked(bool(j.get("virtualasic_scan", False)))
-
-            self.ed_vasic_dll.setText(j.get("virtualasic_dll", self.ed_vasic_dll.text()))
-            self.ed_vasic_kernel.setText(j.get("virtualasic_kernel", self.ed_vasic_kernel.text()))
-            self.ed_vasic_kernel_name.setText(j.get("virtualasic_kernel_name", self.ed_vasic_kernel_name.text()))
-            self.sp_vasic_core_count.setValue(int(j.get("virtualasic_core_count", int(self.sp_vasic_core_count.value()))))
-
-            self.ed_bn_api_relay.setText(j.get("bn_api_relay", self.ed_bn_api_relay.text()))
-            self.ed_bn_api_token.setText(j.get("bn_api_token", self.ed_bn_api_token.text()))
-            self.ed_bn_api_prefix.setText(j.get("bn_api_prefix", self.ed_bn_api_prefix.text()))
-            self.sp_bn_rx_batch.setValue(int(j.get("bn_rx_batch", int(self.sp_bn_rx_batch.value()))))
-            self.sp_scan_iters.setValue(int(j.get("scan_iters", int(self.sp_scan_iters.value()))))
-
-            self._sync_scan_checks()
-            self._autofill_resource_guesses()
-            self.statusBar().showMessage("Config loaded", 1500)
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
         except Exception as e:
-            self.statusBar().showMessage(f"Config load failed: {e}", 2000)
+            self._append_log(f"[gui] load config failed: {e}")
+            return
 
-    def closeEvent(self, ev) -> None:
+        self.ed_stratum.setText(str(data.get("stratum", self.ed_stratum.text())))
+        self.ed_wallet.setText(str(data.get("wallet", self.ed_wallet.text())))
+        self.ed_pass.setText(str(data.get("password", self.ed_pass.text())))
+        self.sp_threads.setValue(int(data.get("threads", self.sp_threads.value())))
+        self.ed_agent.setText(str(data.get("agent", self.ed_agent.text())))
+        self.ed_randomx.setText(str(data.get("randomx_lib", self.ed_randomx.text())))
+
+        self.cb_bn.setChecked(bool(data.get("use_blocknet", self.cb_bn.isChecked())))
+        self.ed_bn_relay.setText(str(data.get("blocknet_relay", self.ed_bn_relay.text())))
+        self.ed_bn_token.setText(str(data.get("blocknet_token", self.ed_bn_token.text())))
+        self.ed_bn_id.setText(str(data.get("blocknet_id", self.ed_bn_id.text())))
+        self.ed_bn_key.setText(str(data.get("blocknet_key", self.ed_bn_key.text())))
+
+        self.cb_bn_p2pool.setChecked(bool(data.get("use_bn_p2pool", self.cb_bn_p2pool.isChecked())))
+        self.cb_bn_randomx.setChecked(bool(data.get("use_bn_randomx", self.cb_bn_randomx.isChecked())))
+        self.cb_bn_p2pool_scan.setChecked(bool(data.get("use_bn_p2pool_scan", self.cb_bn_p2pool_scan.isChecked())))
+        self.cb_bn_randomx_scan.setChecked(bool(data.get("use_bn_randomx_scan", self.cb_bn_randomx_scan.isChecked())))
+        self.cb_bn_gpu_scan.setChecked(bool(data.get("use_bn_gpu_scan", self.cb_bn_gpu_scan.isChecked())))
+        self.cb_bn_cpu_scan.setChecked(bool(data.get("use_bn_cpu_scan", self.cb_bn_cpu_scan.isChecked())))
+
+        self.cb_vasic_scan.setChecked(bool(data.get("use_virtualasic_scan", self.cb_vasic_scan.isChecked())))
+        self.ed_vasic_dll.setText(str(data.get("virtualasic_dll", self.ed_vasic_dll.text())))
+        self.ed_vasic_kernel.setText(str(data.get("virtualasic_kernel", self.ed_vasic_kernel.text())))
+        self.ed_vasic_kernel_name.setText(str(data.get("virtualasic_kernel_name", self.ed_vasic_kernel_name.text())))
+        self.sp_vasic_core_count.setValue(int(data.get("virtualasic_core_count", self.sp_vasic_core_count.value())))
+
+        self.ed_bn_api_relay.setText(str(data.get("bn_api_relay", self.ed_bn_api_relay.text())))
+        self.ed_bn_api_token.setText(str(data.get("bn_api_token", self.ed_bn_api_token.text())))
+        self.ed_bn_api_prefix.setText(str(data.get("bn_api_prefix", self.ed_bn_api_prefix.text())))
+        self.sp_bn_rx_batch.setValue(int(data.get("bn_rx_batch", self.sp_bn_rx_batch.value())))
+        self.sp_scan_iters.setValue(int(data.get("scan_iters", self.sp_scan_iters.value())))
+        self.sp_submit_workers.setValue(int(data.get("submit_workers", self.sp_submit_workers.value())))
+
+        self.cb_parallel_monero_scan.setChecked(bool(data.get("use_parallel_monero_scan", self.cb_parallel_monero_scan.isChecked())))
+        self.sp_parallel_monero_threads.setValue(int(data.get("parallel_monero_threads", self.sp_parallel_monero_threads.value())))
+        self.sp_parallel_monero_chunk_size.setValue(int(data.get("parallel_monero_chunk_size", self.sp_parallel_monero_chunk_size.value())))
+        self.sp_parallel_monero_max_results_per_chunk.setValue(
+            int(data.get("parallel_monero_max_results_per_chunk", self.sp_parallel_monero_max_results_per_chunk.value()))
+        )
+
+        self._sync_scan_checks()
+
+    def closeEvent(self, event) -> None:
         try:
-            if self.worker and self.worker.isRunning():
-                self._append_log("[gui] closing window: stopping miner first…")
-                self.btn_start.setDisabled(True)
-                self.btn_stop.setDisabled(True)
-                self.worker.stop()
+            self._save_cfg()
+        except Exception:
+            pass
 
-                if not self.worker.wait(10000):
-                    self._append_log("[gui] miner is still shutting down; close canceled to avoid a crash.")
-                    ev.ignore()
-                    return
-        except Exception as e:
-            self._append_log(f"[gui] closeEvent warning: {e}")
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(3000)
 
-        super().closeEvent(ev)
+        super().closeEvent(event)
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     apply_dark_theme(app)
-
     w = MainWindow()
-    w.resize(1320, 860)
+    w.resize(1450, 900)
     w.show()
     return app.exec_()
 
