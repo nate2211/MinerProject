@@ -1,3 +1,6 @@
+
+<img width="479" height="557" alt="natesmonerominer" src="https://github.com/user-attachments/assets/00e7a8d9-ebf8-46b5-ae27-e3fc004b568b" />
+
 # 🧠 MinerProject
 
 A high-performance, modular Monero mining framework with broker-based job distribution, parallel CPU/GPU execution, and advanced share validation + optimization pipeline.
