@@ -14,6 +14,7 @@ hidden_imports = [
     'randomx_ctypes',
     'stratum_client',
     'virtualasic',
+    'parallel_monero_worker',
 ]
 
 a = Analysis(
@@ -22,6 +23,7 @@ a = Analysis(
     binaries=[
         ('randomx-dll.dll', '.'),
         ('VirtualASIC.dll', '.'),
+        ('ParallelPython.dll', '.'),
     ],
     datas=[
         ('virtualasic_monero_scan.cl', '.'),
