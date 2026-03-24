@@ -227,11 +227,9 @@ class MinerConfig:
     scan_iters: int
     submit_workers: int
 
-    # --- optional addition: local parallel monero scan ---
-    use_parallel_monero_scan: bool = False
-    parallel_monero_threads: int = 1
-    parallel_monero_chunk_size: int = 8192
-    parallel_monero_max_results_per_chunk: int = 32
+    use_parallel_monero_worker: bool = False
+    parallel_python_dll: str = ""
+    parallel_python_batch_size: int = 1024
 
 
 class MinerWorker(QThread):
@@ -278,6 +276,8 @@ class MinerWorker(QThread):
                 os.environ["VIRTUALASIC_LIB"] = self.cfg.virtualasic_dll.strip()
             if self.cfg.virtualasic_kernel.strip():
                 os.environ["VIRTUALASIC_KERNEL"] = self.cfg.virtualasic_kernel.strip()
+            if self.cfg.parallel_python_dll.strip():
+                os.environ["PARALLEL_PYTHON_DLL"] = self.cfg.parallel_python_dll.strip()
 
             self._setup_blocknet_reporting()
 
@@ -331,14 +331,12 @@ class MinerWorker(QThread):
             if "scan_iters" in sig.parameters:
                 miner_kwargs["scan_iters"] = int(self.cfg.scan_iters)
 
-            if "use_parallel_monero_scan" in sig.parameters:
-                miner_kwargs["use_parallel_monero_scan"] = bool(self.cfg.use_parallel_monero_scan)
-            if "parallel_monero_threads" in sig.parameters:
-                miner_kwargs["parallel_monero_threads"] = int(self.cfg.parallel_monero_threads)
-            if "parallel_monero_chunk_size" in sig.parameters:
-                miner_kwargs["parallel_monero_chunk_size"] = int(self.cfg.parallel_monero_chunk_size)
-            if "parallel_monero_max_results_per_chunk" in sig.parameters:
-                miner_kwargs["parallel_monero_max_results_per_chunk"] = int(self.cfg.parallel_monero_max_results_per_chunk)
+            if "use_parallel_monero_worker" in sig.parameters:
+                miner_kwargs["use_parallel_monero_worker"] = bool(self.cfg.use_parallel_monero_worker)
+            if "parallel_python_dll" in sig.parameters:
+                miner_kwargs["parallel_python_dll"] = self.cfg.parallel_python_dll.strip()
+            if "parallel_python_batch_size" in sig.parameters:
+                miner_kwargs["parallel_python_batch_size"] = int(self.cfg.parallel_python_batch_size)
 
             self._miner = Miner(**miner_kwargs)
 
@@ -356,11 +354,12 @@ class MinerWorker(QThread):
                 job_id = (last_stats.get("job_id") or "")[:10]
                 b_p2 = last_stats.get("backend_p2pool")
                 b_rx = last_stats.get("backend_randomx")
-                b_pp = last_stats.get("backend_parallel_monero_scan")
+                b_pm = bool(last_stats.get("backend_parallel_monero_worker"))
+                pp_batch = last_stats.get("parallel_python_batch_size")
 
                 self.log_line.emit(
                     f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | "
-                    f"job={job_id} | p2pool={b_p2} rx={b_rx} parallel={b_pp}"
+                    f"job={job_id} | p2pool={b_p2} rx={b_rx} parallel_worker={b_pm} batch={pp_batch}"
                 )
 
                 if self._bn_heartbeat:
@@ -425,7 +424,7 @@ def _mono_font(point_size: int = 10) -> QFont:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + Parallel Monero")
+        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + ParallelMoneroWorker")
 
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
@@ -547,9 +546,8 @@ class MainWindow(QMainWindow):
         self.cb_bn_p2pool_scan = QCheckBox("Use BlockNet P2Pool scan (/p2pool/scan) — server-side scanning")
         self.cb_bn_randomx_scan = QCheckBox("Use BlockNet RandomX scan (/randomx/scan) — server-side scanning")
         self.cb_vasic_scan = QCheckBox("Use VirtualASIC local scan — loads VirtualASIC.dll and a compatible scan kernel")
-
-        self.cb_parallel_monero_scan = QCheckBox(
-            "Use Parallel Monero local scan — shared RandomX dataset with threaded local nonce scanning"
+        self.cb_parallel_monero_worker = QCheckBox(
+            "Use ParallelMoneroWorker — local RandomX hashing through ParallelPython callback exports"
         )
 
         self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
@@ -566,6 +564,14 @@ class MainWindow(QMainWindow):
         self.btn_browse_vasic_kernel.clicked.connect(self._browse_virtualasic_kernel)
 
         self.ed_vasic_kernel_name = QLineEdit("monero_scan")
+
+        self.ed_parallel_python_dll = QLineEdit("")
+        self.btn_browse_parallel_python_dll = QPushButton("Browse…")
+        self.btn_browse_parallel_python_dll.clicked.connect(self._browse_parallel_python_dll)
+
+        self.sp_parallel_python_batch_size = QSpinBox()
+        self.sp_parallel_python_batch_size.setRange(1, 1_000_000)
+        self.sp_parallel_python_batch_size.setValue(1024)
 
         self.sp_vasic_core_count = QSpinBox()
         self.sp_vasic_core_count.setRange(0, 1024)
@@ -585,18 +591,6 @@ class MainWindow(QMainWindow):
         self.sp_scan_iters.setSingleStep(100)
         self.sp_scan_iters.setValue(1000)
 
-        self.sp_parallel_monero_threads = QSpinBox()
-        self.sp_parallel_monero_threads.setRange(1, 256)
-        self.sp_parallel_monero_threads.setValue(4)
-
-        self.sp_parallel_monero_chunk_size = QSpinBox()
-        self.sp_parallel_monero_chunk_size.setRange(1, 10_000_000)
-        self.sp_parallel_monero_chunk_size.setValue(8192)
-
-        self.sp_parallel_monero_max_results_per_chunk = QSpinBox()
-        self.sp_parallel_monero_max_results_per_chunk.setRange(1, 4096)
-        self.sp_parallel_monero_max_results_per_chunk.setValue(32)
-
         mfl.addRow(self.cb_bn_gpu_scan)
         mfl.addRow(self.cb_bn_cpu_scan)
         mfl.addRow(self.cb_bn_p2pool)
@@ -604,10 +598,9 @@ class MainWindow(QMainWindow):
         mfl.addRow(self.cb_bn_p2pool_scan)
         mfl.addRow(self.cb_bn_randomx_scan)
         mfl.addRow(self.cb_vasic_scan)
-        mfl.addRow(self.cb_parallel_monero_scan)
-        mfl.addRow("Parallel Monero threads", self.sp_parallel_monero_threads)
-        mfl.addRow("Parallel Monero chunk size", self.sp_parallel_monero_chunk_size)
-        mfl.addRow("Parallel Monero max results/chunk", self.sp_parallel_monero_max_results_per_chunk)
+        mfl.addRow(self.cb_parallel_monero_worker)
+        mfl.addRow("ParallelPython DLL", self._hbox(self.ed_parallel_python_dll, self.btn_browse_parallel_python_dll))
+        mfl.addRow("ParallelPython batch size", self.sp_parallel_python_batch_size)
         mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
         mfl.addRow("API Token", self.ed_bn_api_token)
         mfl.addRow("API Prefix", self.ed_bn_api_prefix)
@@ -621,7 +614,7 @@ class MainWindow(QMainWindow):
 
         info = QLabel(
             "Only one scan mode should be enabled at a time. "
-            "Parallel Monero mode is local CPU-side threaded scanning using a shared RandomX dataset. "
+            "ParallelMoneroWorker uses local RandomX hashing through the ParallelPython callback/export path. "
             "VirtualASIC expects a compatible kernel that writes result records as "
             "[nonce_u32 little-endian][32-byte hash] and a count buffer."
         )
@@ -638,7 +631,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_gpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_cpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_vasic_scan.toggled.connect(self._sync_scan_mode_exclusive)
-        self.cb_parallel_monero_scan.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_parallel_monero_worker.toggled.connect(self._sync_scan_mode_exclusive)
         self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
@@ -741,6 +734,10 @@ class MainWindow(QMainWindow):
             )
             if guess:
                 self.ed_vasic_kernel.setText(guess)
+        if not self.ed_parallel_python_dll.text().strip():
+            guess = resolve_resource_path("", fallback_names=("ParallelPython.dll", "parallelpython.dll"))
+            if guess:
+                self.ed_parallel_python_dll.setText(guess)
 
     def _sync_scan_mode_exclusive(self) -> None:
         sender = self.sender()
@@ -755,7 +752,7 @@ class MainWindow(QMainWindow):
             self.cb_bn_gpu_scan,
             self.cb_bn_cpu_scan,
             self.cb_vasic_scan,
-            self.cb_parallel_monero_scan,
+            self.cb_parallel_monero_worker,
         ):
             if cb is sender:
                 continue
@@ -778,7 +775,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_gpu_scan.setEnabled(True)
         self.cb_bn_cpu_scan.setEnabled(True)
         self.cb_vasic_scan.setEnabled(True)
-        self.cb_parallel_monero_scan.setEnabled(True)
+        self.cb_parallel_monero_worker.setEnabled(True)
 
     def _on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
@@ -871,6 +868,20 @@ class MainWindow(QMainWindow):
         if path:
             self.ed_vasic_kernel.setText(path)
 
+    def _browse_parallel_python_dll(self) -> None:
+        start = _pick_existing_path(
+            self.ed_parallel_python_dll.text().strip(),
+            ("ParallelPython.dll", "parallelpython.dll"),
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select ParallelPython DLL",
+            start,
+            "DLL (*.dll *.so *.dylib);;All files (*.*)",
+        )
+        if path:
+            self.ed_parallel_python_dll.setText(path)
+
     def _tick_uptime(self) -> None:
         if not self.started_at:
             self.lbl_uptime.setText("Uptime: 00:00:00")
@@ -924,7 +935,7 @@ class MainWindow(QMainWindow):
         use_bn_p2pool_scan = bool(self.cb_bn_p2pool_scan.isChecked())
         use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
         use_virtualasic_scan = bool(self.cb_vasic_scan.isChecked())
-        use_parallel_monero_scan = bool(self.cb_parallel_monero_scan.isChecked())
+        use_parallel_monero_worker = bool(self.cb_parallel_monero_worker.isChecked())
 
         bn_api_relay = self.ed_bn_api_relay.text().strip()
         submit_workers = int(self.sp_submit_workers.value())
@@ -933,6 +944,9 @@ class MainWindow(QMainWindow):
         vasic_dll = self.ed_vasic_dll.text().strip()
         vasic_kernel = self.ed_vasic_kernel.text().strip()
         vasic_kernel_name = self.ed_vasic_kernel_name.text().strip() or "monero_scan"
+
+        parallel_python_dll = self.ed_parallel_python_dll.text().strip()
+        parallel_python_batch_size = int(self.sp_parallel_python_batch_size.value())
 
         if use_virtualasic_scan:
             if not vasic_dll:
@@ -943,9 +957,6 @@ class MainWindow(QMainWindow):
                 raise ValueError("missing VirtualASIC kernel")
             if threads > 1:
                 self._append_log("[gui] warning: VirtualASIC with threads > 1 creates one engine per worker and may reduce GPU efficiency.")
-
-        if use_parallel_monero_scan and threads <= 0:
-            raise ValueError("Parallel Monero scan requires at least one worker thread.")
 
         use_bn_reporting = bool(self.cb_bn.isChecked())
 
@@ -978,10 +989,9 @@ class MainWindow(QMainWindow):
             bn_api_prefix=self.ed_bn_api_prefix.text().strip() or "/v1",
             bn_rx_batch=int(self.sp_bn_rx_batch.value()),
             scan_iters=scan_iters,
-            use_parallel_monero_scan=use_parallel_monero_scan,
-            parallel_monero_threads=int(self.sp_parallel_monero_threads.value()),
-            parallel_monero_chunk_size=int(self.sp_parallel_monero_chunk_size.value()),
-            parallel_monero_max_results_per_chunk=int(self.sp_parallel_monero_max_results_per_chunk.value()),
+            use_parallel_monero_worker=use_parallel_monero_worker,
+            parallel_python_dll=parallel_python_dll,
+            parallel_python_batch_size=parallel_python_batch_size,
         )
 
     def _start(self) -> None:
@@ -1002,12 +1012,12 @@ class MainWindow(QMainWindow):
                 f"kernel_name={cfg.virtualasic_kernel_name}"
             )
 
-        if cfg.use_parallel_monero_scan:
+        if cfg.use_parallel_monero_worker:
             self.txt_log.appendPlainText(
-                f"[gui] parallel monero scan enabled: "
-                f"threads={cfg.parallel_monero_threads} "
-                f"chunk_size={cfg.parallel_monero_chunk_size} "
-                f"max_results_per_chunk={cfg.parallel_monero_max_results_per_chunk}"
+                f"[gui] parallel monero worker enabled: "
+                f"threads={cfg.threads} "
+                f"dll={cfg.parallel_python_dll or 'auto'} "
+                f"batch_size={cfg.parallel_python_batch_size}"
             )
 
         self._set_running(True)
@@ -1069,10 +1079,9 @@ class MainWindow(QMainWindow):
                 "bn_rx_batch": int(self.sp_bn_rx_batch.value()),
                 "scan_iters": int(self.sp_scan_iters.value()),
                 "submit_workers": int(self.sp_submit_workers.value()),
-                "use_parallel_monero_scan": bool(self.cb_parallel_monero_scan.isChecked()),
-                "parallel_monero_threads": int(self.sp_parallel_monero_threads.value()),
-                "parallel_monero_chunk_size": int(self.sp_parallel_monero_chunk_size.value()),
-                "parallel_monero_max_results_per_chunk": int(self.sp_parallel_monero_max_results_per_chunk.value()),
+                "use_parallel_monero_worker": bool(self.cb_parallel_monero_worker.isChecked()),
+                "parallel_python_dll": self.ed_parallel_python_dll.text(),
+                "parallel_python_batch_size": int(self.sp_parallel_python_batch_size.value()),
             }
 
         try:
@@ -1124,11 +1133,10 @@ class MainWindow(QMainWindow):
         self.sp_scan_iters.setValue(int(data.get("scan_iters", self.sp_scan_iters.value())))
         self.sp_submit_workers.setValue(int(data.get("submit_workers", self.sp_submit_workers.value())))
 
-        self.cb_parallel_monero_scan.setChecked(bool(data.get("use_parallel_monero_scan", self.cb_parallel_monero_scan.isChecked())))
-        self.sp_parallel_monero_threads.setValue(int(data.get("parallel_monero_threads", self.sp_parallel_monero_threads.value())))
-        self.sp_parallel_monero_chunk_size.setValue(int(data.get("parallel_monero_chunk_size", self.sp_parallel_monero_chunk_size.value())))
-        self.sp_parallel_monero_max_results_per_chunk.setValue(
-            int(data.get("parallel_monero_max_results_per_chunk", self.sp_parallel_monero_max_results_per_chunk.value()))
+        self.cb_parallel_monero_worker.setChecked(bool(data.get("use_parallel_monero_worker", False)))
+        self.ed_parallel_python_dll.setText(str(data.get("parallel_python_dll", self.ed_parallel_python_dll.text())))
+        self.sp_parallel_python_batch_size.setValue(
+            int(data.get("parallel_python_batch_size", self.sp_parallel_python_batch_size.value()))
         )
 
         self._sync_scan_checks()
