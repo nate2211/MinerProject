@@ -14,16 +14,17 @@ from ctypes import (
     c_char_p,
     c_double,
     c_int,
-    c_size_t,
     c_uint32,
     c_ubyte,
     c_void_p,
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 
 from monero_job import MoneroJob
+from python_runtime import PYR_TASK_ECHO, PythonRuntime, PythonRuntimeError
+from python_usage import PythonUsage
 from randomx_ctypes import RandomX
 
 
@@ -80,8 +81,9 @@ class ParallelPythonBridge:
     TYPE_DOUBLE = 3
     TYPE_STRING = 4
 
-    def __init__(self, logger: Optional[Callable[[str], None]] = None, dll_path: str = "") -> None:
+    def __init__(self, logger: Optional[Callable[[str], None]] = None, dll_path: str = "", python_runtime = None) -> None:
         self.logger = logger or (lambda s: None)
+        self.python_runtime = python_runtime
         self.dll_path = self._resolve_dll_path(dll_path)
         self.dll = None
         self.available = False
@@ -160,7 +162,8 @@ class ParallelPythonBridge:
             self.dll.invoke_python_string.argtypes = [c_void_p, c_char_p, c_int]
             self.dll.invoke_python_string.restype = None
 
-            self.dll.invoke_all_parallel.argtypes = [c_void_p, c_int]
+            # FIX: use the real descriptor pointer type, not plain c_void_p
+            self.dll.invoke_all_parallel.argtypes = [POINTER(self.PythonCallDescriptor), c_int]
             self.dll.invoke_all_parallel.restype = None
 
             self.available = True
@@ -171,7 +174,27 @@ class ParallelPythonBridge:
             self.logger(f"[ParallelPythonBridge] Failed to load DLL: {e}")
 
     def make_void_callback(self, func: Callable[[], None]):
-        return self.PythonCallback(func)
+        if isinstance(func, self.PythonCallback):
+            return func
+
+        if not callable(func):
+            raise TypeError(f"make_void_callback expected a callable, got {type(func)!r}")
+
+        def _wrapped():
+            rt = self.python_runtime
+            entered = False
+
+            try:
+                if rt is not None and hasattr(rt, "_enter_parallelpython_callback"):
+                    rt._enter_parallelpython_callback()
+                    entered = True
+
+                func()
+            finally:
+                if entered and rt is not None and hasattr(rt, "_exit_parallelpython_callback"):
+                    rt._exit_parallelpython_callback()
+
+        return self.PythonCallback(_wrapped)
 
     def make_int_callback(self, func: Callable[[], int]):
         def cb(ptr):
@@ -203,33 +226,44 @@ class ParallelPythonBridge:
                 data = str(func()).encode("utf-8", errors="replace")
             except Exception:
                 data = b""
-            n = min(len(data), max(0, int(size) - 1))
+
+            size_i = max(0, int(size))
+            n = min(len(data), max(0, size_i - 1))
+
             if n > 0:
                 ctypes.memmove(buf, data, n)
-            if size > 0:
-                ctypes.memset(ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer_copy(b"\x00"))), 0, 0)
+
+            if size_i > 0:
+                base_ptr = cast(buf, c_void_p).value
+                if base_ptr:
+                    ctypes.memset(c_void_p(base_ptr + n), 0, 1)
+
         return self.StringCallback(cb), ctypes.create_string_buffer(buffer_size)
 
     def invoke_all_void(self, callbacks: list) -> None:
-        if not self.available or self.dll is None or not callbacks:
-            for cb in callbacks:
+        if not callbacks:
+            return
+
+        normalized = [self.make_void_callback(cb) for cb in callbacks]
+
+        if not self.available or self.dll is None:
+            for cb in normalized:
                 cb()
             return
 
-        descs = []
-        for cb in callbacks:
-            descs.append(
-                self.PythonCallDescriptor(
-                    c_void_p(cast(cb, c_void_p).value),
-                    c_void_p(),
-                    0,
-                    self.TYPE_VOID,
-                )
+        descs = [
+            self.PythonCallDescriptor(
+                c_void_p(cast(cb, c_void_p).value),
+                c_void_p(),
+                0,
+                self.TYPE_VOID,
             )
+            for cb in normalized
+        ]
 
         arr_t = self.PythonCallDescriptor * len(descs)
         arr = arr_t(*descs)
-        self.dll.invoke_all_parallel(cast(arr, c_void_p), len(descs))
+        self.dll.invoke_all_parallel(arr, len(descs))
 
     def invoke_int(self, cb) -> int:
         if not self.available or self.dll is None:
@@ -267,16 +301,29 @@ class ParallelPythonBridge:
         return buf.value.decode("utf-8", errors="replace")
 
 
+
+@dataclass
+class _VMState:
+    seed_hash: bytes = b""
+    vm: Any = None
+    blob_buf: Any = None
+    nonce_ptr: Any = None
+    out_buf: Any = None
+
 class ParallelMoneroWorker:
     """
-    A worker-oriented Monero hasher that uses ParallelPython callback exports
-    to dispatch multiple local hashing jobs in parallel.
+    Safe hybrid design:
+      - actual Monero hashing stays local in _hash_range() using RandomX
+      - ParallelPython is used only for callback fan-out
+      - PythonRuntime is used only as a lightweight control-plane health check
 
-    Notes:
-      - hashing is still real RandomX hashing via randomx_ctypes
-      - ParallelPython is used for callback orchestration
-      - miner threads param is respected by creating that many callback jobs
-      - one VM per Python worker thread via thread-local state
+    Why:
+      - the uploaded PythonRuntime wrapper/DLL do not yet implement a real native
+        Monero task for PYR_TASK_USER_BASE + N
+      - the old runtime branch used wait_result()/release_result(), which do not
+        match the current wrapper API
+      - keeping PythonRuntime out of the hot hashing path avoids the access-
+        violation-prone teardown pattern you were hitting
     """
 
     def __init__(
@@ -287,21 +334,29 @@ class ParallelMoneroWorker:
         randomx: Optional[RandomX] = None,
         dll_path: str = "",
         batch_size: int = 1024,
+        python_runtime: Optional[PythonRuntime] = None,
+        python_usage: Optional[PythonUsage] = None,
     ) -> None:
         self.logger = logger or (lambda s: None)
         self.threads = max(1, int(threads))
         self.batch_size = max(1, int(batch_size))
         self.rx = randomx or RandomX(self.logger)
-        self.bridge = ParallelPythonBridge(logger=self.logger, dll_path=dll_path)
+        self.bridge = ParallelPythonBridge(logger=self.logger, dll_path=dll_path, python_runtime=python_runtime)
 
-        self._tls = _ThreadState()
+        self._vm_cv = threading.Condition()
+        self._vm_pool: list[_VMState] = []
+        self._vm_total_created = 0
+        self._vm_limit = self.threads
         self._seed_lock = threading.RLock()
         self._prepared_seed: bytes = b""
         self._stop = threading.Event()
+
         self._last_hashes_done = 0
         self._last_job_id = ""
         self._last_elapsed = 0.0
 
+        self.python_runtime = python_runtime
+        self.python_usage = python_usage
     def stop(self) -> None:
         self._stop.set()
 
@@ -310,6 +365,35 @@ class ParallelMoneroWorker:
 
     def close(self) -> None:
         self._stop.set()
+
+        pooled = []
+        with self._vm_cv:
+            if self._vm_pool:
+                pooled = list(self._vm_pool)
+                self._vm_pool.clear()
+
+            if pooled:
+                self._vm_total_created -= len(pooled)
+                if self._vm_total_created < 0:
+                    self._vm_total_created = 0
+
+            self._vm_cv.notify_all()
+
+        for st in pooled:
+            if st.vm is not None:
+                try:
+                    self.rx.destroy_vm(st.vm)
+                except Exception:
+                    pass
+            st.vm = None
+            st.seed_hash = b""
+            st.blob_buf = None
+            st.nonce_ptr = None
+            st.out_buf = None
+
+        # Intentionally do not close self.python_runtime here.
+        # The owner should manage PythonRuntime lifecycle so we do not race
+        # other components or tear it down while someone else is using it.
 
     def ensure_seed(self, seed_hash: bytes) -> None:
         seed_hash = bytes(seed_hash or b"")
@@ -323,38 +407,144 @@ class ParallelMoneroWorker:
             self._prepared_seed = seed_hash
 
     def _ensure_thread_vm(self, job: MoneroJob) -> None:
-        st = self._tls
+        """
+        Bounded VM checkout + prepare, while preserving the existing contract:
+            self._ensure_thread_vm(job)
+            st = self._tls
 
-        if st.seed_hash != job.seed_hash or st.vm is None:
-            if st.vm is not None:
-                try:
-                    self.rx.destroy_vm(st.vm)
-                except Exception:
-                    pass
-                st.vm = None
-            st.vm = self.rx.create_vm()
-            st.seed_hash = bytes(job.seed_hash)
+        Uses the already-existing:
+            self._vm_cv
+            self._vm_pool
+            self._vm_total_created
+            self._vm_limit
+        """
+        if job is None:
+            raise ValueError("job is required")
 
-        if st.blob_buf is None or len(st.blob_buf) != len(job.blob):
-            st.blob_buf = (c_ubyte * len(job.blob))()
+        blob = bytes(job.blob or b"")
+        seed_hash = bytes(job.seed_hash or b"")
+        nonce_offset = int(job.nonce_offset)
 
-        memmove(st.blob_buf, job.blob, len(job.blob))
-        st.nonce_ptr = cast(byref(st.blob_buf, job.nonce_offset), POINTER(c_uint32))
+        if not blob:
+            raise ValueError("job.blob is empty")
+        if not seed_hash:
+            raise ValueError("job.seed_hash is empty")
+        if nonce_offset < 0 or (nonce_offset + 4) > len(blob):
+            raise ValueError(
+                f"invalid nonce_offset {nonce_offset} for blob length {len(blob)}"
+            )
 
-        if st.out_buf is None:
-            st.out_buf = (c_ubyte * 32)()
+        tls = getattr(self, "_tls", None)
+        if tls is None:
+            tls = threading.local()
+            self._tls = tls
+
+        if not hasattr(tls, "seed_hash"):
+            tls.seed_hash = b""
+        if not hasattr(tls, "vm"):
+            tls.vm = None
+        if not hasattr(tls, "blob_buf"):
+            tls.blob_buf = None
+        if not hasattr(tls, "nonce_ptr"):
+            tls.nonce_ptr = None
+        if not hasattr(tls, "out_buf"):
+            tls.out_buf = None
+        if not hasattr(tls, "_checked_out_vm_state"):
+            tls._checked_out_vm_state = None
+
+        # Already checked out for this call path
+        st = tls._checked_out_vm_state
+        if st is None:
+            created_slot = False
+            with self._vm_cv:
+                while True:
+                    if self._vm_pool:
+                        st = self._vm_pool.pop()
+                        break
+
+                    if self._vm_total_created < self._vm_limit:
+                        self._vm_total_created += 1
+                        created_slot = True
+                        st = _VMState()
+                        break
+
+                    self._vm_cv.wait()
+
+            try:
+                # Create / recreate VM only when the seed changes.
+                if st.vm is None or st.seed_hash != seed_hash:
+                    if st.vm is not None:
+                        try:
+                            self.rx.destroy_vm(st.vm)
+                        except Exception:
+                            pass
+                        st.vm = None
+
+                    new_vm = self.rx.create_vm()
+                    if new_vm is None:
+                        raise RuntimeError("RandomX create_vm() returned None")
+
+                    st.vm = new_vm
+                    st.seed_hash = seed_hash
+
+                if st.blob_buf is None or len(st.blob_buf) != len(blob):
+                    st.blob_buf = (c_ubyte * len(blob))()
+
+                if st.out_buf is None:
+                    st.out_buf = (c_ubyte * 32)()
+
+                memmove(st.blob_buf, blob, len(blob))
+                st.nonce_ptr = cast(byref(st.blob_buf, nonce_offset), POINTER(c_uint32))
+
+                if st.nonce_ptr is None:
+                    raise RuntimeError("failed to create nonce pointer")
+
+                # Probe pointer before native hashing touches it.
+                _ = st.nonce_ptr[0]
+
+                tls._checked_out_vm_state = st
+
+            except Exception:
+                # Do not leak a partially prepared slot.
+                if st is not None and getattr(st, "vm", None) is not None:
+                    try:
+                        self.rx.destroy_vm(st.vm)
+                    except Exception:
+                        pass
+                    st.vm = None
+                    st.seed_hash = b""
+                    st.blob_buf = None
+                    st.nonce_ptr = None
+                    st.out_buf = None
+
+                if created_slot:
+                    with self._vm_cv:
+                        if self._vm_total_created > 0:
+                            self._vm_total_created -= 1
+                        self._vm_cv.notify_all()
+                raise
+
+        # Mirror into TLS so existing _hash_range() can continue using self._tls
+        tls.seed_hash = st.seed_hash
+        tls.vm = st.vm
+        tls.blob_buf = st.blob_buf
+        tls.nonce_ptr = st.nonce_ptr
+        tls.out_buf = st.out_buf
 
     def _hash_range(
-        self,
-        *,
-        job: MoneroJob,
-        start_nonce: int,
-        count: int,
-        max_results: int,
-        out_found: list,
-        out_hashes: list,
-        out_errors: list,
+            self,
+            *,
+            job: MoneroJob,
+            start_nonce: int,
+            count: int,
+            max_results: int,
+            out_found: list,
+            out_hashes: list,
+            out_errors: list,
+            out_lock: threading.Lock,
     ) -> None:
+        tls = getattr(self, "_tls", None)
+
         try:
             self._ensure_thread_vm(job)
             st = self._tls
@@ -385,12 +575,52 @@ class ParallelMoneroWorker:
                     if len(local_found) >= max_results:
                         break
 
-            out_hashes.append(local_done)
-            if local_found:
-                out_found.extend(local_found[:max_results])
+            with out_lock:
+                out_hashes.append(local_done)
+                if local_found:
+                    out_found.extend(local_found[:max_results])
 
         except Exception as e:
-            out_errors.append(str(e))
+            with out_lock:
+                out_errors.append(str(e))
+
+        finally:
+            tls = getattr(self, "_tls", None)
+            if tls is None:
+                return
+
+            st = getattr(tls, "_checked_out_vm_state", None)
+            if st is not None:
+                # After stop/close, destroy instead of repooling so RAM goes down.
+                if self._stop.is_set():
+                    if st.vm is not None:
+                        try:
+                            self.rx.destroy_vm(st.vm)
+                        except Exception:
+                            pass
+                    st.vm = None
+                    st.seed_hash = b""
+                    st.blob_buf = None
+                    st.nonce_ptr = None
+                    st.out_buf = None
+
+                    with self._vm_cv:
+                        if self._vm_total_created > 0:
+                            self._vm_total_created -= 1
+                        self._vm_cv.notify_all()
+                else:
+                    with self._vm_cv:
+                        self._vm_pool.append(st)
+                        self._vm_cv.notify()
+
+            # Clear thread-local mirror refs so callback-thread churn does not keep
+            # stale Python-side buffer references alive forever.
+            tls._checked_out_vm_state = None
+            tls.seed_hash = b""
+            tls.vm = None
+            tls.blob_buf = None
+            tls.nonce_ptr = None
+            tls.out_buf = None
 
     def hash_job(
         self,
@@ -412,6 +642,7 @@ class ParallelMoneroWorker:
         self.ensure_seed(job.seed_hash)
         self.reset_stop()
 
+
         count = max(1, int(count))
         threads = max(1, int(self.threads))
         per_thread = max(1, count // threads)
@@ -420,18 +651,22 @@ class ParallelMoneroWorker:
         found: list[dict] = []
         hashes_done_parts: list[int] = []
         errors: list[str] = []
-        callbacks = []
+        results_lock = threading.Lock()
 
         nonce_cursor = int(start_nonce) & 0xFFFFFFFF
 
+        subranges: list[tuple[int, int]] = []
         for i in range(threads):
             take = per_thread + (1 if i < remainder else 0)
             if take <= 0:
                 continue
             sub_start = nonce_cursor
             nonce_cursor = (nonce_cursor + take) & 0xFFFFFFFF
+            subranges.append((sub_start, take))
 
-            def make_job(s=sub_start, c=take):
+        callbacks = []
+        for sub_start, take in subranges:
+            def make_job(s=sub_start, c=take)-> Callable[[], None]:
                 return lambda: self._hash_range(
                     job=job,
                     start_nonce=s,
@@ -440,9 +675,17 @@ class ParallelMoneroWorker:
                     out_found=found,
                     out_hashes=hashes_done_parts,
                     out_errors=errors,
+                    out_lock=results_lock,
                 )
-
-            callbacks.append(self.bridge.make_void_callback(make_job()))
+            cb_func = self.python_runtime.wrap_parallel_void_factory(
+                make_job,
+                timeout_ms=0xFFFFFFFF,
+                gate_task=PYR_TASK_ECHO,
+                gate_payload=f"__parallel_make_job__:{job.job_id}:{sub_start}:{take}".encode("utf-8"),
+                name=f"make_job_{sub_start}_{take}",
+            )
+            wrapped_func = self.python_usage.wrap_function(cb_func)
+            callbacks.append(wrapped_func)
 
         self.bridge.invoke_all_void(callbacks)
 
@@ -454,19 +697,9 @@ class ParallelMoneroWorker:
         self._last_elapsed = elapsed
 
         if errors:
-            self.logger(f"[ParallelMoneroWorker] callback errors: {' | '.join(errors[:4])}")
+            self.logger(f"[ParallelMoneroWorker] hashing errors: {' | '.join(errors[:4])}")
 
-        # Example use of the other export types for lightweight diagnostics/state callbacks.
-        int_cb = self.bridge.make_int_callback(lambda: hashes_done)
-        bool_cb = self.bridge.make_bool_callback(lambda: len(found) > 0)
-        double_cb = self.bridge.make_double_callback(lambda: elapsed)
-        string_cb = self.bridge.make_string_callback(lambda: job.job_id)[0]
 
-        # invoke them so the bridge actually uses the export family requested
-        _ = self.bridge.invoke_int(int_cb)
-        _ = self.bridge.invoke_bool(bool_cb)
-        _ = self.bridge.invoke_double(double_cb)
-        _ = self.bridge.invoke_string(string_cb)
 
         return {
             "job_id": job.job_id,

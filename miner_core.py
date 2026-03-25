@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, List
 
 from monero_job import MoneroJob
+from python_runtime import PythonRuntime
+from python_usage import PythonUsage
 from randomx_ctypes import RandomX
 from stratum_client import StratumClient, StratumDisconnected
 from virtualasic import (
@@ -244,7 +246,8 @@ class Miner:
                 prefix=(blocknet_api_prefix or "/v1"),
                 verify_tls=bool(blocknet_verify_tls),
             )
-
+        self.python_runtime = PythonRuntime("PythonRuntime.dll")
+        self.python_usage = PythonUsage("PythonUsage.dll", python_runtime=self.python_runtime)
         self.job_state = JobState()
         self.share_q: "queue.Queue[Share]" = queue.Queue()
         self._stop = threading.Event()
@@ -292,6 +295,8 @@ class Miner:
                 randomx=self.rx,
                 dll_path=self.parallel_python_dll,
                 batch_size=self.parallel_python_batch_size,
+                python_runtime=self.python_runtime,
+                python_usage=self.python_usage
             )
 
         elif self.use_blocknet_gpu_scan:
