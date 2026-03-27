@@ -17,6 +17,7 @@ hidden_imports = [
     'parallel_monero_worker',
     'python_runtime.py',
     'python_usage.py'
+    'python_jit.py',
 ]
 
 a = Analysis(
@@ -28,6 +29,7 @@ a = Analysis(
         ('ParallelPython.dll', '.'),
         ('PythonRuntime.dll', '.'),
         ('PythonUsage.dll', '.'),
+        ('PythonJIT.dll', '.'),
     ],
     datas=[
         ('virtualasic_monero_scan.cl', '.'),

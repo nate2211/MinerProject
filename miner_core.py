@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, List
 
 from monero_job import MoneroJob
+from python_jit import PythonJIT, JITWorker
 from python_runtime import PythonRuntime
 from python_usage import PythonUsage
 from randomx_ctypes import RandomX
@@ -130,6 +131,8 @@ class Miner:
         use_parallel_monero_worker: bool = False,
         parallel_python_dll: str = "",
         parallel_python_batch_size: int = 1024,
+        use_jit_worker: bool = False,
+        jit_batch_size: int = 1024,
     ) -> None:
         self.logger = logger or (lambda s: None)
 
@@ -172,7 +175,8 @@ class Miner:
 
         self.parallel_python_dll = str(parallel_python_dll or "").strip()
         self.parallel_python_batch_size = max(1, int(parallel_python_batch_size))
-
+        self.use_jit_worker = bool(use_jit_worker)
+        self.jit_batch_size = max(1, int(jit_batch_size))
         scan_mode_count = sum(
             1 for x in (
                 self.use_blocknet_p2pool_scan,
@@ -181,6 +185,7 @@ class Miner:
                 self.use_blocknet_cpu_scan,
                 self.use_virtualasic_scan,
                 self.use_parallel_monero_worker,
+                self.use_jit_worker,
             ) if x
         )
         if scan_mode_count > 1:
@@ -188,7 +193,7 @@ class Miner:
                 "Only one scan mode can be enabled at a time: "
                 "use_blocknet_p2pool_scan, use_blocknet_randomx_scan, "
                 "use_blocknet_gpu_scan, use_blocknet_cpu_scan, "
-                "use_virtualasic_scan, use_parallel_monero_worker"
+                "use_virtualasic_scan, use_parallel_monero_worker, use_jit_worker"
             )
 
         self.submit_workers = max(1, int(submit_workers))
@@ -219,6 +224,7 @@ class Miner:
             or self.use_blocknet_cpu_scan
             or self.use_virtualasic_scan
             or self.use_parallel_monero_worker
+            or self.use_jit_worker
         ):
             self.use_blocknet_randomx = False
 
@@ -248,6 +254,9 @@ class Miner:
             )
         self.python_runtime = PythonRuntime("PythonRuntime.dll")
         self.python_usage = PythonUsage("PythonUsage.dll", python_runtime=self.python_runtime)
+        self.python_jit = PythonJIT("PythonJIT.dll")
+        self._jit_worker: Optional[JITWorker] = None
+
         self.job_state = JobState()
         self.share_q: "queue.Queue[Share]" = queue.Queue()
         self._stop = threading.Event()
@@ -296,7 +305,8 @@ class Miner:
                 dll_path=self.parallel_python_dll,
                 batch_size=self.parallel_python_batch_size,
                 python_runtime=self.python_runtime,
-                python_usage=self.python_usage
+                python_usage=self.python_usage,
+                python_jit=self.python_jit
             )
 
         elif self.use_blocknet_gpu_scan:
@@ -325,7 +335,20 @@ class Miner:
             self._bn_gpu = None
             self._bn_cpu = None
             self.rx = None
-
+        elif self.use_jit_worker:
+            self.logger("[Miner] Using local JITWorker backend...")
+            self._bn_gpu = None
+            self._bn_cpu = None
+            self._bn_rx = None
+            self.rx = RandomX(self.logger)
+            self._jit_worker = JITWorker(
+                threads=self.threads,
+                logger=self.logger,
+                randomx=self.rx,
+                jit=self.python_jit,
+                batch_size=self.jit_batch_size,
+                python_usage=self.python_usage,
+            )
         else:
             self._bn_gpu = None
             self._bn_cpu = None
@@ -349,7 +372,11 @@ class Miner:
                 self._parallel_worker.stop()
             except Exception:
                 pass
-
+        if self._jit_worker is not None:
+            try:
+                self._jit_worker.stop()
+            except Exception:
+                pass
         loop = self._async_loop
         cli = self._active_cli
         if loop is not None and cli is not None and not loop.is_closed():
@@ -573,6 +600,7 @@ class Miner:
             and not self.use_blocknet_cpu_scan
             and not self.use_virtualasic_scan
             and not self.use_parallel_monero_worker
+            and not self.use_jit_worker
         )
         needs_local_vm = local_randomx_mode or self.use_virtualasic_scan
 
@@ -756,7 +784,46 @@ class Miner:
                         self.last_err = f"parallel monero worker failed: {self._fmt_exc(e)}"
                         self.logger(f"[Worker-{idx}] parallel monero worker error: {self._fmt_exc(e)}")
                         time.sleep(0.02)
+                elif self.use_jit_worker:
+                    try:
+                        assert self._jit_worker is not None
 
+                        start_nonce = self.job_state.alloc_nonce_block(self.jit_batch_size)
+                        resp = self._jit_worker.hash_job(
+                            job=cur_job,
+                            start_nonce=start_nonce,
+                            count=self.jit_batch_size,
+                            max_results=self.scan_max_results,
+                        )
+
+                        done = int(resp.get("hashes_done") or 0)
+                        if done > 0:
+                            self.add_hashes(done)
+
+                        found = resp.get("found") or []
+                        if isinstance(found, list):
+                            for one in found:
+                                try:
+                                    n = int(one.get("nonce_u32"))
+                                    hx = str(one.get("hash_hex") or "")
+                                    h32 = bytes.fromhex(hx)
+                                    if len(h32) == 32:
+                                        share_put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
+                                except Exception:
+                                    continue
+
+                        errs = resp.get("errors") or []
+                        if errs:
+                            self.last_err = "; ".join(str(x) for x in errs[:4])
+                            self.logger(f"[Worker-{idx}] jit worker warning: {self.last_err}")
+
+                        if done <= 0:
+                            time.sleep(0.001)
+
+                    except Exception as e:
+                        self.last_err = f"jit worker failed: {self._fmt_exc(e)}"
+                        self.logger(f"[Worker-{idx}] jit worker error: {self._fmt_exc(e)}")
+                        time.sleep(0.02)
                 elif self.use_virtualasic_scan:
                     try:
                         assert vasic is not None
@@ -1151,6 +1218,8 @@ class Miner:
 
                     if self.use_virtualasic_scan:
                         backend_rx = "virtualasic_gpu_scan_cpu_verify_submit"
+                    elif self.use_jit_worker:
+                        backend_rx = "jit_worker"
                     elif self.use_parallel_monero_worker:
                         backend_rx = "parallel_monero_worker"
                     elif self.use_blocknet_p2pool_scan:
@@ -1179,8 +1248,10 @@ class Miner:
                             "backend_p2pool": ("blocknet" if self.use_blocknet_p2pool else "stratum"),
                             "backend_randomx": backend_rx,
                             "backend_parallel_monero_worker": self.use_parallel_monero_worker,
-                            "parallel_python_dll": (self.parallel_python_dll if self.use_parallel_monero_worker else None),
-                            "parallel_python_batch_size": (self.parallel_python_batch_size if self.use_parallel_monero_worker else None),
+                            "parallel_python_batch_size": (
+                                self.parallel_python_batch_size if self.use_parallel_monero_worker else None),
+                            "backend_jit_worker": self.use_jit_worker,
+                            "jit_batch_size": (self.jit_batch_size if self.use_jit_worker else None),
                             "submit_workers": self.submit_workers,
                             "scan_iters": (
                                 self.scan_iters if (

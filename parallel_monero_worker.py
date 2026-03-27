@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional, Any
 
 from monero_job import MoneroJob
+from python_jit import PythonJIT
 from python_runtime import PYR_TASK_ECHO, PythonRuntime, PythonRuntimeError
 from python_usage import PythonUsage
 from randomx_ctypes import RandomX
@@ -336,6 +337,7 @@ class ParallelMoneroWorker:
         batch_size: int = 1024,
         python_runtime: Optional[PythonRuntime] = None,
         python_usage: Optional[PythonUsage] = None,
+        python_jit: Optional[PythonJIT] = None,
     ) -> None:
         self.logger = logger or (lambda s: None)
         self.threads = max(1, int(threads))
@@ -357,6 +359,7 @@ class ParallelMoneroWorker:
 
         self.python_runtime = python_runtime
         self.python_usage = python_usage
+        self.python_jit = python_jit
     def stop(self) -> None:
         self._stop.set()
 
@@ -698,8 +701,6 @@ class ParallelMoneroWorker:
 
         if errors:
             self.logger(f"[ParallelMoneroWorker] hashing errors: {' | '.join(errors[:4])}")
-
-
 
         return {
             "job_id": job.job_id,

@@ -230,7 +230,8 @@ class MinerConfig:
     use_parallel_monero_worker: bool = False
     parallel_python_dll: str = ""
     parallel_python_batch_size: int = 1024
-
+    use_jit_worker: bool = False
+    jit_batch_size: int = 1024
 
 class MinerWorker(QThread):
     log_line = pyqtSignal(str)
@@ -337,7 +338,10 @@ class MinerWorker(QThread):
                 miner_kwargs["parallel_python_dll"] = self.cfg.parallel_python_dll.strip()
             if "parallel_python_batch_size" in sig.parameters:
                 miner_kwargs["parallel_python_batch_size"] = int(self.cfg.parallel_python_batch_size)
-
+            if "use_jit_worker" in sig.parameters:
+                miner_kwargs["use_jit_worker"] = bool(self.cfg.use_jit_worker)
+            if "jit_batch_size" in sig.parameters:
+                miner_kwargs["jit_batch_size"] = int(self.cfg.jit_batch_size)
             self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
@@ -356,10 +360,14 @@ class MinerWorker(QThread):
                 b_rx = last_stats.get("backend_randomx")
                 b_pm = bool(last_stats.get("backend_parallel_monero_worker"))
                 pp_batch = last_stats.get("parallel_python_batch_size")
+                b_jit = bool(last_stats.get("backend_jit_worker"))
+                jit_batch = last_stats.get("jit_batch_size")
 
                 self.log_line.emit(
                     f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | "
-                    f"job={job_id} | p2pool={b_p2} rx={b_rx} parallel_worker={b_pm} batch={pp_batch}"
+                    f"job={job_id} | p2pool={b_p2} rx={b_rx} "
+                    f"parallel_worker={b_pm} jit_worker={b_jit} "
+                    f"batch={pp_batch or jit_batch}"
                 )
 
                 if self._bn_heartbeat:
@@ -424,8 +432,7 @@ def _mono_font(point_size: int = 10) -> QFont:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + ParallelMoneroWorker")
-
+        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + ParallelMoneroWorker + JITWorker")
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
 
@@ -549,7 +556,13 @@ class MainWindow(QMainWindow):
         self.cb_parallel_monero_worker = QCheckBox(
             "Use ParallelMoneroWorker — local RandomX hashing through ParallelPython callback exports"
         )
+        self.cb_jit_worker = QCheckBox(
+            "Use JITWorker — local RandomX hashing through PythonJIT/JITWorker"
+        )
 
+        self.sp_jit_batch_size = QSpinBox()
+        self.sp_jit_batch_size.setRange(1, 1_000_000)
+        self.sp_jit_batch_size.setValue(1024)
         self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
         self.ed_bn_api_token = QLineEdit("")
         self.ed_bn_api_token.setEchoMode(QLineEdit.Password)
@@ -599,6 +612,8 @@ class MainWindow(QMainWindow):
         mfl.addRow(self.cb_bn_randomx_scan)
         mfl.addRow(self.cb_vasic_scan)
         mfl.addRow(self.cb_parallel_monero_worker)
+        mfl.addRow(self.cb_jit_worker)
+        mfl.addRow("JIT batch size", self.sp_jit_batch_size)
         mfl.addRow("ParallelPython DLL", self._hbox(self.ed_parallel_python_dll, self.btn_browse_parallel_python_dll))
         mfl.addRow("ParallelPython batch size", self.sp_parallel_python_batch_size)
         mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
@@ -632,6 +647,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_cpu_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_vasic_scan.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_parallel_monero_worker.toggled.connect(self._sync_scan_mode_exclusive)
+        self.cb_jit_worker.toggled.connect(self._sync_scan_mode_exclusive)
         self._sync_scan_checks()
 
         gb_ctrl = QGroupBox("Controls")
@@ -753,6 +769,7 @@ class MainWindow(QMainWindow):
             self.cb_bn_cpu_scan,
             self.cb_vasic_scan,
             self.cb_parallel_monero_worker,
+            self.cb_jit_worker,
         ):
             if cb is sender:
                 continue
@@ -776,7 +793,7 @@ class MainWindow(QMainWindow):
         self.cb_bn_cpu_scan.setEnabled(True)
         self.cb_vasic_scan.setEnabled(True)
         self.cb_parallel_monero_worker.setEnabled(True)
-
+        self.cb_jit_worker.setEnabled(True)
     def _on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
         self._set_log_focus(tab_name == "Log")
@@ -936,7 +953,8 @@ class MainWindow(QMainWindow):
         use_bn_randomx_scan = bool(self.cb_bn_randomx_scan.isChecked())
         use_virtualasic_scan = bool(self.cb_vasic_scan.isChecked())
         use_parallel_monero_worker = bool(self.cb_parallel_monero_worker.isChecked())
-
+        use_jit_worker = bool(self.cb_jit_worker.isChecked())
+        jit_batch_size = int(self.sp_jit_batch_size.value())
         bn_api_relay = self.ed_bn_api_relay.text().strip()
         submit_workers = int(self.sp_submit_workers.value())
         scan_iters = int(self.sp_scan_iters.value())
@@ -992,6 +1010,8 @@ class MainWindow(QMainWindow):
             use_parallel_monero_worker=use_parallel_monero_worker,
             parallel_python_dll=parallel_python_dll,
             parallel_python_batch_size=parallel_python_batch_size,
+            use_jit_worker=use_jit_worker,
+            jit_batch_size=jit_batch_size,
         )
 
     def _start(self) -> None:
@@ -1082,6 +1102,8 @@ class MainWindow(QMainWindow):
                 "use_parallel_monero_worker": bool(self.cb_parallel_monero_worker.isChecked()),
                 "parallel_python_dll": self.ed_parallel_python_dll.text(),
                 "parallel_python_batch_size": int(self.sp_parallel_python_batch_size.value()),
+                "use_jit_worker": bool(self.cb_jit_worker.isChecked()),
+                "jit_batch_size": int(self.sp_jit_batch_size.value()),
             }
 
         try:
@@ -1138,7 +1160,8 @@ class MainWindow(QMainWindow):
         self.sp_parallel_python_batch_size.setValue(
             int(data.get("parallel_python_batch_size", self.sp_parallel_python_batch_size.value()))
         )
-
+        self.cb_jit_worker.setChecked(bool(data.get("use_jit_worker", False)))
+        self.sp_jit_batch_size.setValue(int(data.get("jit_batch_size", self.sp_jit_batch_size.value())))
         self._sync_scan_checks()
 
     def closeEvent(self, event) -> None:
