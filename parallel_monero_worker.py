@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import heapq
 import os
 import sys
 import threading
@@ -310,21 +311,43 @@ class _VMState:
     blob_buf: Any = None
     nonce_ptr: Any = None
     out_buf: Any = None
+@dataclass
+class _LaneState:
+    worker_index: int
+    vm: Any = None
+    blob_buf: Any = None
+    nonce_ptr: Any = None
+    out_buf: Any = None
+    last_seed: bytes = b""
+    last_blob: bytes = b""
 
+    assigned_job: Optional["MoneroJob"] = None
+    assigned_generation: int = 0
+    assigned_start_nonce: int = 0
+    assigned_count: int = 0
+    assigned_max_results: int = 0
+
+    done_hashes: int = 0
+    found: list[dict] | None = None
+    error: Optional[str] = None
+    busy: bool = False
+
+    start_event: threading.Event | None = None
+    done_event: threading.Event | None = None
+    stop_event: threading.Event | None = None
+
+    launch_callback: Optional[Callable[[], None]] = None
+    launch_mode: str = "direct"
 class ParallelMoneroWorker:
     """
-    Safe hybrid design:
-      - actual Monero hashing stays local in _hash_range() using RandomX
-      - ParallelPython is used only for callback fan-out
-      - PythonRuntime is used only as a lightweight control-plane health check
+    JITWorker-style ParallelMoneroWorker while keeping the same public API.
 
-    Why:
-      - the uploaded PythonRuntime wrapper/DLL do not yet implement a real native
-        Monero task for PYR_TASK_USER_BASE + N
-      - the old runtime branch used wait_result()/release_result(), which do not
-        match the current wrapper API
-      - keeping PythonRuntime out of the hot hashing path avoids the access-
-        violation-prone teardown pattern you were hitting
+    Key design:
+      - persistent worker threads
+      - one reusable RandomX VM per worker lane
+      - batch/age strategy similar to JITWorker
+      - PythonRuntime + PythonUsage + ParallelPythonBridge are still used,
+        but only for launch/fan-out, not the actual hot hashing loop
     """
 
     def __init__(
@@ -343,23 +366,38 @@ class ParallelMoneroWorker:
         self.threads = max(1, int(threads))
         self.batch_size = max(1, int(batch_size))
         self.rx = randomx or RandomX(self.logger)
-        self.bridge = ParallelPythonBridge(logger=self.logger, dll_path=dll_path, python_runtime=python_runtime)
+        self.bridge = ParallelPythonBridge(
+            logger=self.logger,
+            dll_path=dll_path,
+            python_runtime=python_runtime,
+        )
 
-        self._vm_cv = threading.Condition()
-        self._vm_pool: list[_VMState] = []
-        self._vm_total_created = 0
-        self._vm_limit = self.threads
+        self.python_runtime = python_runtime
+        self.python_usage = python_usage
+        self.python_jit = python_jit
+
         self._seed_lock = threading.RLock()
-        self._prepared_seed: bytes = b""
+        self._job_lock = threading.RLock()
+        self._hash_job_lock = threading.Lock()
         self._stop = threading.Event()
+
+        self._prepared_seed: bytes = b""
+        self._dispatch_generation = 0
+        self._current_job_id = ""
+        self._current_job_started_at = 0.0
+
+        self._tls = _ThreadState()
+        self._lanes: list[_LaneState] = []
+        self._threads: list[threading.Thread] = []
+        self._lane_by_ident: dict[int, _LaneState] = {}
 
         self._last_hashes_done = 0
         self._last_job_id = ""
         self._last_elapsed = 0.0
 
-        self.python_runtime = python_runtime
-        self.python_usage = python_usage
-        self.python_jit = python_jit
+        self._bootstrap_workers()
+        self._preflight_control_plane()
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -369,34 +407,21 @@ class ParallelMoneroWorker:
     def close(self) -> None:
         self._stop.set()
 
-        pooled = []
-        with self._vm_cv:
-            if self._vm_pool:
-                pooled = list(self._vm_pool)
-                self._vm_pool.clear()
+        for lane in self._lanes:
+            try:
+                if lane.start_event is not None:
+                    lane.start_event.set()
+            except Exception:
+                pass
 
-            if pooled:
-                self._vm_total_created -= len(pooled)
-                if self._vm_total_created < 0:
-                    self._vm_total_created = 0
+        for t in self._threads:
+            try:
+                t.join(timeout=1.5)
+            except Exception:
+                pass
 
-            self._vm_cv.notify_all()
-
-        for st in pooled:
-            if st.vm is not None:
-                try:
-                    self.rx.destroy_vm(st.vm)
-                except Exception:
-                    pass
-            st.vm = None
-            st.seed_hash = b""
-            st.blob_buf = None
-            st.nonce_ptr = None
-            st.out_buf = None
-
-        # Intentionally do not close self.python_runtime here.
-        # The owner should manage PythonRuntime lifecycle so we do not race
-        # other components or tear it down while someone else is using it.
+        for lane in self._lanes:
+            self._destroy_lane_vm(lane)
 
     def ensure_seed(self, seed_hash: bytes) -> None:
         seed_hash = bytes(seed_hash or b"")
@@ -409,21 +434,188 @@ class ParallelMoneroWorker:
             self.rx.ensure_seed(seed_hash)
             self._prepared_seed = seed_hash
 
-    def _ensure_thread_vm(self, job: MoneroJob) -> None:
-        """
-        Bounded VM checkout + prepare, while preserving the existing contract:
-            self._ensure_thread_vm(job)
-            st = self._tls
+    def _bootstrap_workers(self) -> None:
+        for i in range(self.threads):
+            lane = _LaneState(
+                worker_index=i,
+                out_buf=(c_ubyte * 32)(),
+                found=[],
+                start_event=threading.Event(),
+                done_event=threading.Event(),
+                stop_event=self._stop,
+            )
+            lane.launch_callback, lane.launch_mode = self._make_launch_callback(lane)
 
-        Uses the already-existing:
-            self._vm_cv
-            self._vm_pool
-            self._vm_total_created
-            self._vm_limit
-        """
-        if job is None:
-            raise ValueError("job is required")
+            t = threading.Thread(
+                target=self._thread_main,
+                args=(lane,),
+                name=f"ParallelMoneroWorker-{i}",
+                daemon=True,
+            )
+            self._lanes.append(lane)
+            self._threads.append(t)
+            t.start()
 
+        mode_counts: dict[str, int] = {}
+        for lane in self._lanes:
+            mode_counts[lane.launch_mode] = mode_counts.get(lane.launch_mode, 0) + 1
+
+        self.logger(
+            f"[ParallelMoneroWorker] initialized: "
+            f"threads={self.threads} "
+            f"batch_size={self.batch_size} "
+            f"bridge_available={self.bridge.available} "
+            f"launch_modes={mode_counts}"
+        )
+
+    def _preflight_control_plane(self) -> None:
+        callbacks = [
+            lane.launch_callback
+            for lane in self._lanes[: min(4, len(self._lanes))]
+            if callable(lane.launch_callback)
+        ]
+        if not callbacks:
+            return
+
+        try:
+            self.bridge.invoke_all_void(callbacks)
+            self.logger(
+                f"[ParallelMoneroWorker] control-plane preflight complete "
+                f"(callbacks={len(callbacks)})"
+            )
+        except Exception as e:
+            self.logger(
+                f"[ParallelMoneroWorker] control-plane preflight failed: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    def _make_launch_callback(self, lane: _LaneState) -> tuple[Callable[[], None], str]:
+        def _start_lane() -> None:
+            if lane.start_event is not None:
+                lane.start_event.set()
+
+        wrapped: Callable[[], None] = _start_lane
+        mode_parts: list[str] = []
+
+        if self.python_runtime is not None:
+            try:
+                def _factory(cb=_start_lane):
+                    return cb
+
+                rt_cb = self.python_runtime.wrap_parallel_void_factory(
+                    _factory,
+                    timeout_ms=0xFFFFFFFF,
+                    gate_task=PYR_TASK_ECHO,
+                    gate_payload=f"__pmw_lane__:{lane.worker_index}".encode("utf-8"),
+                    name=f"pmw_lane_{lane.worker_index}",
+                )
+                if callable(rt_cb):
+                    wrapped = rt_cb
+                    mode_parts.append("runtime")
+            except Exception as e:
+                self.logger(
+                    f"[ParallelMoneroWorker] worker[{lane.worker_index}] "
+                    f"PythonRuntime wrap failed; using direct start: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if self.python_usage is not None:
+            # Keep PythonUsage in the fan-out path, not the hashing path.
+            # Only wrap a subset of lanes to avoid turning launch into a bottleneck.
+            if lane.worker_index < min(2, self.threads):
+                try:
+                    usage_cb = self.python_usage.wrap_function(wrapped)
+                    if callable(usage_cb):
+                        wrapped = usage_cb
+                        mode_parts.append("usage")
+                except Exception as e:
+                    self.logger(
+                        f"[ParallelMoneroWorker] worker[{lane.worker_index}] "
+                        f"PythonUsage wrap failed; keeping prior mode: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+        mode = "+".join(mode_parts) if mode_parts else "direct"
+        return wrapped, mode
+
+    def _thread_main(self, lane: _LaneState) -> None:
+        ident = threading.get_ident()
+        with self._job_lock:
+            self._lane_by_ident[ident] = lane
+
+        try:
+            while True:
+                lane.start_event.wait()
+                lane.start_event.clear()
+
+                if self._stop.is_set():
+                    break
+
+                lane.done_event.clear()
+                lane.busy = True
+                try:
+                    self._run_lane(lane)
+                finally:
+                    lane.busy = False
+                    lane.done_event.set()
+        finally:
+            with self._job_lock:
+                self._lane_by_ident.pop(ident, None)
+
+    def _current_job_age_ms(self) -> float:
+        with self._job_lock:
+            if self._current_job_started_at <= 0.0:
+                return 0.0
+            return max(0.0, (time.perf_counter() - self._current_job_started_at) * 1000.0)
+
+    def _effective_count(self, requested_count: int) -> int:
+        count = max(0, int(requested_count))
+        if count <= 0:
+            return 0
+
+        age_ms = self._current_job_age_ms()
+
+        if age_ms <= 0.0:
+            return count
+        if age_ms < 150.0:
+            return count
+        if age_ms < 350.0:
+            return min(count, max(256, self.batch_size))
+        if age_ms < 800.0:
+            return min(count, max(128, self.batch_size // 2))
+        return min(count, 128)
+
+    def _stale_check_mask(self) -> int:
+        age_ms = self._current_job_age_ms()
+        if age_ms < 150.0:
+            return 63
+        if age_ms < 400.0:
+            return 31
+        if age_ms < 900.0:
+            return 15
+        return 7
+
+    def _is_current(self, job_id: str, generation: int) -> bool:
+        with self._job_lock:
+            return (
+                str(job_id) == self._current_job_id
+                and int(generation) == int(self._dispatch_generation)
+            )
+
+    def _destroy_lane_vm(self, lane: _LaneState) -> None:
+        if lane.vm is not None:
+            try:
+                self.rx.destroy_vm(lane.vm)
+            except Exception:
+                pass
+        lane.vm = None
+        lane.blob_buf = None
+        lane.nonce_ptr = None
+        lane.out_buf = None
+        lane.last_seed = b""
+        lane.last_blob = b""
+
+    def _prepare_lane_resources(self, lane: _LaneState, job: MoneroJob) -> None:
         blob = bytes(job.blob or b"")
         seed_hash = bytes(job.seed_hash or b"")
         nonce_offset = int(job.nonce_offset)
@@ -437,193 +629,265 @@ class ParallelMoneroWorker:
                 f"invalid nonce_offset {nonce_offset} for blob length {len(blob)}"
             )
 
-        tls = getattr(self, "_tls", None)
-        if tls is None:
-            tls = threading.local()
-            self._tls = tls
+        self.ensure_seed(seed_hash)
 
-        if not hasattr(tls, "seed_hash"):
-            tls.seed_hash = b""
-        if not hasattr(tls, "vm"):
-            tls.vm = None
-        if not hasattr(tls, "blob_buf"):
-            tls.blob_buf = None
-        if not hasattr(tls, "nonce_ptr"):
-            tls.nonce_ptr = None
-        if not hasattr(tls, "out_buf"):
-            tls.out_buf = None
-        if not hasattr(tls, "_checked_out_vm_state"):
-            tls._checked_out_vm_state = None
+        if lane.vm is None or lane.last_seed != seed_hash:
+            if lane.vm is not None:
+                try:
+                    self.rx.destroy_vm(lane.vm)
+                except Exception:
+                    pass
+                lane.vm = None
 
-        # Already checked out for this call path
-        st = tls._checked_out_vm_state
-        if st is None:
-            created_slot = False
-            with self._vm_cv:
-                while True:
-                    if self._vm_pool:
-                        st = self._vm_pool.pop()
-                        break
+            new_vm = self.rx.create_vm()
+            if new_vm is None:
+                raise RuntimeError("RandomX create_vm() returned None")
 
-                    if self._vm_total_created < self._vm_limit:
-                        self._vm_total_created += 1
-                        created_slot = True
-                        st = _VMState()
-                        break
+            lane.vm = new_vm
+            lane.last_seed = seed_hash
 
-                    self._vm_cv.wait()
+        if lane.blob_buf is None or len(lane.blob_buf) != len(blob):
+            lane.blob_buf = (c_ubyte * len(blob))()
+            lane.last_blob = b""
 
-            try:
-                # Create / recreate VM only when the seed changes.
-                if st.vm is None or st.seed_hash != seed_hash:
-                    if st.vm is not None:
-                        try:
-                            self.rx.destroy_vm(st.vm)
-                        except Exception:
-                            pass
-                        st.vm = None
+        if lane.out_buf is None:
+            lane.out_buf = (c_ubyte * 32)()
 
-                    new_vm = self.rx.create_vm()
-                    if new_vm is None:
-                        raise RuntimeError("RandomX create_vm() returned None")
+        if lane.last_blob != blob:
+            memmove(lane.blob_buf, blob, len(blob))
+            lane.last_blob = blob
 
-                    st.vm = new_vm
-                    st.seed_hash = seed_hash
+        lane.nonce_ptr = cast(
+            byref(lane.blob_buf, nonce_offset),
+            POINTER(c_uint32),
+        )
+        _ = lane.nonce_ptr[0]
 
-                if st.blob_buf is None or len(st.blob_buf) != len(blob):
-                    st.blob_buf = (c_ubyte * len(blob))()
+        # Mirror for compatibility with older helper flow.
+        self._tls.seed_hash = lane.last_seed
+        self._tls.vm = lane.vm
+        self._tls.blob_buf = lane.blob_buf
+        self._tls.nonce_ptr = lane.nonce_ptr
+        self._tls.out_buf = lane.out_buf
 
-                if st.out_buf is None:
-                    st.out_buf = (c_ubyte * 32)()
+    @staticmethod
+    def _candidate_sort_key(item: dict) -> tuple[int, float, int]:
+        return (
+            int(item["tail64"]),
+            -float(item["share_diff_est"]),
+            int(item["nonce_u32"]),
+        )
 
-                memmove(st.blob_buf, blob, len(blob))
-                st.nonce_ptr = cast(byref(st.blob_buf, nonce_offset), POINTER(c_uint32))
+    @staticmethod
+    def _candidate_heap_key(item: dict) -> tuple[int, float, int]:
+        # heap root = worst kept candidate
+        return (
+            -int(item["tail64"]),
+            float(item["share_diff_est"]),
+            -int(item["nonce_u32"]),
+        )
 
-                if st.nonce_ptr is None:
-                    raise RuntimeError("failed to create nonce pointer")
-
-                # Probe pointer before native hashing touches it.
-                _ = st.nonce_ptr[0]
-
-                tls._checked_out_vm_state = st
-
-            except Exception:
-                # Do not leak a partially prepared slot.
-                if st is not None and getattr(st, "vm", None) is not None:
-                    try:
-                        self.rx.destroy_vm(st.vm)
-                    except Exception:
-                        pass
-                    st.vm = None
-                    st.seed_hash = b""
-                    st.blob_buf = None
-                    st.nonce_ptr = None
-                    st.out_buf = None
-
-                if created_slot:
-                    with self._vm_cv:
-                        if self._vm_total_created > 0:
-                            self._vm_total_created -= 1
-                        self._vm_cv.notify_all()
-                raise
-
-        # Mirror into TLS so existing _hash_range() can continue using self._tls
-        tls.seed_hash = st.seed_hash
-        tls.vm = st.vm
-        tls.blob_buf = st.blob_buf
-        tls.nonce_ptr = st.nonce_ptr
-        tls.out_buf = st.out_buf
-
-    def _hash_range(
-            self,
-            *,
-            job: MoneroJob,
-            start_nonce: int,
-            count: int,
-            max_results: int,
-            out_found: list,
-            out_hashes: list,
-            out_errors: list,
-            out_lock: threading.Lock,
+    def _keep_local_best(
+        self,
+        heap: list[tuple[tuple[int, float, int], dict]],
+        item: dict,
+        keep: int,
     ) -> None:
-        tls = getattr(self, "_tls", None)
+        keep = max(1, int(keep))
+        entry = (self._candidate_heap_key(item), item)
+
+        if len(heap) < keep:
+            heapq.heappush(heap, entry)
+            return
+
+        if entry[0] > heap[0][0]:
+            heapq.heapreplace(heap, entry)
+
+    def _rank_found(self, gathered: list[dict], max_results: int) -> list[dict]:
+        if max_results <= 0 or not gathered:
+            return []
+
+        best_by_key: dict[tuple[int, str], dict] = {}
+        for item in gathered:
+            key = (int(item["nonce_u32"]), str(item["hash_hex"]))
+            prev = best_by_key.get(key)
+            if prev is None or self._candidate_sort_key(item) < self._candidate_sort_key(prev):
+                best_by_key[key] = item
+
+        ranked = sorted(best_by_key.values(), key=self._candidate_sort_key)
+        return ranked[:max_results]
+
+    def _run_lane_once(self, lane: _LaneState) -> None:
+        lane.error = None
+        lane.done_hashes = 0
+        if lane.found is None:
+            lane.found = []
+        else:
+            lane.found.clear()
+
+        job = lane.assigned_job
+        if job is None:
+            return
+
+        job_id = str(job.job_id)
+        generation = int(lane.assigned_generation or 0)
+        if generation <= 0:
+            return
+
+        if not self._is_current(job_id, generation):
+            return
+
+        self._prepare_lane_resources(lane, job)
+
+        rx_hash_into = self.rx.hash_into
+        target64 = int(job.target64) & 0xFFFFFFFFFFFFFFFF
+
+        keep_best = max(0, int(lane.assigned_max_results))
+        start_nonce = int(lane.assigned_start_nonce) & 0xFFFFFFFF
+        count = max(0, int(lane.assigned_count))
+
+        stop_flag = self._stop
+        nonce_ptr = lane.nonce_ptr
+        blob_buf = lane.blob_buf
+        out_buf = lane.out_buf
+        stale_mask = self._stale_check_mask()
+
+        done = 0
+        local_heap: list[tuple[tuple[int, float, int], dict]] = []
+
+        for i in range(count):
+            if stop_flag.is_set():
+                break
+
+            if (i & stale_mask) == 0 and not self._is_current(job_id, generation):
+                break
+
+            nonce_u32 = (start_nonce + i) & 0xFFFFFFFF
+            nonce_ptr[0] = nonce_u32
+            rx_hash_into(lane.vm, blob_buf, out_buf)
+            done += 1
+
+            if keep_best <= 0:
+                continue
+
+            tail64 = int.from_bytes(bytes(out_buf[24:32]), "little", signed=False)
+            if tail64 < target64:
+                h32 = bytes(out_buf)
+                share_diff_est = float("inf") if tail64 == 0 else float((1 << 64) / tail64)
+                self._keep_local_best(
+                    local_heap,
+                    {
+                        "nonce_u32": nonce_u32,
+                        "hash_hex": h32.hex(),
+                        "tail64": tail64,
+                        "share_diff_est": share_diff_est,
+                    },
+                    keep_best,
+                )
+
+        lane.done_hashes = done
+        lane.found = [
+            item for _, item in sorted(local_heap, key=lambda x: self._candidate_sort_key(x[1]))
+        ] if local_heap else []
+
+    def _run_lane(self, lane: _LaneState) -> None:
+        try:
+            self._run_lane_once(lane)
+            return
+        except Exception:
+            # Rebuild the VM once and retry, similar to a self-heal path.
+            self._destroy_lane_vm(lane)
 
         try:
-            self._ensure_thread_vm(job)
-            st = self._tls
+            self._run_lane_once(lane)
+        except Exception as e:
+            lane.error = f"{type(e).__name__}: {e}"
+            lane.done_hashes = 0
+            lane.found = []
+
+    def _get_current_lane(self) -> _LaneState:
+        ident = threading.get_ident()
+        with self._job_lock:
+            lane = self._lane_by_ident.get(ident)
+        if lane is not None:
+            return lane
+
+        lane = getattr(self._tls, "compat_lane", None)
+        if lane is None:
+            lane = _LaneState(
+                worker_index=-1,
+                out_buf=(c_ubyte * 32)(),
+                found=[],
+            )
+            self._tls.compat_lane = lane
+        return lane
+
+    def _ensure_thread_vm(self, job: MoneroJob) -> None:
+        lane = self._get_current_lane()
+        self._prepare_lane_resources(lane, job)
+
+    def _hash_range(
+        self,
+        *,
+        job: MoneroJob,
+        start_nonce: int,
+        count: int,
+        max_results: int,
+        out_found: list,
+        out_hashes: list,
+        out_errors: list,
+        out_lock: threading.Lock,
+    ) -> None:
+        try:
+            lane = self._get_current_lane()
+            self._prepare_lane_resources(lane, job)
+
             rx_hash_into = self.rx.hash_into
             target64 = int(job.target64) & 0xFFFFFFFFFFFFFFFF
 
             local_done = 0
-            local_found: list[dict] = []
+            local_heap: list[tuple[tuple[int, float, int], dict]] = []
+            keep_best = max(0, int(max_results))
 
             for i in range(max(0, int(count))):
                 if self._stop.is_set():
                     break
 
                 nonce_u32 = (int(start_nonce) + i) & 0xFFFFFFFF
-                st.nonce_ptr[0] = nonce_u32
-                rx_hash_into(st.vm, st.blob_buf, st.out_buf)
+                lane.nonce_ptr[0] = nonce_u32
+                rx_hash_into(lane.vm, lane.blob_buf, lane.out_buf)
                 local_done += 1
 
-                h32 = bytes(st.out_buf)
-                tail = int.from_bytes(h32[24:32], "little", signed=False)
-                if tail < target64:
-                    local_found.append(
+                if keep_best <= 0:
+                    continue
+
+                tail64 = int.from_bytes(bytes(lane.out_buf[24:32]), "little", signed=False)
+                if tail64 < target64:
+                    h32 = bytes(lane.out_buf)
+                    share_diff_est = float("inf") if tail64 == 0 else float((1 << 64) / tail64)
+                    self._keep_local_best(
+                        local_heap,
                         {
                             "nonce_u32": nonce_u32,
                             "hash_hex": h32.hex(),
-                        }
+                            "tail64": tail64,
+                            "share_diff_est": share_diff_est,
+                        },
+                        keep_best,
                     )
-                    if len(local_found) >= max_results:
-                        break
+
+            local_found = [
+                item for _, item in sorted(local_heap, key=lambda x: self._candidate_sort_key(x[1]))
+            ]
 
             with out_lock:
                 out_hashes.append(local_done)
                 if local_found:
-                    out_found.extend(local_found[:max_results])
+                    out_found.extend(local_found)
 
         except Exception as e:
             with out_lock:
                 out_errors.append(str(e))
-
-        finally:
-            tls = getattr(self, "_tls", None)
-            if tls is None:
-                return
-
-            st = getattr(tls, "_checked_out_vm_state", None)
-            if st is not None:
-                # After stop/close, destroy instead of repooling so RAM goes down.
-                if self._stop.is_set():
-                    if st.vm is not None:
-                        try:
-                            self.rx.destroy_vm(st.vm)
-                        except Exception:
-                            pass
-                    st.vm = None
-                    st.seed_hash = b""
-                    st.blob_buf = None
-                    st.nonce_ptr = None
-                    st.out_buf = None
-
-                    with self._vm_cv:
-                        if self._vm_total_created > 0:
-                            self._vm_total_created -= 1
-                        self._vm_cv.notify_all()
-                else:
-                    with self._vm_cv:
-                        self._vm_pool.append(st)
-                        self._vm_cv.notify()
-
-            # Clear thread-local mirror refs so callback-thread churn does not keep
-            # stale Python-side buffer references alive forever.
-            tls._checked_out_vm_state = None
-            tls.seed_hash = b""
-            tls.vm = None
-            tls.blob_buf = None
-            tls.nonce_ptr = None
-            tls.out_buf = None
 
     def hash_job(
         self,
@@ -641,73 +905,121 @@ class ParallelMoneroWorker:
                 "elapsed_sec": 0.0,
             }
 
-        t0 = time.perf_counter()
-        self.ensure_seed(job.seed_hash)
-        self.reset_stop()
+        with self._hash_job_lock:
+            t0 = time.perf_counter()
+            self.reset_stop()
 
+            with self._job_lock:
+                now = time.perf_counter()
+                if str(job.job_id) != self._current_job_id:
+                    self._current_job_id = str(job.job_id)
+                    self._current_job_started_at = now
+                elif self._current_job_started_at <= 0.0:
+                    self._current_job_started_at = now
 
-        count = max(1, int(count))
-        threads = max(1, int(self.threads))
-        per_thread = max(1, count // threads)
-        remainder = count % threads
+                self._dispatch_generation += 1
+                generation = self._dispatch_generation
 
-        found: list[dict] = []
-        hashes_done_parts: list[int] = []
-        errors: list[str] = []
-        results_lock = threading.Lock()
+            try:
+                setattr(job, "generation", int(generation))
+            except Exception:
+                pass
 
-        nonce_cursor = int(start_nonce) & 0xFFFFFFFF
+            self.ensure_seed(job.seed_hash)
 
-        subranges: list[tuple[int, int]] = []
-        for i in range(threads):
-            take = per_thread + (1 if i < remainder else 0)
-            if take <= 0:
-                continue
-            sub_start = nonce_cursor
-            nonce_cursor = (nonce_cursor + take) & 0xFFFFFFFF
-            subranges.append((sub_start, take))
+            count = self._effective_count(count)
+            if count <= 0:
+                return {
+                    "job_id": job.job_id,
+                    "hashes_done": 0,
+                    "found": [],
+                    "elapsed_sec": max(0.0, time.perf_counter() - t0),
+                }
 
-        callbacks = []
-        for sub_start, take in subranges:
-            def make_job(s=sub_start, c=take)-> Callable[[], None]:
-                return lambda: self._hash_range(
-                    job=job,
-                    start_nonce=s,
-                    count=c,
-                    max_results=max_results,
-                    out_found=found,
-                    out_hashes=hashes_done_parts,
-                    out_errors=errors,
-                    out_lock=results_lock,
+            threads = min(self.threads, count)
+            per_thread = count // threads
+            remainder = count % threads
+            nonce_cursor = int(start_nonce) & 0xFFFFFFFF
+
+            active_lanes: list[_LaneState] = []
+
+            per_thread_candidate_budget = 0
+            if max_results > 0:
+                per_thread_candidate_budget = max(
+                    4,
+                    min(128, max(1, int(max_results)) * 4),
                 )
-            cb_func = self.python_runtime.wrap_parallel_void_factory(
-                make_job,
-                timeout_ms=0xFFFFFFFF,
-                gate_task=PYR_TASK_ECHO,
-                gate_payload=f"__parallel_make_job__:{job.job_id}:{sub_start}:{take}".encode("utf-8"),
-                name=f"make_job_{sub_start}_{take}",
-            )
-            wrapped_func = self.python_usage.wrap_function(cb_func)
-            callbacks.append(wrapped_func)
 
-        self.bridge.invoke_all_void(callbacks)
+            for i in range(threads):
+                take = per_thread + (1 if i < remainder else 0)
+                if take <= 0:
+                    continue
 
-        hashes_done = int(sum(hashes_done_parts))
-        elapsed = time.perf_counter() - t0
+                lane = self._lanes[i]
+                lane.assigned_job = job
+                lane.assigned_generation = generation
+                lane.assigned_start_nonce = nonce_cursor
+                lane.assigned_count = take
+                lane.assigned_max_results = per_thread_candidate_budget
+                lane.done_hashes = 0
+                lane.error = None
 
-        self._last_hashes_done = hashes_done
-        self._last_job_id = job.job_id
-        self._last_elapsed = elapsed
+                if lane.found is None:
+                    lane.found = []
+                else:
+                    lane.found.clear()
 
-        if errors:
-            self.logger(f"[ParallelMoneroWorker] hashing errors: {' | '.join(errors[:4])}")
+                lane.done_event.clear()
 
-        return {
-            "job_id": job.job_id,
-            "hashes_done": hashes_done,
-            "found": found[:max_results],
-            "elapsed_sec": elapsed,
-        }
+                nonce_cursor = (nonce_cursor + take) & 0xFFFFFFFF
+                active_lanes.append(lane)
+
+            launch_callbacks = [
+                lane.launch_callback
+                for lane in active_lanes
+                if callable(lane.launch_callback)
+            ]
+
+            try:
+                if launch_callbacks:
+                    self.bridge.invoke_all_void(launch_callbacks)
+                else:
+                    for lane in active_lanes:
+                        lane.start_event.set()
+            except Exception:
+                for lane in active_lanes:
+                    lane.start_event.set()
+
+            for lane in active_lanes:
+                lane.done_event.wait()
+
+            hashes_done = 0
+            gathered: list[dict] = []
+            errors: list[str] = []
+
+            for lane in active_lanes:
+                hashes_done += int(lane.done_hashes or 0)
+                if lane.found:
+                    gathered.extend(lane.found)
+                if lane.error:
+                    errors.append(f"worker[{lane.worker_index}] {lane.error}")
+
+            found = self._rank_found(gathered, max_results=max_results)
+            elapsed = time.perf_counter() - t0
+
+            self._last_hashes_done = hashes_done
+            self._last_job_id = str(job.job_id)
+            self._last_elapsed = elapsed
+
+            if errors:
+                self.logger(f"[ParallelMoneroWorker] hashing errors: {' | '.join(errors[:4])}")
+
+            return {
+                "job_id": job.job_id,
+                "hashes_done": hashes_done,
+                "found": found,
+                "elapsed_sec": elapsed,
+            }
 
     def get_last_hashes_done(self) -> int:
         return int(self._last_hashes_done)

@@ -9,10 +9,25 @@ from ctypes import (
 )
 from ctypes.util import find_library
 
+RANDOMX_FLAG_DEFAULT      = 0
+RANDOMX_FLAG_LARGE_PAGES  = 1 << 0
+RANDOMX_FLAG_HARD_AES     = 1 << 1
+RANDOMX_FLAG_FULL_MEM     = 1 << 2
+RANDOMX_FLAG_JIT          = 1 << 3
+RANDOMX_FLAG_SECURE       = 1 << 4
 
 class RandomX:
-    def __init__(self, logger = None) -> None:
-        self.logger = logger
+    def __init__(
+        self,
+        logger=None,
+        *,
+        use_large_pages: bool = True,
+        use_full_mem: bool = True,
+        use_jit: bool = True,
+        use_hard_aes: bool = True,
+        use_secure_jit: bool = False,
+    ) -> None:
+        self.logger = logger or (lambda s: None)
         self.logger("[RandomX] Loading DLL...")
         self.lib = self._load_randomx()
         self.logger(f"[RandomX] DLL Loaded: {self.lib}")
@@ -21,14 +36,35 @@ class RandomX:
 
         self._lock = threading.RLock()
         self._seed: bytes = b""
-        self._flags: int = int(self.randomx_get_flags())
 
-        # Initialize as None so we can safely check "is not None"
+        base_flags = int(self.randomx_get_flags())
+        flags = int(base_flags)
+
+        # randomx_get_flags() does not include LARGE_PAGES / FULL_MEM / SECURE automatically
+        if use_large_pages:
+            flags |= RANDOMX_FLAG_LARGE_PAGES
+        if use_full_mem:
+            flags |= RANDOMX_FLAG_FULL_MEM
+        if use_jit:
+            flags |= RANDOMX_FLAG_JIT
+        if use_hard_aes:
+            flags |= RANDOMX_FLAG_HARD_AES
+        if use_secure_jit:
+            flags |= RANDOMX_FLAG_SECURE
+
+        self._base_flags = base_flags
+        self._flags = flags
+
         self._cache = None
         self._dataset = None
+        self._dataset_items = int(self.randomx_dataset_item_count())
 
-        self._dataset_items: int = int(self.randomx_dataset_item_count())
-        self.logger(f"[RandomX] Flags: {self._flags}, Dataset Items: {self._dataset_items}")
+        self.logger(
+            f"[RandomX] Base Flags: {self._base_flags} | Active Flags: {self._flags} "
+            f"(large_pages={use_large_pages}, full_mem={use_full_mem}, "
+            f"jit={use_jit}, hard_aes={use_hard_aes}, secure_jit={use_secure_jit})"
+        )
+        self.logger(f"[RandomX] Dataset Items: {self._dataset_items}")
 
     def _load_randomx(self) -> CDLL:
         # 1. Try environment variable
@@ -106,7 +142,7 @@ class RandomX:
             if seed_hash == self._seed and self._cache is not None and self._dataset is not None:
                 return
 
-            self.logger(f"[RandomX] New Seed Detected! Initializing Dataset (this takes time)...")
+            self.logger("[RandomX] New Seed Detected! Initializing Dataset...")
             t0 = time.time()
 
             if self._dataset is not None:
@@ -116,33 +152,53 @@ class RandomX:
                 self.randomx_release_cache(self._cache)
                 self._cache = None
 
-            self._cache = self.randomx_alloc_cache(self._flags)
-            if not self._cache:
-                raise MemoryError("Failed to allocate RandomX Cache")
-
             seed_buf = (c_ubyte * len(seed_hash)).from_buffer_copy(seed_hash)
-            self.randomx_init_cache(self._cache, seed_buf, c_size_t(len(seed_hash)))
 
-            self._dataset = self.randomx_alloc_dataset(self._flags)
-            if not self._dataset:
-                raise MemoryError("Failed to allocate RandomX Dataset (Do you have 3GB+ RAM free?)")
+            flags_try = [self._flags]
+            if self._flags & RANDOMX_FLAG_LARGE_PAGES:
+                flags_try.append(self._flags & ~RANDOMX_FLAG_LARGE_PAGES)
 
-            self.logger(f"[RandomX] Building Dataset... (Please Wait)")
-            self.randomx_init_dataset(self._dataset, self._cache, c_uint64(0), c_uint64(self._dataset_items))
+            last_err = None
+            for flags in flags_try:
+                try:
+                    cache = self.randomx_alloc_cache(flags)
+                    if not cache:
+                        raise MemoryError(f"randomx_alloc_cache failed (flags={flags})")
 
-            self._seed = seed_hash
-            dt = time.time() - t0
-            self.logger(f"[RandomX] Dataset Ready! (Took {dt:.2f} seconds)")
+                    self.randomx_init_cache(cache, seed_buf, c_size_t(len(seed_hash)))
+
+                    dataset = self.randomx_alloc_dataset(flags)
+                    if not dataset:
+                        self.randomx_release_cache(cache)
+                        raise MemoryError(f"randomx_alloc_dataset failed (flags={flags})")
+
+                    self.logger(f"[RandomX] Building Dataset... flags={flags}")
+                    self.randomx_init_dataset(dataset, cache, c_uint64(0), c_uint64(self._dataset_items))
+
+                    self._cache = cache
+                    self._dataset = dataset
+                    self._seed = seed_hash
+                    self._active_seed_flags = flags
+
+                    dt = time.time() - t0
+                    self.logger(f"[RandomX] Dataset Ready! flags={flags} took {dt:.2f}s")
+                    return
+
+                except Exception as e:
+                    last_err = e
+                    self.logger(f"[RandomX] Seed init attempt failed with flags={flags}: {type(e).__name__}: {e}")
+
+            raise last_err
 
     def create_vm(self) -> c_void_p:
         with self._lock:
             if self._cache is None or self._dataset is None:
                 raise RuntimeError("seed not initialized")
 
-            # Now that argtypes are set, this will pass the pointer correctly
-            vm = self.randomx_create_vm(self._flags, self._cache, self._dataset)
+            vm = self.randomx_create_vm(self._active_seed_flags, self._cache, self._dataset)
             if not vm:
-                raise RuntimeError("randomx_create_vm returned NULL")
+                raise RuntimeError(f"randomx_create_vm returned NULL (flags={self._active_seed_flags})")
+
             return vm
 
     def destroy_vm(self, vm: c_void_p) -> None:

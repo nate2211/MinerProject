@@ -201,37 +201,44 @@ class MinerConfig:
     agent: str
     randomx_lib: str
 
-    use_blocknet: bool
-    blocknet_relay: str
-    blocknet_token: str
-    blocknet_id: str
-    blocknet_key: str
+    randomx_use_large_pages: bool = True
+    randomx_use_full_mem: bool = True
+    randomx_use_jit: bool = True
+    randomx_use_hard_aes: bool = True
+    randomx_use_secure_jit: bool = False
 
-    use_bn_p2pool: bool
-    use_bn_randomx: bool
-    use_bn_p2pool_scan: bool
-    use_bn_randomx_scan: bool
-    use_bn_gpu_scan: bool
-    use_bn_cpu_scan: bool
+    use_blocknet: bool = False
+    blocknet_relay: str = ""
+    blocknet_token: str = ""
+    blocknet_id: str = "miner1"
+    blocknet_key: str = ""
 
-    use_virtualasic_scan: bool
-    virtualasic_dll: str
-    virtualasic_kernel: str
-    virtualasic_kernel_name: str
-    virtualasic_core_count: int
+    use_bn_p2pool: bool = False
+    use_bn_randomx: bool = False
+    use_bn_p2pool_scan: bool = False
+    use_bn_randomx_scan: bool = False
+    use_bn_gpu_scan: bool = False
+    use_bn_cpu_scan: bool = False
 
-    bn_api_relay: str
-    bn_api_token: str
-    bn_api_prefix: str
-    bn_rx_batch: int
-    scan_iters: int
-    submit_workers: int
+    use_virtualasic_scan: bool = False
+    virtualasic_dll: str = ""
+    virtualasic_kernel: str = ""
+    virtualasic_kernel_name: str = "monero_scan"
+    virtualasic_core_count: int = 0
+
+    bn_api_relay: str = ""
+    bn_api_token: str = ""
+    bn_api_prefix: str = "/v1"
+    bn_rx_batch: int = 64
+    scan_iters: int = 1000
+    submit_workers: int = 4
 
     use_parallel_monero_worker: bool = False
     parallel_python_dll: str = ""
     parallel_python_batch_size: int = 1024
     use_jit_worker: bool = False
     jit_batch_size: int = 1024
+
 
 class MinerWorker(QThread):
     log_line = pyqtSignal(str)
@@ -309,6 +316,7 @@ class MinerWorker(QThread):
             )
 
             sig = inspect.signature(Miner.__init__)
+
             if "submit_workers" in sig.parameters:
                 miner_kwargs["submit_workers"] = int(self.cfg.submit_workers)
             if "use_blocknet_p2pool_scan" in sig.parameters:
@@ -342,6 +350,18 @@ class MinerWorker(QThread):
                 miner_kwargs["use_jit_worker"] = bool(self.cfg.use_jit_worker)
             if "jit_batch_size" in sig.parameters:
                 miner_kwargs["jit_batch_size"] = int(self.cfg.jit_batch_size)
+
+            if "randomx_use_large_pages" in sig.parameters:
+                miner_kwargs["randomx_use_large_pages"] = bool(self.cfg.randomx_use_large_pages)
+            if "randomx_use_full_mem" in sig.parameters:
+                miner_kwargs["randomx_use_full_mem"] = bool(self.cfg.randomx_use_full_mem)
+            if "randomx_use_jit" in sig.parameters:
+                miner_kwargs["randomx_use_jit"] = bool(self.cfg.randomx_use_jit)
+            if "randomx_use_hard_aes" in sig.parameters:
+                miner_kwargs["randomx_use_hard_aes"] = bool(self.cfg.randomx_use_hard_aes)
+            if "randomx_use_secure_jit" in sig.parameters:
+                miner_kwargs["randomx_use_secure_jit"] = bool(self.cfg.randomx_use_secure_jit)
+
             self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
@@ -523,6 +543,46 @@ class MainWindow(QMainWindow):
 
         self.left_layout.addWidget(gb_perf)
 
+        gb_rx_flags = QGroupBox("RandomX Flags (local only)")
+        rxfl = QFormLayout(gb_rx_flags)
+
+        self.cb_rx_large_pages = QCheckBox("Enable LARGE_PAGES")
+        self.cb_rx_large_pages.setChecked(True)
+        self.cb_rx_large_pages.setToolTip("Requests huge/large page allocation when available.")
+
+        self.cb_rx_full_mem = QCheckBox("Enable FULL_MEM")
+        self.cb_rx_full_mem.setChecked(True)
+        self.cb_rx_full_mem.setToolTip("Use full dataset memory mode.")
+
+        self.cb_rx_jit = QCheckBox("Enable JIT")
+        self.cb_rx_jit.setChecked(True)
+        self.cb_rx_jit.setToolTip("Enable RandomX JIT compilation.")
+
+        self.cb_rx_hard_aes = QCheckBox("Enable HARD_AES")
+        self.cb_rx_hard_aes.setChecked(True)
+        self.cb_rx_hard_aes.setToolTip("Use hardware AES instructions when available.")
+
+        self.cb_rx_secure_jit = QCheckBox("Enable SECURE_JIT")
+        self.cb_rx_secure_jit.setChecked(False)
+        self.cb_rx_secure_jit.setToolTip("Enable secure JIT mode.")
+
+        rx_info = QLabel(
+            "These apply only to local RandomX usage: normal local mining, JITWorker, "
+            "ParallelMoneroWorker, and VirtualASIC CPU verification. "
+            "They do not affect remote BlockNet hashing/scan modes."
+        )
+        rx_info.setWordWrap(True)
+        rx_info.setStyleSheet("color:#bcbcbc;")
+
+        rxfl.addRow(self.cb_rx_large_pages)
+        rxfl.addRow(self.cb_rx_full_mem)
+        rxfl.addRow(self.cb_rx_jit)
+        rxfl.addRow(self.cb_rx_hard_aes)
+        rxfl.addRow(self.cb_rx_secure_jit)
+        rxfl.addRow(rx_info)
+
+        self.left_layout.addWidget(gb_rx_flags)
+
         gb_bn = QGroupBox("BlockNet Reporting (optional)")
         bfl = QFormLayout(gb_bn)
 
@@ -563,6 +623,7 @@ class MainWindow(QMainWindow):
         self.sp_jit_batch_size = QSpinBox()
         self.sp_jit_batch_size.setRange(1, 1_000_000)
         self.sp_jit_batch_size.setValue(1024)
+
         self.ed_bn_api_relay = QLineEdit("127.0.0.1:38888")
         self.ed_bn_api_token = QLineEdit("")
         self.ed_bn_api_token.setEchoMode(QLineEdit.Password)
@@ -794,6 +855,7 @@ class MainWindow(QMainWindow):
         self.cb_vasic_scan.setEnabled(True)
         self.cb_parallel_monero_worker.setEnabled(True)
         self.cb_jit_worker.setEnabled(True)
+
     def _on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
         self._set_log_focus(tab_name == "Log")
@@ -937,6 +999,37 @@ class MainWindow(QMainWindow):
         self._append_log(tb)
         QMessageBox.critical(self, "Miner Error", tb)
 
+    def _uses_local_randomx(self, cfg: MinerConfig) -> bool:
+        if cfg.use_virtualasic_scan or cfg.use_parallel_monero_worker or cfg.use_jit_worker:
+            return True
+
+        if cfg.use_bn_randomx:
+            return False
+        if cfg.use_bn_randomx_scan:
+            return False
+        if cfg.use_bn_gpu_scan:
+            return False
+        if cfg.use_bn_cpu_scan:
+            return False
+        if cfg.use_bn_p2pool_scan:
+            return False
+
+        return True
+
+    def _randomx_flags_summary(self, cfg: MinerConfig) -> str:
+        enabled = []
+        if cfg.randomx_use_large_pages:
+            enabled.append("LARGE_PAGES")
+        if cfg.randomx_use_full_mem:
+            enabled.append("FULL_MEM")
+        if cfg.randomx_use_jit:
+            enabled.append("JIT")
+        if cfg.randomx_use_hard_aes:
+            enabled.append("HARD_AES")
+        if cfg.randomx_use_secure_jit:
+            enabled.append("SECURE_JIT")
+        return ", ".join(enabled) if enabled else "DEFAULT/NONE"
+
     def _build_cfg(self) -> MinerConfig:
         stratum = self.ed_stratum.text().strip()
         wallet = self.ed_wallet.text().strip()
@@ -974,7 +1067,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Missing VirtualASIC kernel", "Please choose a VirtualASIC kernel path.")
                 raise ValueError("missing VirtualASIC kernel")
             if threads > 1:
-                self._append_log("[gui] warning: VirtualASIC with threads > 1 creates one engine per worker and may reduce GPU efficiency.")
+                self._append_log(
+                    "[gui] warning: VirtualASIC with threads > 1 creates one engine per worker and may reduce GPU efficiency."
+                )
 
         use_bn_reporting = bool(self.cb_bn.isChecked())
 
@@ -985,6 +1080,11 @@ class MainWindow(QMainWindow):
             threads=threads,
             agent=agent,
             randomx_lib=randomx_lib,
+            randomx_use_large_pages=bool(self.cb_rx_large_pages.isChecked()),
+            randomx_use_full_mem=bool(self.cb_rx_full_mem.isChecked()),
+            randomx_use_jit=bool(self.cb_rx_jit.isChecked()),
+            randomx_use_hard_aes=bool(self.cb_rx_hard_aes.isChecked()),
+            randomx_use_secure_jit=bool(self.cb_rx_secure_jit.isChecked()),
             use_blocknet=use_bn_reporting,
             blocknet_relay=self.ed_bn_relay.text().strip(),
             blocknet_token=self.ed_bn_token.text().strip(),
@@ -1024,6 +1124,11 @@ class MainWindow(QMainWindow):
         self._save_cfg()
 
         self.txt_log.appendPlainText("[gui] starting miner…")
+
+        if self._uses_local_randomx(cfg):
+            self.txt_log.appendPlainText(
+                f"[gui] local RandomX flags: {self._randomx_flags_summary(cfg)}"
+            )
 
         if cfg.use_virtualasic_scan:
             self.txt_log.appendPlainText(
@@ -1077,6 +1182,11 @@ class MainWindow(QMainWindow):
                 "threads": int(self.sp_threads.value()),
                 "agent": self.ed_agent.text(),
                 "randomx_lib": self.ed_randomx.text(),
+                "randomx_use_large_pages": bool(self.cb_rx_large_pages.isChecked()),
+                "randomx_use_full_mem": bool(self.cb_rx_full_mem.isChecked()),
+                "randomx_use_jit": bool(self.cb_rx_jit.isChecked()),
+                "randomx_use_hard_aes": bool(self.cb_rx_hard_aes.isChecked()),
+                "randomx_use_secure_jit": bool(self.cb_rx_secure_jit.isChecked()),
                 "use_blocknet": bool(self.cb_bn.isChecked()),
                 "blocknet_relay": self.ed_bn_relay.text(),
                 "blocknet_token": self.ed_bn_token.text(),
@@ -1128,6 +1238,12 @@ class MainWindow(QMainWindow):
         self.sp_threads.setValue(int(data.get("threads", self.sp_threads.value())))
         self.ed_agent.setText(str(data.get("agent", self.ed_agent.text())))
         self.ed_randomx.setText(str(data.get("randomx_lib", self.ed_randomx.text())))
+
+        self.cb_rx_large_pages.setChecked(bool(data.get("randomx_use_large_pages", True)))
+        self.cb_rx_full_mem.setChecked(bool(data.get("randomx_use_full_mem", True)))
+        self.cb_rx_jit.setChecked(bool(data.get("randomx_use_jit", True)))
+        self.cb_rx_hard_aes.setChecked(bool(data.get("randomx_use_hard_aes", True)))
+        self.cb_rx_secure_jit.setChecked(bool(data.get("randomx_use_secure_jit", False)))
 
         self.cb_bn.setChecked(bool(data.get("use_blocknet", self.cb_bn.isChecked())))
         self.ed_bn_relay.setText(str(data.get("blocknet_relay", self.ed_bn_relay.text())))

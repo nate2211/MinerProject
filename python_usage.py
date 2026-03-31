@@ -12,7 +12,10 @@ class PythonUsageError(Exception):
     pass
 
 
+
 class PythonUsage:
+    # Exact native callback signature from the header:
+    # typedef int(__cdecl* PythonCallback)();
     CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int)
 
     def __init__(
@@ -105,6 +108,7 @@ class PythonUsage:
                 self._dll_dir_handle = None
 
         try:
+            # Header/export uses __cdecl-style API surface; CDLL is correct.
             return ctypes.CDLL(dll_path)
         except OSError as e:
             raise PythonUsageError(
@@ -128,6 +132,7 @@ class PythonUsage:
             pass
 
     def _configure_signatures(self) -> None:
+        # Match the header exactly: SetCallback(PythonCallback cb)
         self._dll.SetCallback.argtypes = [self.CALLBACK]
         self._dll.SetCallback.restype = ctypes.c_int
 
@@ -216,7 +221,9 @@ class PythonUsage:
     def _dispatcher_thunk(self) -> int:
         try:
             return self._execute_current_function_direct()
-        except BaseException:
+        except BaseException as e:
+            with self._lock:
+                self._last_error = e
             return 0
 
     def _ensure_dispatcher_installed(self) -> None:
@@ -234,7 +241,7 @@ class PythonUsage:
 
         try:
             callback = self.CALLBACK(self._dispatcher_thunk)
-            result = self._dll.SetCallback(callback)
+            result = int(self._dll.SetCallback(callback))
             if result != 1:
                 raise PythonUsageError(
                     f"SetCallback failed while installing dispatcher: {result} "
@@ -260,6 +267,7 @@ class PythonUsage:
             self._python_func = func
             self._pending_args = args
             self._pending_kwargs = dict(kwargs)
+            self._last_error = None
 
         if not self._in_parallelpython_callback():
             self._ensure_dispatcher_installed()

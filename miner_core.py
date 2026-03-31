@@ -133,9 +133,26 @@ class Miner:
         parallel_python_batch_size: int = 1024,
         use_jit_worker: bool = False,
         jit_batch_size: int = 1024,
+        randomx_use_large_pages: bool = True,
+        randomx_use_full_mem: bool = True,
+        randomx_use_jit: bool = True,
+        randomx_use_hard_aes: bool = True,
+        randomx_use_secure_jit: bool = False,
     ) -> None:
         self.logger = logger or (lambda s: None)
+        self.randomx_use_large_pages = bool(randomx_use_large_pages)
+        self.randomx_use_full_mem = bool(randomx_use_full_mem)
+        self.randomx_use_jit = bool(randomx_use_jit)
+        self.randomx_use_hard_aes = bool(randomx_use_hard_aes)
+        self.randomx_use_secure_jit = bool(randomx_use_secure_jit)
 
+        self._randomx_kwargs = dict(
+            use_large_pages=self.randomx_use_large_pages,
+            use_full_mem=self.randomx_use_full_mem,
+            use_jit=self.randomx_use_jit,
+            use_hard_aes=self.randomx_use_hard_aes,
+            use_secure_jit=self.randomx_use_secure_jit,
+        )
         self.stratum_host = stratum_host
         self.stratum_port = int(stratum_port)
         self.wallet = wallet
@@ -290,14 +307,14 @@ class Miner:
             self._bn_gpu = None
             self._bn_cpu = None
             self._bn_rx = None
-            self.rx = RandomX(self.logger)
+            self.rx = RandomX(self.logger, **self._randomx_kwargs)
 
         elif self.use_parallel_monero_worker:
             self.logger("[Miner] Using local ParallelMoneroWorker backend...")
             self._bn_gpu = None
             self._bn_cpu = None
             self._bn_rx = None
-            self.rx = RandomX(self.logger)
+            self.rx = RandomX(self.logger, **self._randomx_kwargs)
             self._parallel_worker = ParallelMoneroWorker(
                 threads=self.threads,
                 logger=self.logger,
@@ -340,7 +357,7 @@ class Miner:
             self._bn_gpu = None
             self._bn_cpu = None
             self._bn_rx = None
-            self.rx = RandomX(self.logger)
+            self.rx = RandomX(self.logger, **self._randomx_kwargs)
             self._jit_worker = JITWorker(
                 threads=self.threads,
                 logger=self.logger,
@@ -357,7 +374,7 @@ class Miner:
                 self.rx = None
             else:
                 self.logger("[Miner] Initializing local RandomX...")
-                self.rx = RandomX(self.logger)
+                self.rx = RandomX(self.logger, **self._randomx_kwargs)
 
     def stop(self) -> None:
         if self._stop.is_set():
