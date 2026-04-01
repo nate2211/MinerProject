@@ -461,7 +461,7 @@ class _HybridExecutionController:
         self._lanes: dict[int, _ExecutionLane] = {}
         self._usage_owner: Optional[int] = None
         self._thunk_lane_count = 0
-
+        self._max_thunk_lanes = 1
         self._active_invocations = 0
         self._active_native_invocations = 0
 
