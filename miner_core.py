@@ -47,18 +47,59 @@ class Share:
 
 
 class JobState:
+    """
+    Smarter nonce allocator with per-thread local leases.
+
+    Benefits:
+    - keeps alloc_nonce_block(n) API unchanged
+    - reduces lock contention by refilling larger local leases
+    - invalidates stale local leases automatically when job seq changes
+    - keeps returned blocks contiguous
+    - aligns starts/lease sizes to reduce noisy boundaries
+    """
+
     def __init__(self) -> None:
         self._mu = threading.Lock()
         self._cv = threading.Condition(self._mu)
         self._job: Optional[MoneroJob] = None
         self._seq = 0
-        self._nonce_cursor = secrets.randbits(32)
+
+        # Keep cursor aligned so all downstream blocks stay aligned too.
+        self._align = 128
+        self._nonce_cursor = self._align_down(secrets.randbits(32), self._align)
+
+        # Per-thread cached lease:
+        # (seq, next_nonce, remaining)
+        self._tls = threading.local()
+
+        # Lease sizing knobs.
+        self._lease_min = 1024
+        self._lease_max = 65536
+
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    @staticmethod
+    def _align_up(v: int, align: int) -> int:
+        align = max(1, int(align))
+        return ((int(v) + align - 1) // align) * align
+
+    @staticmethod
+    def _align_down(v: int, align: int) -> int:
+        align = max(1, int(align))
+        return (int(v) // align) * align
 
     def set(self, job: MoneroJob) -> None:
         with self._cv:
             self._job = job
             self._seq += 1
-            self._nonce_cursor = secrets.randbits(32)
+
+            # Fresh randomized aligned start each job.
+            self._nonce_cursor = self._align_down(secrets.randbits(32), self._align)
+
+            # No need to walk thread-local state here.
+            # Old leases self-invalidate because seq changes.
             self._cv.notify_all()
 
     def wait(self, last_seq: int, timeout: float = 0.5) -> Tuple[int, Optional[MoneroJob]]:
@@ -75,12 +116,80 @@ class JobState:
         with self._mu:
             return self._job
 
-    def alloc_nonce_block(self, n: int) -> int:
+    def _get_tls_lease(self) -> tuple[int, int, int]:
+        lease = getattr(self._tls, "lease", None)
+        if not lease:
+            return (0, 0, 0)
+        try:
+            seq, next_nonce, remaining = lease
+            return int(seq), self._u32(next_nonce), max(0, int(remaining))
+        except Exception:
+            return (0, 0, 0)
+
+    def _set_tls_lease(self, seq: int, next_nonce: int, remaining: int) -> None:
+        self._tls.lease = (int(seq), self._u32(next_nonce), max(0, int(remaining)))
+
+    def _choose_lease_size_locked(self, n: int) -> int:
+        """
+        Refill with more than requested so the same thread can allocate
+        several blocks without retaking the global lock.
+
+        Bias:
+        - small requests get proportionally larger leases
+        - large requests still get some amortization, but capped
+        """
         n = max(1, int(n))
-        with self._mu:
-            start = self._nonce_cursor & 0xFFFFFFFF
-            self._nonce_cursor = (self._nonce_cursor + n) & 0xFFFFFFFF
+
+        if n <= 128:
+            lease = n * 16
+        elif n <= 512:
+            lease = n * 8
+        elif n <= 2048:
+            lease = n * 4
+        else:
+            lease = n * 2
+
+        lease = max(self._lease_min, lease, n)
+        lease = min(self._lease_max, lease)
+        lease = self._align_up(lease, self._align)
+        return lease
+
+    def alloc_nonce_block(self, n: int) -> int:
+        """
+        Same public API, but now uses a thread-local lease to reduce locking.
+        """
+        n = max(1, int(n))
+
+        # Fast path: satisfy from thread-local lease with no global cursor touch.
+        cur_seq = self._seq
+        lease_seq, lease_next, lease_remaining = self._get_tls_lease()
+        if lease_seq == cur_seq and lease_remaining >= n:
+            start = lease_next
+            self._set_tls_lease(cur_seq, self._u32(start + n), lease_remaining - n)
             return start
+
+        # Slow path: refill local lease from the global cursor.
+        with self._mu:
+            cur_seq = self._seq
+
+            # Recheck under lock in case another path already refilled.
+            lease_seq, lease_next, lease_remaining = self._get_tls_lease()
+            if lease_seq == cur_seq and lease_remaining >= n:
+                start = lease_next
+                self._set_tls_lease(cur_seq, self._u32(start + n), lease_remaining - n)
+                return start
+
+            lease_size = self._choose_lease_size_locked(n)
+            start = self._nonce_cursor
+            self._nonce_cursor = self._u32(start + lease_size)
+
+        # Keep the remainder locally for this thread.
+        self._set_tls_lease(
+            cur_seq,
+            self._u32(start + n),
+            max(0, lease_size - n),
+        )
+        return start
 
     @property
     def seq(self) -> int:

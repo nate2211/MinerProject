@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -18,7 +20,7 @@ from PyQt5.QtCore import (
     QTimer,
     QStandardPaths,
 )
-from PyQt5.QtGui import QFont, QPalette, QColor
+from PyQt5.QtGui import QFont, QPalette, QColor, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -31,6 +33,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPushButton,
     QPlainTextEdit,
+    QTextEdit,
     QMessageBox,
     QSplitter,
     QTabWidget,
@@ -141,7 +144,7 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #dcdcdc;
             font-weight: 600;
         }
-        QLineEdit, QPlainTextEdit, QSpinBox {
+        QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox {
             border: 1px solid #404040;
             border-radius: 8px;
             padding: 7px;
@@ -458,6 +461,8 @@ class MainWindow(QMainWindow):
 
         self._saved_main_split_sizes: Optional[list[int]] = None
         self._log_focus_enabled: bool = False
+        self._color_logs_enabled: bool = True
+        self._max_log_blocks: int = 5000
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -731,14 +736,19 @@ class MainWindow(QMainWindow):
         self.btn_save = QPushButton("Save Config")
         self.btn_load = QPushButton("Load Config")
         self.btn_clear = QPushButton("Clear Log")
+        self.cb_color_logs = QCheckBox("Color Logs")
+        self.cb_color_logs.setChecked(True)
+        self.cb_color_logs.toggled.connect(self._on_color_logs_toggled)
 
         self.btn_save.clicked.connect(self._save_cfg)
         self.btn_load.clicked.connect(self._load_cfg)
-        self.btn_clear.clicked.connect(lambda: self.txt_log.setPlainText(""))
+        self.btn_clear.clicked.connect(self._clear_log)
 
         btn_row2.addWidget(self.btn_save)
         btn_row2.addWidget(self.btn_load)
         btn_row2.addWidget(self.btn_clear)
+        btn_row2.addStretch(1)
+        btn_row2.addWidget(self.cb_color_logs)
         cl.addLayout(btn_row2)
 
         self.left_layout.addWidget(gb_ctrl)
@@ -774,10 +784,14 @@ class MainWindow(QMainWindow):
         ll = QVBoxLayout(log)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
-        self.txt_log = QPlainTextEdit()
+
+        self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setFont(_mono_font())
+        self.txt_log.setAcceptRichText(True)
+        self.txt_log.setUndoRedoEnabled(False)
         ll.addWidget(self.txt_log)
+
         self.tabs.addTab(log, "Log")
 
         raw = QWidget()
@@ -798,6 +812,51 @@ class MainWindow(QMainWindow):
         self._load_cfg()
         self._autofill_resource_guesses()
         self.statusBar().showMessage("Ready")
+
+    def _hbox(self, *widgets: QWidget) -> QWidget:
+        wrap = QWidget()
+        lay = QHBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        for w in widgets:
+            lay.addWidget(w)
+        return wrap
+
+    def _browse_randomx(self) -> None:
+        start = _pick_existing_path(
+            self.ed_randomx.text().strip(),
+            ("randomx.dll", "randomx_ctypes.dll"),
+        )
+        p, _ = QFileDialog.getOpenFileName(self, "Select RandomX library", start, "DLL Files (*.dll);;All Files (*)")
+        if p:
+            self.ed_randomx.setText(p)
+
+    def _browse_virtualasic_dll(self) -> None:
+        start = _pick_existing_path(
+            self.ed_vasic_dll.text().strip(),
+            ("VirtualASIC.dll", "virtualasic.dll"),
+        )
+        p, _ = QFileDialog.getOpenFileName(self, "Select VirtualASIC DLL", start, "DLL Files (*.dll);;All Files (*)")
+        if p:
+            self.ed_vasic_dll.setText(p)
+
+    def _browse_virtualasic_kernel(self) -> None:
+        start = _pick_existing_path(
+            self.ed_vasic_kernel.text().strip(),
+            ("monero_scan.cl", "virtualasic_monero_scan.cl", "randomx_scan.cl"),
+        )
+        p, _ = QFileDialog.getOpenFileName(self, "Select VirtualASIC/OpenCL Kernel", start, "Kernel Files (*.cl);;All Files (*)")
+        if p:
+            self.ed_vasic_kernel.setText(p)
+
+    def _browse_parallel_python_dll(self) -> None:
+        start = _pick_existing_path(
+            self.ed_parallel_python_dll.text().strip(),
+            ("ParallelPython.dll", "parallelpython.dll"),
+        )
+        p, _ = QFileDialog.getOpenFileName(self, "Select ParallelPython DLL", start, "DLL Files (*.dll);;All Files (*)")
+        if p:
+            self.ed_parallel_python_dll.setText(p)
 
     def _autofill_resource_guesses(self) -> None:
         if not self.ed_vasic_dll.text().strip():
@@ -874,161 +933,206 @@ class MainWindow(QMainWindow):
                 self.main_split.setSizes([620, 900])
             self._log_focus_enabled = False
 
-    @staticmethod
-    def _hbox(*widgets: QWidget) -> QWidget:
-        w = QWidget()
-        l = QHBoxLayout(w)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(8)
-        for x in widgets:
-            l.addWidget(x)
-        return w
+    def _on_color_logs_toggled(self, checked: bool) -> None:
+        self._color_logs_enabled = bool(checked)
+        self.statusBar().showMessage(
+            "Colored logs enabled" if checked else "Colored logs disabled",
+            2000,
+        )
+
+    def _clear_log(self) -> None:
+        self.txt_log.clear()
+
+    def _is_log_tab_active(self) -> bool:
+        idx = self.tabs.currentIndex()
+        if idx < 0:
+            return False
+        return self.tabs.tabText(idx) == "Log"
+
+    def _was_log_scrolled_to_bottom(self, slack_px: int = 4) -> bool:
+        vbar = self.txt_log.verticalScrollBar()
+        return vbar.value() >= max(0, vbar.maximum() - int(slack_px))
 
     def _append_log(self, s: str) -> None:
         s = (s or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not s:
             return
-        self.txt_log.appendPlainText(s)
 
-        max_blocks = 5000
+        follow_tail = (not self._is_log_tab_active()) or self._was_log_scrolled_to_bottom()
+
+        for line in s.split("\n"):
+            self._append_log_line(line, follow_tail=follow_tail)
+
+        self._trim_log_blocks(follow_tail=follow_tail)
+
+    def _append_log_line(self, line: str, *, follow_tail: bool) -> None:
+        vbar = self.txt_log.verticalScrollBar()
+        hbar = self.txt_log.horizontalScrollBar()
+
+        old_v = vbar.value()
+        old_h = hbar.value()
+
+        if self._color_logs_enabled:
+            self.txt_log.append(self._format_log_html(line))
+        else:
+            self.txt_log.append(html.escape(line))
+
+        if follow_tail:
+            cursor = self.txt_log.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.txt_log.setTextCursor(cursor)
+            self.txt_log.ensureCursorVisible()
+        else:
+            vbar.setValue(min(old_v, vbar.maximum()))
+            hbar.setValue(min(old_h, hbar.maximum()))
+
+    def _trim_log_blocks(self, *, follow_tail: bool) -> None:
         doc = self.txt_log.document()
-        if doc.blockCount() > max_blocks:
-            cur = self.txt_log.textCursor()
-            cur.movePosition(cur.Start)
-            for _ in range(doc.blockCount() - max_blocks):
-                cur.select(cur.LineUnderCursor)
-                cur.removeSelectedText()
-                cur.deleteChar()
+        if doc.blockCount() <= self._max_log_blocks:
+            return
+
+        vbar = self.txt_log.verticalScrollBar()
+        hbar = self.txt_log.horizontalScrollBar()
+
+        old_v = vbar.value()
+        old_h = hbar.value()
+
+        cursor = self.txt_log.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+
+        remove_count = doc.blockCount() - self._max_log_blocks
+        for _ in range(remove_count):
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+
+        if follow_tail:
+            cursor = self.txt_log.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.txt_log.setTextCursor(cursor)
+            self.txt_log.ensureCursorVisible()
+        else:
+            vbar.setValue(min(old_v, vbar.maximum()))
+            hbar.setValue(min(old_h, hbar.maximum()))
+
+    def _format_log_html(self, line: str) -> str:
+        color = self._color_for_log_line(line)
+        prefix_color = self._prefix_color_for_log_line(line, fallback=color)
+
+        m = re.match(r"^(\[[^\]]+\](?:\[[^\]]+\])*)\s*(.*)$", line)
+        if not m:
+            return f'<span style="color:{color};">{html.escape(line)}</span>'
+
+        prefix = html.escape(m.group(1))
+        rest = html.escape(m.group(2))
+
+        if rest:
+            return (
+                f'<span style="color:{prefix_color}; font-weight:600;">{prefix}</span> '
+                f'<span style="color:{color};">{rest}</span>'
+            )
+        return f'<span style="color:{prefix_color}; font-weight:600;">{prefix}</span>'
+
+    def _prefix_color_for_log_line(self, line: str, fallback: str = "#d8d8d8") -> str:
+        s = line.lower()
+
+        if "traceback" in s or "[error]" in s or "fatal" in s:
+            return "#ff6b6b"
+        if "[submit" in s or "accepted" in s:
+            return "#7ee787"
+        if "rejected" in s:
+            return "#ff7b72"
+        if "[stats]" in s:
+            return "#79c0ff"
+        if "[randomx" in s:
+            return "#d2a8ff"
+        if "[jobdispatch" in s:
+            return "#ffa657"
+        if "[noncelease" in s:
+            return "#56d4dd"
+        if "[hybridexecutioncontroller" in s:
+            return "#f2cc60"
+        if "[candidateselector" in s:
+            return "#a5d6ff"
+        if "[stratum" in s:
+            return "#8ddb8c"
+        if "[blocknet" in s:
+            return "#c297ff"
+        if "[worker" in s:
+            return "#c9d1d9"
+        if "[gui" in s:
+            return "#ffd580"
+        return fallback
+
+    def _color_for_log_line(self, line: str) -> str:
+        s = line.lower()
+
+        if "traceback" in s or "[error]" in s or "fatal_error" in s:
+            return "#ffb3b3"
+        if "accepted" in s:
+            return "#b7f7c3"
+        if "rejected" in s or "failed" in s:
+            return "#ffb4a9"
+        if "[stats]" in s:
+            return "#d2e9ff"
+        if "[randomx" in s:
+            return "#ead7ff"
+        if "[jobdispatch" in s:
+            return "#ffe2b8"
+        if "[noncelease" in s:
+            return "#d7fbff"
+        if "[hybridexecutioncontroller" in s:
+            return "#fff1b8"
+        if "[candidateselector" in s:
+            return "#dbefff"
+        if "[stratum" in s:
+            return "#d9f7d7"
+        if "[blocknet" in s:
+            return "#efe1ff"
+        if "[gui" in s:
+            return "#ffecc7"
+        return "#d8d8d8"
 
     def _set_running(self, running: bool) -> None:
-        if running:
-            self.pill.setText("RUNNING")
-            self.pill.setStyleSheet("background:#143d27; color:#eaffea;")
-        else:
-            self.pill.setText("STOPPED")
-            self.pill.setStyleSheet("background:#4a1f1f; color:#ffecec;")
-
         self.btn_start.setDisabled(running)
         self.btn_stop.setDisabled(not running)
 
-    def _browse_randomx(self) -> None:
-        start = _pick_existing_path(self.ed_randomx.text().strip(), ("randomx-dll.dll", "randomx.dll"))
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select RandomX library",
-            start,
-            "RandomX Library (*.dll *.so *.dylib);;All files (*.*)",
-        )
-        if path:
-            self.ed_randomx.setText(path)
-
-    def _browse_virtualasic_dll(self) -> None:
-        start = _pick_existing_path(self.ed_vasic_dll.text().strip(), ("VirtualASIC.dll", "virtualasic.dll"))
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select VirtualASIC DLL",
-            start,
-            "VirtualASIC (*.dll *.so *.dylib);;All files (*.*)",
-        )
-        if path:
-            self.ed_vasic_dll.setText(path)
-
-    def _browse_virtualasic_kernel(self) -> None:
-        start = _pick_existing_path(
-            self.ed_vasic_kernel.text().strip(),
-            ("monero_scan.cl", "virtualasic_monero_scan.cl", "randomx_scan.cl"),
-        )
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select VirtualASIC kernel",
-            start,
-            "OpenCL Kernel (*.cl *.txt);;All files (*.*)",
-        )
-        if path:
-            self.ed_vasic_kernel.setText(path)
-
-    def _browse_parallel_python_dll(self) -> None:
-        start = _pick_existing_path(
-            self.ed_parallel_python_dll.text().strip(),
-            ("ParallelPython.dll", "parallelpython.dll"),
-        )
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select ParallelPython DLL",
-            start,
-            "DLL (*.dll *.so *.dylib);;All files (*.*)",
-        )
-        if path:
-            self.ed_parallel_python_dll.setText(path)
+        if running:
+            self.pill.setText("RUNNING")
+            self.pill.setStyleSheet("background:#1f6f3f; color:white;")
+        else:
+            self.pill.setText("STOPPED")
+            self.pill.setStyleSheet("background:#6a2c2c; color:white;")
 
     def _tick_uptime(self) -> None:
-        if not self.started_at:
+        if self.started_at <= 0:
             self.lbl_uptime.setText("Uptime: 00:00:00")
             return
-        elapsed = max(0, int(time.time() - self.started_at))
-        h = elapsed // 3600
-        m = (elapsed % 3600) // 60
-        s = elapsed % 60
+
+        sec = max(0, int(time.time() - self.started_at))
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
         self.lbl_uptime.setText(f"Uptime: {h:02d}:{m:02d}:{s:02d}")
 
-    def _on_stats(self, stats: Dict[str, Any]) -> None:
-        hps = float(stats.get("hashrate_hs") or 0.0)
-        acc = int(stats.get("accepted") or 0)
-        rej = int(stats.get("rejected") or 0)
-        height = stats.get("height")
-        threads = stats.get("threads")
-        self.lbl_hashrate.setText(f"{hps:,.0f} H/s")
-        self.lbl_sub.setText(f"Accepted: {acc}    Rejected: {rej}    Height: {height}    Threads: {threads}")
-        self.txt_raw.setPlainText(json.dumps(stats, indent=2, sort_keys=True))
-
-    def _on_state(self, s: str) -> None:
-        if s == "RUNNING":
-            self._set_running(True)
-        else:
-            self._set_running(False)
-            self.started_at = 0.0
-            self.uptime_timer.stop()
-            self._tick_uptime()
-            self._append_log("[gui] stopped")
-
-    def _on_fatal(self, tb: str) -> None:
-        self._set_running(False)
-        self.started_at = 0.0
-        self.uptime_timer.stop()
-        self._tick_uptime()
-        self._append_log(tb)
-        QMessageBox.critical(self, "Miner Error", tb)
+    def _randomx_flags_summary(self, cfg: MinerConfig) -> str:
+        flags = []
+        if cfg.randomx_use_large_pages:
+            flags.append("LARGE_PAGES")
+        if cfg.randomx_use_full_mem:
+            flags.append("FULL_MEM")
+        if cfg.randomx_use_jit:
+            flags.append("JIT")
+        if cfg.randomx_use_hard_aes:
+            flags.append("HARD_AES")
+        if cfg.randomx_use_secure_jit:
+            flags.append("SECURE_JIT")
+        return ", ".join(flags) if flags else "DEFAULT"
 
     def _uses_local_randomx(self, cfg: MinerConfig) -> bool:
-        if cfg.use_virtualasic_scan or cfg.use_parallel_monero_worker or cfg.use_jit_worker:
-            return True
-
-        if cfg.use_bn_randomx:
+        if cfg.use_bn_randomx or cfg.use_bn_randomx_scan:
             return False
-        if cfg.use_bn_randomx_scan:
-            return False
-        if cfg.use_bn_gpu_scan:
-            return False
-        if cfg.use_bn_cpu_scan:
-            return False
-        if cfg.use_bn_p2pool_scan:
-            return False
-
         return True
-
-    def _randomx_flags_summary(self, cfg: MinerConfig) -> str:
-        enabled = []
-        if cfg.randomx_use_large_pages:
-            enabled.append("LARGE_PAGES")
-        if cfg.randomx_use_full_mem:
-            enabled.append("FULL_MEM")
-        if cfg.randomx_use_jit:
-            enabled.append("JIT")
-        if cfg.randomx_use_hard_aes:
-            enabled.append("HARD_AES")
-        if cfg.randomx_use_secure_jit:
-            enabled.append("SECURE_JIT")
-        return ", ".join(enabled) if enabled else "DEFAULT/NONE"
 
     def _build_cfg(self) -> MinerConfig:
         stratum = self.ed_stratum.text().strip()
@@ -1037,6 +1141,13 @@ class MainWindow(QMainWindow):
         threads = int(self.sp_threads.value())
         agent = self.ed_agent.text().strip() or "py-blockminer/0.1"
         randomx_lib = self.ed_randomx.text().strip()
+
+        if not stratum:
+            raise ValueError("Stratum cannot be empty")
+        if not wallet:
+            raise ValueError("Wallet cannot be empty")
+        if threads <= 0:
+            raise ValueError("Threads must be at least 1")
 
         use_bn_p2pool = bool(self.cb_bn_p2pool.isChecked())
         use_bn_randomx = bool(self.cb_bn_randomx.isChecked())
@@ -1047,29 +1158,39 @@ class MainWindow(QMainWindow):
         use_virtualasic_scan = bool(self.cb_vasic_scan.isChecked())
         use_parallel_monero_worker = bool(self.cb_parallel_monero_worker.isChecked())
         use_jit_worker = bool(self.cb_jit_worker.isChecked())
-        jit_batch_size = int(self.sp_jit_batch_size.value())
-        bn_api_relay = self.ed_bn_api_relay.text().strip()
-        submit_workers = int(self.sp_submit_workers.value())
-        scan_iters = int(self.sp_scan_iters.value())
 
+        bn_api_relay = self.ed_bn_api_relay.text().strip()
         vasic_dll = self.ed_vasic_dll.text().strip()
         vasic_kernel = self.ed_vasic_kernel.text().strip()
         vasic_kernel_name = self.ed_vasic_kernel_name.text().strip() or "monero_scan"
-
         parallel_python_dll = self.ed_parallel_python_dll.text().strip()
         parallel_python_batch_size = int(self.sp_parallel_python_batch_size.value())
+        jit_batch_size = int(self.sp_jit_batch_size.value())
+        submit_workers = int(self.sp_submit_workers.value())
+        scan_iters = int(self.sp_scan_iters.value())
 
-        if use_virtualasic_scan:
-            if not vasic_dll:
-                QMessageBox.warning(self, "Missing VirtualASIC DLL", "Please choose a VirtualASIC DLL path.")
-                raise ValueError("missing VirtualASIC DLL")
-            if not vasic_kernel:
-                QMessageBox.warning(self, "Missing VirtualASIC kernel", "Please choose a VirtualASIC kernel path.")
-                raise ValueError("missing VirtualASIC kernel")
-            if threads > 1:
-                self._append_log(
-                    "[gui] warning: VirtualASIC with threads > 1 creates one engine per worker and may reduce GPU efficiency."
-                )
+        enabled_scan_modes = sum(
+            1 for v in (
+                use_bn_p2pool_scan,
+                use_bn_randomx_scan,
+                use_bn_gpu_scan,
+                use_bn_cpu_scan,
+                use_virtualasic_scan,
+                use_parallel_monero_worker,
+                use_jit_worker,
+            ) if v
+        )
+        if enabled_scan_modes > 1:
+            raise ValueError("Only one scan/backend mode may be enabled at a time")
+
+        if use_virtualasic_scan and not vasic_dll:
+            raise ValueError("VirtualASIC DLL is required when VirtualASIC scan is enabled")
+        if use_virtualasic_scan and not vasic_kernel:
+            raise ValueError("VirtualASIC kernel is required when VirtualASIC scan is enabled")
+        if use_parallel_monero_worker and not parallel_python_dll:
+            parallel_python_dll = resolve_resource_path("", fallback_names=("ParallelPython.dll", "parallelpython.dll"))
+        if use_jit_worker and jit_batch_size <= 0:
+            raise ValueError("JIT batch size must be at least 1")
 
         use_bn_reporting = bool(self.cb_bn.isChecked())
 
@@ -1123,22 +1244,22 @@ class MainWindow(QMainWindow):
 
         self._save_cfg()
 
-        self.txt_log.appendPlainText("[gui] starting miner…")
+        self._append_log("[gui] starting miner…")
 
         if self._uses_local_randomx(cfg):
-            self.txt_log.appendPlainText(
+            self._append_log(
                 f"[gui] local RandomX flags: {self._randomx_flags_summary(cfg)}"
             )
 
         if cfg.use_virtualasic_scan:
-            self.txt_log.appendPlainText(
+            self._append_log(
                 f"[gui] virtualasic dll={resolve_resource_path(cfg.virtualasic_dll, fallback_names=('VirtualASIC.dll', 'virtualasic.dll'))} "
                 f"kernel={resolve_resource_path(cfg.virtualasic_kernel, fallback_names=('monero_scan.cl', 'virtualasic_monero_scan.cl', 'randomx_scan.cl'))} "
                 f"kernel_name={cfg.virtualasic_kernel_name}"
             )
 
         if cfg.use_parallel_monero_worker:
-            self.txt_log.appendPlainText(
+            self._append_log(
                 f"[gui] parallel monero worker enabled: "
                 f"threads={cfg.threads} "
                 f"dll={cfg.parallel_python_dll or 'auto'} "
@@ -1216,11 +1337,13 @@ class MainWindow(QMainWindow):
                 "jit_batch_size": int(self.sp_jit_batch_size.value()),
             }
 
+        data["color_logs"] = bool(self.cb_color_logs.isChecked())
+
         try:
             CFG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            self.statusBar().showMessage(f"Saved config: {CFG_PATH}", 4000)
+            self.statusBar().showMessage(f"Saved config to {CFG_PATH}", 2500)
         except Exception as e:
-            self._append_log(f"[gui] save config failed: {e}")
+            self._append_log(f"[gui] failed to save config: {e}")
 
     def _load_cfg(self) -> None:
         if not CFG_PATH.exists():
@@ -1229,7 +1352,7 @@ class MainWindow(QMainWindow):
         try:
             data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
         except Exception as e:
-            self._append_log(f"[gui] load config failed: {e}")
+            self._append_log(f"[gui] failed to load config: {e}")
             return
 
         self.ed_stratum.setText(str(data.get("stratum", self.ed_stratum.text())))
@@ -1239,11 +1362,11 @@ class MainWindow(QMainWindow):
         self.ed_agent.setText(str(data.get("agent", self.ed_agent.text())))
         self.ed_randomx.setText(str(data.get("randomx_lib", self.ed_randomx.text())))
 
-        self.cb_rx_large_pages.setChecked(bool(data.get("randomx_use_large_pages", True)))
-        self.cb_rx_full_mem.setChecked(bool(data.get("randomx_use_full_mem", True)))
-        self.cb_rx_jit.setChecked(bool(data.get("randomx_use_jit", True)))
-        self.cb_rx_hard_aes.setChecked(bool(data.get("randomx_use_hard_aes", True)))
-        self.cb_rx_secure_jit.setChecked(bool(data.get("randomx_use_secure_jit", False)))
+        self.cb_rx_large_pages.setChecked(bool(data.get("randomx_use_large_pages", self.cb_rx_large_pages.isChecked())))
+        self.cb_rx_full_mem.setChecked(bool(data.get("randomx_use_full_mem", self.cb_rx_full_mem.isChecked())))
+        self.cb_rx_jit.setChecked(bool(data.get("randomx_use_jit", self.cb_rx_jit.isChecked())))
+        self.cb_rx_hard_aes.setChecked(bool(data.get("randomx_use_hard_aes", self.cb_rx_hard_aes.isChecked())))
+        self.cb_rx_secure_jit.setChecked(bool(data.get("randomx_use_secure_jit", self.cb_rx_secure_jit.isChecked())))
 
         self.cb_bn.setChecked(bool(data.get("use_blocknet", self.cb_bn.isChecked())))
         self.ed_bn_relay.setText(str(data.get("blocknet_relay", self.ed_bn_relay.text())))
@@ -1271,34 +1394,80 @@ class MainWindow(QMainWindow):
         self.sp_scan_iters.setValue(int(data.get("scan_iters", self.sp_scan_iters.value())))
         self.sp_submit_workers.setValue(int(data.get("submit_workers", self.sp_submit_workers.value())))
 
-        self.cb_parallel_monero_worker.setChecked(bool(data.get("use_parallel_monero_worker", False)))
-        self.ed_parallel_python_dll.setText(str(data.get("parallel_python_dll", self.ed_parallel_python_dll.text())))
+        self.cb_parallel_monero_worker.setChecked(
+            bool(data.get("use_parallel_monero_worker", self.cb_parallel_monero_worker.isChecked()))
+        )
+        self.ed_parallel_python_dll.setText(
+            str(data.get("parallel_python_dll", self.ed_parallel_python_dll.text()))
+        )
         self.sp_parallel_python_batch_size.setValue(
             int(data.get("parallel_python_batch_size", self.sp_parallel_python_batch_size.value()))
         )
-        self.cb_jit_worker.setChecked(bool(data.get("use_jit_worker", False)))
+
+        self.cb_jit_worker.setChecked(bool(data.get("use_jit_worker", self.cb_jit_worker.isChecked())))
         self.sp_jit_batch_size.setValue(int(data.get("jit_batch_size", self.sp_jit_batch_size.value())))
+
+        self.cb_color_logs.setChecked(bool(data.get("color_logs", True)))
+        self._color_logs_enabled = bool(self.cb_color_logs.isChecked())
+
         self._sync_scan_checks()
+        self.statusBar().showMessage(f"Loaded config from {CFG_PATH}", 2500)
+
+    def _on_stats(self, stats: Dict[str, Any]) -> None:
+        hps = float(stats.get("hashrate_hs") or 0.0)
+        accepted = int(stats.get("accepted") or 0)
+        rejected = int(stats.get("rejected") or 0)
+        height = stats.get("height", "—")
+        threads = stats.get("threads", self.sp_threads.value())
+
+        self.lbl_hashrate.setText(f"{hps:,.0f} H/s")
+        self.lbl_sub.setText(
+            f"Accepted: {accepted}    Rejected: {rejected}    Height: {height}    Threads: {threads}"
+        )
+
+        try:
+            self.txt_raw.setPlainText(json.dumps(stats, indent=2, sort_keys=True))
+        except Exception:
+            self.txt_raw.setPlainText(str(stats))
+
+    def _on_state(self, state: str) -> None:
+        if state == "RUNNING":
+            self._set_running(True)
+        elif state == "STOPPED":
+            self._set_running(False)
+            self.uptime_timer.stop()
+
+    def _on_fatal(self, tb: str) -> None:
+        self._append_log("[gui] fatal worker error:")
+        self._append_log(tb)
+        self._set_running(False)
+        self.uptime_timer.stop()
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Miner Error")
+        box.setIcon(QMessageBox.Critical)
+        box.setText("The miner stopped because of an error.")
+        box.setDetailedText(tb)
+        box.exec_()
 
     def closeEvent(self, event) -> None:
         try:
-            self._save_cfg()
+            if self.worker and self.worker.isRunning():
+                self.worker.stop()
+                self.worker.wait(3000)
         except Exception:
             pass
-
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self.worker.wait(3000)
-
         super().closeEvent(event)
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     apply_dark_theme(app)
+
     w = MainWindow()
-    w.resize(1450, 900)
+    w.resize(1500, 980)
     w.show()
+
     return app.exec_()
 
 

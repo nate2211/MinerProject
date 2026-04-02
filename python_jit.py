@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import random
 import threading
 import time
 from ctypes import (
@@ -251,44 +252,942 @@ class PythonJIT:
         except Exception:
             pass
 
-
-class _JobDispatchCoordinator:
+class _ClassEventLogMixin:
     """
-    Self-contained coordinator so no external code changes are required.
-
-    What it does:
-    - auto-detects when the active job changes
-    - bumps a generation so old work becomes stale
-    - repairs repeated/backward/overlapping start_nonce requests by moving them
-      onto the next safe nonce window
-    - keeps a freshness clock for the active job
+    Shared sparse natural-event logger for runtime classes.
     """
 
-    def __init__(self, *, hashed_job_start: bool = True) -> None:
+    def _evt_init(
+        self,
+        *,
+        class_prefix: str,
+        logger: Optional[Callable[[str], None]],
+        cooldowns: Optional[dict[str, float]] = None,
+        phrases: Optional[dict[str, list[str]]] = None,
+    ) -> None:
+        self.logger = logger or (lambda s: None)
+        self._evt_prefix = str(class_prefix)
+        self._evt_last_at: dict[str, float] = {}
+        self._evt_last_phrase: dict[str, str] = {}
+        self._evt_rng = random.Random(
+            int(time.time() * 1_000_000) ^ id(self) ^ hash(self._evt_prefix)
+        )
+        self._evt_cooldowns = dict(cooldowns or {})
+        self._evt_phrases = dict(phrases or {})
+
+    def _evt_write(self, text: str) -> None:
+        try:
+            self.logger(text)
+        except Exception:
+            pass
+
+    def _evt_allowed(self, key: str, cooldown: Optional[float] = None) -> bool:
+        now = time.perf_counter()
+        cd = float(
+            self._evt_cooldowns.get(
+                key,
+                45.0 if cooldown is None else cooldown,
+            )
+        )
+        last = float(self._evt_last_at.get(key, 0.0))
+        if (now - last) < cd:
+            return False
+        self._evt_last_at[key] = now
+        return True
+
+    def _evt_pick(self, key: str, phrases: Optional[list[str]] = None) -> str:
+        pool = list(phrases or self._evt_phrases.get(key, []))
+        if not pool:
+            return key
+
+        last = self._evt_last_phrase.get(key, "")
+        if len(pool) > 1 and last in pool:
+            pool = [p for p in pool if p != last]
+
+        picked = self._evt_rng.choice(pool)
+        self._evt_last_phrase[key] = picked
+        return picked
+
+    def _evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        phrases: Optional[list[str]] = None,
+        cooldown: Optional[float] = None,
+        force: bool = False,
+    ) -> None:
+        if not force and not self._evt_allowed(key, cooldown):
+            return
+
+        phrase = self._evt_pick(key, phrases)
+        if details:
+            self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}")
+        else:
+            self._evt_write(f"[{self._evt_prefix}] {phrase}")
+
+class _CandidateBatch(_ClassEventLogMixin):
+    """
+    Fast candidate batch with sparse natural-event logging.
+
+    Keeps the same public API:
+    - __init__(owner_key, max_keep_default, logger)
+    - reset(...)
+    - offer(...)
+    - offer_hit(...)
+    - merge_items(...)
+    - merge_exported(...)
+    - export(...)
+
+    Logging policy:
+    - no logging on every hit
+    - no logging on every merge item
+    - logs only on meaningful transitions:
+        * batch_open
+        * burst
+        * replace
+        * merge
+        * trim
+        * flush
+    - global owner/event throttle prevents flood across recreated batches
+    """
+
+    __slots__ = (
+        "owner_key",
+        "max_keep_default",
+        "_job_id",
+        "_generation",
+        "_requested_keep",
+        "_best_by_nonce",
+        "_incoming",
+        "_accepted",
+        "_rejected_same_or_worse",
+        "_replaced",
+        "_bad",
+        "_merge_calls",
+        "_dirty",
+        "_cached_keep",
+        "_cached_out",
+        "_opened_logged",
+        "_last_export_sig",
+    )
+
+    _GLOBAL_EVT_MU = threading.RLock()
+    _GLOBAL_EVT_NEXT_AT: dict[tuple[str, str], float] = {}
+    _GLOBAL_EVT_SUPPRESSED: dict[tuple[str, str], int] = {}
+
+    def __init__(
+        self,
+        *,
+        owner_key: str,
+        max_keep_default: int = 16,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.owner_key = str(owner_key)
+        self.max_keep_default = max(1, int(max_keep_default))
+
+        self._job_id: str = ""
+        self._generation: int = 0
+        self._requested_keep: int = self.max_keep_default
+
+        # nonce_u32 -> (tail64, hash_hex)
+        self._best_by_nonce: dict[int, tuple[int, str]] = {}
+
+        self._incoming = 0
+        self._accepted = 0
+        self._rejected_same_or_worse = 0
+        self._replaced = 0
+        self._bad = 0
+        self._merge_calls = 0
+
+        self._dirty = True
+        self._cached_keep = 0
+        self._cached_out: list[dict] = []
+
+        self._opened_logged = False
+        self._last_export_sig: Optional[tuple] = None
+
+        self._evt_init(
+            class_prefix="CandidateBatch",
+            logger=logger,
+            cooldowns={
+                "batch_open": 45.0,
+                "burst": 60.0,
+                "replace": 75.0,
+                "merge": 60.0,
+                "trim": 75.0,
+                "flush": 60.0,
+                "bad": 90.0,
+            },
+            phrases={
+                "batch_open": [
+                    "a candidate lane opened up",
+                    "the batch woke onto a fresh round",
+                    "a new candidate window came online",
+                    "the batch stepped onto live work",
+                ],
+                "burst": [
+                    "a cluster of live hits started to form",
+                    "candidate traffic began to gather",
+                    "the batch started catching real movement",
+                    "a pocket of valid hits came together",
+                ],
+                "replace": [
+                    "a stronger nonce echo displaced an older one",
+                    "the batch upgraded a repeated nonce",
+                    "a sharper candidate replaced weaker footing",
+                    "one nonce came back stronger than before",
+                ],
+                "merge": [
+                    "worker candidate streams folded together",
+                    "the round batch absorbed several worker hits",
+                    "candidate lanes merged into one stronger view",
+                    "multiple hit streams were gathered into one batch",
+                ],
+                "trim": [
+                    "the batch trimmed itself to the sharpest edges",
+                    "weaker candidates were left behind at the boundary",
+                    "the kept set narrowed to the best slice",
+                    "the batch cut back to its strongest core",
+                ],
+                "flush": [
+                    "the batch handed off its strongest candidates",
+                    "a filtered candidate set rolled forward",
+                    "the batch exported its sharpest results",
+                    "the kept candidates were pushed onward",
+                ],
+                "bad": [
+                    "some malformed candidates were ignored",
+                    "the batch stepped around damaged entries",
+                    "broken candidate records were filtered out",
+                    "invalid candidate shapes were discarded",
+                ],
+            },
+        )
+
+    @staticmethod
+    def _share_diff_est(tail64: int) -> float:
+        if tail64 <= 0:
+            return float("inf")
+        return float((1 << 64) / tail64)
+
+    @staticmethod
+    def _tail64_from_hash_hex(hash_hex: str) -> int:
+        try:
+            h = bytes.fromhex(hash_hex)
+            if len(h) < 32:
+                return 0xFFFFFFFFFFFFFFFF
+            return int.from_bytes(h[24:32], "little", signed=False)
+        except Exception:
+            return 0xFFFFFFFFFFFFFFFF
+
+    @staticmethod
+    def _heap_key(nonce_u32: int, tail64: int) -> tuple[int, int]:
+        return (-int(tail64), -int(nonce_u32))
+
+    @staticmethod
+    def _sort_key(item: tuple[int, tuple[int, str]]) -> tuple[int, int]:
+        nonce_u32, (tail64, _hash_hex) = item
+        return int(tail64), int(nonce_u32)
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+        self._cached_keep = 0
+        self._cached_out = []
+
+    def _is_round_batch(self) -> bool:
+        return self.owner_key == "round-batch"
+
+    def _global_evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        phrases: Optional[list[str]] = None,
+        force: bool = False,
+    ) -> None:
+        gate = (self.owner_key, str(key))
+        now = time.perf_counter()
+        cd = float(
+            self._evt_cooldowns.get(
+                key,
+                45.0 if cooldown is None else cooldown,
+            )
+        )
+
+        suppressed = 0
+        with self._GLOBAL_EVT_MU:
+            next_at = float(self._GLOBAL_EVT_NEXT_AT.get(gate, 0.0))
+            if not force and now < next_at:
+                self._GLOBAL_EVT_SUPPRESSED[gate] = int(self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)) + 1
+                return
+
+            suppressed = int(self._GLOBAL_EVT_SUPPRESSED.pop(gate, 0))
+            self._GLOBAL_EVT_NEXT_AT[gate] = now + cd
+
+        phrase = self._evt_pick(key, phrases)
+        extra = f" suppressed={suppressed}" if suppressed > 0 else ""
+        if details:
+            self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}{extra}")
+        else:
+            self._evt_write(f"[{self._evt_prefix}] {phrase}{extra}")
+
+    def reset(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        requested_keep: Optional[int] = None,
+    ) -> None:
+        self._job_id = str(job_id)
+        self._generation = int(generation)
+        self._requested_keep = max(1, int(requested_keep or self.max_keep_default))
+
+        self._best_by_nonce.clear()
+
+        self._incoming = 0
+        self._accepted = 0
+        self._rejected_same_or_worse = 0
+        self._replaced = 0
+        self._bad = 0
+        self._merge_calls = 0
+
+        self._dirty = True
+        self._cached_keep = 0
+        self._cached_out = []
+        self._opened_logged = False
+        self._last_export_sig = None
+
+    def offer(
+        self,
+        *,
+        nonce_u32: int,
+        hash_hex: str,
+        tail64: int,
+    ) -> bool:
+        try:
+            nonce_u32 = int(nonce_u32) & 0xFFFFFFFF
+            tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
+            hash_hex = str(hash_hex).strip().lower()
+        except Exception:
+            self._bad += 1
+            return False
+
+        if not hash_hex:
+            self._bad += 1
+            return False
+
+        self._incoming += 1
+
+        if not self._opened_logged:
+            self._opened_logged = True
+            self._global_evt_emit(
+                "batch_open",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} keep={self._requested_keep}"
+                ),
+            )
+
+        prior = self._best_by_nonce.get(nonce_u32)
+        if prior is None:
+            self._best_by_nonce[nonce_u32] = (tail64, hash_hex)
+            self._accepted += 1
+            self._mark_dirty()
+
+            kept = len(self._best_by_nonce)
+            # only milestone logs, not every new winner
+            if kept in (2, 4, 8, 16, 32, 64):
+                self._global_evt_emit(
+                    "burst",
+                    details=(
+                        f"owner={self.owner_key} job={self._job_id} "
+                        f"gen={self._generation} unique_nonce_winners={kept}"
+                    ),
+                )
+            return True
+
+        prior_tail64 = int(prior[0])
+        if tail64 < prior_tail64:
+            self._best_by_nonce[nonce_u32] = (tail64, hash_hex)
+            self._replaced += 1
+            self._mark_dirty()
+
+            if self._replaced in (1, 3, 8):
+                self._global_evt_emit(
+                    "replace",
+                    details=(
+                        f"owner={self.owner_key} job={self._job_id} "
+                        f"gen={self._generation} replaced={self._replaced}"
+                    ),
+                )
+            return True
+
+        self._rejected_same_or_worse += 1
+        return False
+
+    def offer_hit(
+        self,
+        *,
+        nonce_u32: int,
+        tail64: int,
+        hash_hex: str,
+    ) -> bool:
+        return self.offer(
+            nonce_u32=nonce_u32,
+            hash_hex=hash_hex,
+            tail64=tail64,
+        )
+
+    def merge_items(self, items: list[dict]) -> None:
+        if not items:
+            return
+
+        self._merge_calls += 1
+        best_by_nonce = self._best_by_nonce
+        changed = False
+
+        for item in items:
+            try:
+                nonce_u32 = int(item["nonce_u32"]) & 0xFFFFFFFF
+                tail64 = int(item["tail64"]) & 0xFFFFFFFFFFFFFFFF
+                hash_hex = str(item["hash_hex"]).strip().lower()
+            except Exception:
+                self._bad += 1
+                continue
+
+            self._incoming += 1
+
+            prior = best_by_nonce.get(nonce_u32)
+            if prior is None:
+                best_by_nonce[nonce_u32] = (tail64, hash_hex)
+                self._accepted += 1
+                changed = True
+                continue
+
+            prior_tail64 = int(prior[0])
+            if tail64 < prior_tail64:
+                best_by_nonce[nonce_u32] = (tail64, hash_hex)
+                self._replaced += 1
+                changed = True
+            else:
+                self._rejected_same_or_worse += 1
+
+        if changed:
+            self._mark_dirty()
+
+        if self._merge_calls in (2, 4, 8, 16):
+            self._global_evt_emit(
+                "merge",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} merge_calls={self._merge_calls} "
+                    f"unique_nonce_winners={len(self._best_by_nonce)}"
+                ),
+            )
+
+    def merge_exported(self, items: list[dict]) -> None:
+        self.merge_items(items)
+
+    def export(self, max_results: Optional[int] = None) -> list[dict]:
+        keep = max(1, int(max_results or self._requested_keep or self.max_keep_default))
+
+        if not self._dirty and self._cached_keep == keep:
+            return self._cached_out
+
+        winners = self._best_by_nonce
+        if not winners:
+            self._cached_keep = keep
+            self._cached_out = []
+            self._dirty = False
+            return self._cached_out
+
+        trimmed = max(0, len(winners) - keep)
+
+        if len(winners) <= keep:
+            ordered = sorted(winners.items(), key=self._sort_key)
+            out = [
+                {
+                    "nonce_u32": int(nonce_u32),
+                    "hash_hex": hash_hex,
+                    "tail64": int(tail64),
+                    "share_diff_est": self._share_diff_est(int(tail64)),
+                }
+                for nonce_u32, (tail64, hash_hex) in ordered
+            ]
+        else:
+            heap: list[tuple[tuple[int, int], tuple[int, int, str]]] = []
+            push = heapq.heappush
+            replace = heapq.heapreplace
+
+            for nonce_u32, (tail64, hash_hex) in winners.items():
+                entry = (self._heap_key(nonce_u32, tail64), (nonce_u32, tail64, hash_hex))
+                if len(heap) < keep:
+                    push(heap, entry)
+                elif entry[0] > heap[0][0]:
+                    replace(heap, entry)
+
+            out_raw = [payload for _, payload in heap]
+            out_raw.sort(key=lambda x: (int(x[1]), int(x[0])))
+
+            out = [
+                {
+                    "nonce_u32": int(nonce_u32),
+                    "hash_hex": hash_hex,
+                    "tail64": int(tail64),
+                    "share_diff_est": self._share_diff_est(int(tail64)),
+                }
+                for nonce_u32, tail64, hash_hex in out_raw
+            ]
+
+        self._cached_keep = keep
+        self._cached_out = out
+        self._dirty = False
+
+        if self._bad > 0:
+            self._global_evt_emit(
+                "bad",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} bad={self._bad}"
+                ),
+            )
+
+        if trimmed > 0:
+            self._global_evt_emit(
+                "trim",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} trimmed={trimmed} kept={len(out)} requested={keep}"
+                ),
+            )
+
+        if out:
+            best = out[0]
+            sig = (
+                self._job_id,
+                self._generation,
+                self._incoming,
+                self._accepted,
+                self._rejected_same_or_worse,
+                self._replaced,
+                self._bad,
+                self._merge_calls,
+                len(out),
+                trimmed,
+                int(best["nonce_u32"]),
+                int(best["tail64"]),
+            )
+
+            if sig != self._last_export_sig:
+                self._last_export_sig = sig
+                self._global_evt_emit(
+                    "flush",
+                    details=(
+                        f"owner={self.owner_key} job={self._job_id} "
+                        f"gen={self._generation} incoming={self._incoming} "
+                        f"accepted={self._accepted} rejected={self._rejected_same_or_worse} "
+                        f"replaced={self._replaced} merges={self._merge_calls} "
+                        f"exported={len(out)} best_nonce={int(best['nonce_u32'])} "
+                        f"best_tail64={int(best['tail64'])}"
+                    ),
+                )
+
+        return out
+
+class _NonceLease(_ClassEventLogMixin):
+    """
+    Generic nonce ownership record.
+
+    Performance goals:
+    - safe to reuse outside JITWorker
+    - no per-hash locking requirement
+    - cheap range refresh for coordinator/frontier style ownership
+
+    Notes:
+    - use begin(...) when a new logical lease/job starts
+    - use refresh_range(...) when the same owner/job simply moves to a new window
+    - callers that need speed should snapshot once, then use local ints
+    """
+
+    def __init__(
+        self,
+        *,
+        worker_index: Optional[int] = None,
+        owner_key: Optional[str] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.worker_index = None if worker_index is None else int(worker_index)
+        self.owner_key = (
+            str(owner_key)
+            if owner_key is not None
+            else (f"worker-{self.worker_index}" if self.worker_index is not None else "lease")
+        )
+
         self._mu = threading.RLock()
+
+        self._lease_id: int = 0
+        self._job_id: str = ""
+        self._generation: int = 0
+
+        self._start_nonce: int = 0
+        self._count: int = 0
+        self._stop_nonce_exclusive: int = 0
+
+        self._assigned_at: float = 0.0
+        self._last_touch_at: float = 0.0
+        self._done_hashes: int = 0
+
+        self._evt_init(
+            class_prefix="NonceLease",
+            logger=logger,
+            cooldowns={
+                "begin": 45.0,
+                "refresh": 60.0,
+                "clear": 75.0,
+                "slow_lane": 90.0,
+            },
+            phrases={
+                "begin": [
+                    "fresh lease took hold",
+                    "a new nonce lane came online",
+                    "lease woke up on live work",
+                    "a new lease snapped into place",
+                ],
+                "refresh": [
+                    "lease window slid forward",
+                    "nonce lane refreshed",
+                    "lease rearmed cleanly",
+                    "lease advanced onto the next slice",
+                ],
+                "clear": [
+                    "lease cooled off",
+                    "nonce lane went quiet",
+                    "lease stood down",
+                    "lease cleared back to idle",
+                ],
+                "slow_lane": [
+                    "lease has been quiet for a while",
+                    "lease state is aging without much movement",
+                    "nonce lease is stretching its legs slowly",
+                    "this lease has lingered longer than usual",
+                ],
+            },
+        )
+
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    def _next_lease_id_locked(self) -> int:
+        nxt = (self._lease_id + 1) & 0x7FFFFFFF
+        if nxt == 0:
+            nxt = 1
+        return nxt
+
+    def begin(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        start_nonce: int,
+        count: int,
+        force_log: bool = False,
+    ) -> int:
+        """
+        Start a new logical lease. This bumps lease_id.
+        Use this on a new job or when you need a brand new ownership epoch.
+        """
+        job_id = str(job_id)
+        generation = int(generation)
+        start_nonce = self._u32(start_nonce)
+        count = max(0, int(count))
+
+        with self._mu:
+            self._lease_id = self._next_lease_id_locked()
+            self._job_id = job_id
+            self._generation = generation
+            self._start_nonce = start_nonce
+            self._count = count
+            self._stop_nonce_exclusive = self._u32(start_nonce + count)
+
+            now = time.perf_counter()
+            self._assigned_at = now
+            self._last_touch_at = now
+            self._done_hashes = 0
+
+            if count > 0:
+                self._evt_emit(
+                    "begin",
+                    details=(
+                        f"owner={self.owner_key} lease_id={self._lease_id} "
+                        f"job={job_id} gen={generation} start={start_nonce} count={count}"
+                    ),
+                    force=force_log,
+                )
+
+            return self._lease_id
+
+    def refresh_range(
+        self,
+        *,
+        start_nonce: int,
+        count: int,
+        emit_log: bool = False,
+    ) -> None:
+        """
+        Move the active range forward without changing lease_id/job/generation.
+        This is the low-overhead path for a coordinator/frontier owner.
+        """
+        start_nonce = self._u32(start_nonce)
+        count = max(0, int(count))
+
+        with self._mu:
+            self._start_nonce = start_nonce
+            self._count = count
+            self._stop_nonce_exclusive = self._u32(start_nonce + count)
+            self._last_touch_at = time.perf_counter()
+
+            if emit_log and count > 0:
+                self._evt_emit(
+                    "refresh",
+                    details=(
+                        f"owner={self.owner_key} lease_id={self._lease_id} "
+                        f"job={self._job_id} gen={self._generation} "
+                        f"start={start_nonce} count={count}"
+                    ),
+                )
+
+    def clear(self) -> None:
+        with self._mu:
+            had_work = bool(self._job_id) or self._count > 0
+            old_job = self._job_id
+            old_generation = self._generation
+
+            self._job_id = ""
+            self._generation = 0
+            self._start_nonce = 0
+            self._count = 0
+            self._stop_nonce_exclusive = 0
+            self._assigned_at = 0.0
+            self._last_touch_at = 0.0
+            self._done_hashes = 0
+
+            if had_work:
+                self._evt_emit(
+                    "clear",
+                    details=(
+                        f"owner={self.owner_key} last_job={old_job} "
+                        f"last_gen={old_generation}"
+                    ),
+                )
+
+    def matches(self, *, lease_id: int, job_id: str, generation: int) -> bool:
+        with self._mu:
+            return (
+                self._lease_id == int(lease_id)
+                and self._job_id == str(job_id)
+                and self._generation == int(generation)
+                and self._count > 0
+            )
+
+    def nonce_at(self, offset: int) -> int:
+        offset = max(0, int(offset))
+        with self._mu:
+            return self._u32(self._start_nonce + offset)
+
+    def note_progress(self, done_hashes: int) -> None:
+        with self._mu:
+            self._done_hashes = max(0, int(done_hashes))
+            self._last_touch_at = time.perf_counter()
+
+            if self._assigned_at > 0.0:
+                age_ms = max(0.0, (time.perf_counter() - self._assigned_at) * 1000.0)
+                if age_ms >= 12000.0 and self._done_hashes <= 0 and self._count > 0:
+                    self._evt_emit(
+                        "slow_lane",
+                        details=(
+                            f"owner={self.owner_key} lease_id={self._lease_id} "
+                            f"job={self._job_id} gen={self._generation} age_ms={age_ms:.0f}"
+                        ),
+                    )
+
+    def progress(self) -> int:
+        with self._mu:
+            return self._done_hashes
+
+    def age_ms(self) -> float:
+        with self._mu:
+            if self._assigned_at <= 0.0:
+                return 0.0
+            return max(0.0, (time.perf_counter() - self._assigned_at) * 1000.0)
+
+    def snapshot(self) -> tuple[int, str, int, int, int]:
+        with self._mu:
+            return (
+                self._lease_id,
+                self._job_id,
+                self._generation,
+                self._start_nonce,
+                self._count,
+            )
+
+    def snapshot_dict(self) -> dict:
+        with self._mu:
+            return {
+                "owner_key": self.owner_key,
+                "worker_index": self.worker_index,
+                "lease_id": self._lease_id,
+                "job_id": self._job_id,
+                "generation": self._generation,
+                "start_nonce": self._start_nonce,
+                "count": self._count,
+                "stop_nonce_exclusive": self._stop_nonce_exclusive,
+                "done_hashes": self._done_hashes,
+                "age_ms": self.age_ms(),
+            }
+
+
+class _JobDispatchCoordinator(_ClassEventLogMixin):
+    """
+    Self-contained coordinator backed by one reusable NonceLease.
+
+    Hashrate safety:
+    - this class is not in the RandomX hot loop
+    - it uses one lease only for ownership/frontier state
+    - same-job reservations refresh the range without bumping lease_id
+    """
+
+    def __init__(
+        self,
+        *,
+        hashed_job_start: bool = True,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._mu = threading.RLock()
+
         self._active_job_id: Optional[str] = None
         self._active_generation: int = 0
         self._job_started_at: float = 0.0
         self._next_nonce: int = 0
+
         self._hashed_job_start = bool(hashed_job_start)
+        self.logger = logger or (lambda s: None)
+
+        self._dispatch_seq: int = 0
+        self._last_reserved_start: int = 0
+        self._last_reserved_count: int = 0
+
+        # one reusable lease for the coordinator itself
+        self._active_lease = _NonceLease(
+            owner_key="dispatch",
+            logger=self.logger,
+        )
+
+        self._evt_init(
+            class_prefix="JobDispatchCoordinator",
+            logger=logger,
+            cooldowns={
+                "job_start": 35.0,
+                "jump": 60.0,
+                "overlap": 60.0,
+                "backward": 75.0,
+                "wrap": 90.0,
+            },
+            phrases={
+                "job_start": [
+                    "fresh work rolled in",
+                    "dispatch picked up a new lane",
+                    "a new mining wave landed",
+                    "the board changed under dispatch",
+                ],
+                "jump": [
+                    "nonce lane vaulted ahead",
+                    "dispatch skipped into a later slice",
+                    "window hopped forward cleanly",
+                    "the nonce stream lunged ahead",
+                ],
+                "overlap": [
+                    "dispatch untangled a crossing nonce lane",
+                    "an overlap surfaced and got smoothed out",
+                    "two nonce paths brushed together and were separated",
+                    "dispatch nudged a colliding lane ahead",
+                ],
+                "backward": [
+                    "an older nonce request tried to come back",
+                    "dispatch caught stale backward motion",
+                    "a rewind attempt got turned forward",
+                    "dispatch refused to reopen an older lane",
+                ],
+                "wrap": [
+                    "nonce space wrapped around",
+                    "the nonce ring crossed its boundary",
+                    "dispatch rolled through the uint32 seam",
+                    "the reservation looped across the edge",
+                ],
+            },
+        )
+
+    def _log(self, text: str) -> None:
+        try:
+            self.logger(text)
+        except Exception:
+            pass
 
     @staticmethod
     def _norm_job_id(job_id: str) -> str:
         return str(job_id)
 
-    def _seed_nonce_for_job(self, job_id: str) -> int:
-        if not self._hashed_job_start:
-            return 0
-        h = hashlib.blake2s(
-            self._norm_job_id(job_id).encode("utf-8", "ignore"),
-            digest_size=4,
-        ).digest()
-        return int.from_bytes(h, "little", signed=False) & 0xFFFFFFFF
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    @staticmethod
+    def _forward_distance(cur: int, req: int) -> int:
+        return (int(req) - int(cur)) & 0xFFFFFFFF
+
+    @staticmethod
+    def _backward_distance(cur: int, req: int) -> int:
+        return (int(cur) - int(req)) & 0xFFFFFFFF
 
     @staticmethod
     def _is_forward_or_equal(req: int, cur: int) -> bool:
         delta = (int(req) - int(cur)) & 0xFFFFFFFF
         return delta == 0 or delta < 0x80000000
+
+    def _next_generation_locked(self) -> int:
+        nxt = (self._active_generation + 1) & 0x7FFFFFFF
+        if nxt == 0:
+            nxt = 1
+        return nxt
+
+    def _seed_nonce_for_job(self, job_id: str, generation: int) -> int:
+        if not self._hashed_job_start:
+            return 0
+
+        h = hashlib.blake2s(
+            f"{self._norm_job_id(job_id)}|{int(generation)}".encode("utf-8", "ignore"),
+            digest_size=4,
+        ).digest()
+        return int.from_bytes(h, "little", signed=False) & 0xFFFFFFFF
+
+    def _initial_nonce_for_job(self, job_id: str, generation: int) -> int:
+        return self._seed_nonce_for_job(job_id, generation) & 0xFFFFFFC0
+
+    def _reserve_locked(self, start_nonce: int, count: int) -> tuple[int, bool]:
+        start_nonce = self._u32(start_nonce)
+        count = max(1, int(count))
+
+        stop = (start_nonce + count) & 0xFFFFFFFF
+        wrapped = stop < start_nonce or (count > 0 and stop == start_nonce)
+
+        self._next_nonce = stop
+        self._last_reserved_start = start_nonce
+        self._last_reserved_count = count
+        self._dispatch_seq += 1
+
+        return start_nonce, wrapped
 
     def observe_and_reserve(
         self,
@@ -298,28 +1197,110 @@ class _JobDispatchCoordinator:
     ) -> tuple[int, int]:
         job_id = self._norm_job_id(job_id)
         count = max(1, int(count))
-        req = int(requested_start_nonce) & 0xFFFFFFFF
+        req = self._u32(requested_start_nonce)
 
         with self._mu:
-            if self._active_job_id != job_id:
-                next_gen = (self._active_generation + 1) & 0x7FFFFFFF
-                if next_gen == 0:
-                    next_gen = 1
+            previous_age_ms = 0.0
+            if self._job_started_at > 0.0:
+                previous_age_ms = max(
+                    0.0,
+                    (time.perf_counter() - self._job_started_at) * 1000.0,
+                )
 
+            is_new_job = (self._active_job_id != job_id)
+
+            if is_new_job:
                 self._active_job_id = job_id
-                self._active_generation = next_gen
+                self._active_generation = self._next_generation_locked()
                 self._job_started_at = time.perf_counter()
 
-                actual_start = req if req != 0 else self._seed_nonce_for_job(job_id)
-                self._next_nonce = (actual_start + count) & 0xFFFFFFFF
+                actual_start = req if req != 0 else self._initial_nonce_for_job(job_id, self._active_generation)
+
+                # new logical ownership epoch
+                self._active_lease.begin(
+                    job_id=job_id,
+                    generation=self._active_generation,
+                    start_nonce=actual_start,
+                    count=count,
+                )
+
+                actual_start, wrapped = self._reserve_locked(actual_start, count)
+
+                self._evt_emit(
+                    "job_start",
+                    details=(
+                        f"job={job_id} gen={self._active_generation} "
+                        f"start={actual_start} count={count} previous_age_ms={previous_age_ms:.0f}"
+                    ),
+                )
+
+                if wrapped:
+                    self._evt_emit(
+                        "wrap",
+                        details=(
+                            f"job={job_id} gen={self._active_generation} "
+                            f"start={actual_start} count={count}"
+                        ),
+                    )
+
                 return actual_start, self._active_generation
 
-            if self._is_forward_or_equal(req, self._next_nonce):
-                actual_start = req
-            else:
-                actual_start = self._next_nonce
+            expected = self._next_nonce
 
-            self._next_nonce = (actual_start + count) & 0xFFFFFFFF
+            if req == expected:
+                actual_start = req
+
+            elif self._is_forward_or_equal(req, expected):
+                gap = self._forward_distance(expected, req)
+                actual_start = req
+
+                if gap >= max(2048, count * 8):
+                    self._evt_emit(
+                        "jump",
+                        details=(
+                            f"job={job_id} gen={self._active_generation} "
+                            f"expected={expected} requested={req} gap={gap}"
+                        ),
+                    )
+            else:
+                actual_start = expected
+                overlap_span = self._forward_distance(req, expected)
+
+                if overlap_span <= 0x00FFFFFF:
+                    self._evt_emit(
+                        "overlap",
+                        details=(
+                            f"job={job_id} gen={self._active_generation} "
+                            f"requested={req} repaired={actual_start}"
+                        ),
+                    )
+                else:
+                    self._evt_emit(
+                        "backward",
+                        details=(
+                            f"job={job_id} gen={self._active_generation} "
+                            f"requested={req} repaired={actual_start}"
+                        ),
+                    )
+
+            actual_start, wrapped = self._reserve_locked(actual_start, count)
+
+            # same logical lease, just a new reservation window
+            self._active_lease.refresh_range(
+                start_nonce=actual_start,
+                count=count,
+                emit_log=False,
+            )
+
+            if wrapped:
+                self._evt_emit(
+                    "wrap",
+                    details=(
+                        f"job={job_id} gen={self._active_generation} "
+                        f"start={actual_start} count={count}"
+                    ),
+                )
+
             return actual_start, self._active_generation
 
     def is_current(self, job_id: str, generation: int) -> bool:
@@ -345,14 +1326,89 @@ class _JobDispatchCoordinator:
         with self._mu:
             return self._active_job_id
 
+    def current_lease_snapshot(self) -> dict:
+        return self._active_lease.snapshot_dict()
 
-class _CandidateSelector:
+    def clear(self) -> None:
+        with self._mu:
+            self._active_job_id = None
+            self._active_generation = 0
+            self._job_started_at = 0.0
+            self._next_nonce = 0
+            self._last_reserved_start = 0
+            self._last_reserved_count = 0
+            self._dispatch_seq = 0
+            self._active_lease.clear()
+
+    def snapshot(self) -> dict:
+        with self._mu:
+            return {
+                "active_job_id": self._active_job_id,
+                "active_generation": self._active_generation,
+                "job_age_ms": self.current_job_age_ms(),
+                "next_nonce": self._next_nonce,
+                "last_reserved_start": self._last_reserved_start,
+                "last_reserved_count": self._last_reserved_count,
+                "dispatch_seq": self._dispatch_seq,
+                "lease": self._active_lease.snapshot_dict(),
+            }
+
+
+class _CandidateSelector(_ClassEventLogMixin):
     """
-    Keeps only unique legitimate candidates and ranks strongest-first.
+    High-throughput candidate selector.
+
+    Design goals:
+    - keep the public API identical
+    - minimize allocations and full-list sorting
+    - collapse repeated nonces to the strongest candidate
+    - avoid redundant ranking math
+    - preserve logging through the mixin
     """
 
-    def __init__(self, *, max_keep_default: int = 16) -> None:
+    def __init__(
+        self,
+        *,
+        max_keep_default: int = 16,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.max_keep_default = max(1, int(max_keep_default))
+        self._evt_init(
+            class_prefix="CandidateSelector",
+            logger=logger,
+            cooldowns={
+                "kept_candidates": 75.0,
+                "dedup": 90.0,
+                "nonce_collapse": 90.0,
+                "bad": 90.0,
+            },
+            phrases={
+                "kept_candidates": [
+                    "strong candidates floated to the surface",
+                    "a promising set survived ranking",
+                    "the ranking pass held onto live contenders",
+                    "candidate sorting kept the sharpest edges",
+                ],
+                "dedup": [
+                    "duplicates got brushed out of the pile",
+                    "ranking shaved off repeated candidates",
+                    "the selector thinned out mirrored results",
+                    "duplicate candidate echoes were removed",
+                ],
+                "nonce_collapse": [
+                    "multiple hits on the same nonce were narrowed down",
+                    "the selector kept only the sharpest nonce echoes",
+                    "weaker results on repeated nonces were set aside",
+                    "nonce collisions were reduced to their strongest form",
+                ],
+                "bad": [
+                    "some malformed candidates were ignored",
+                    "the selector stepped around damaged entries",
+                    "broken candidate records were filtered out",
+                    "invalid candidate shapes were discarded",
+                ],
+            },
+        )
 
     @staticmethod
     def _tail64_from_hash_hex(hash_hex: str) -> int:
@@ -370,42 +1426,162 @@ class _CandidateSelector:
             return float("inf")
         return float((1 << 64) / tail64)
 
+    @staticmethod
+    def _normalize(raw: dict) -> Optional[dict]:
+        try:
+            nonce_u32 = int(raw.get("nonce_u32", 0)) & 0xFFFFFFFF
+            hash_hex = str(raw.get("hash_hex", "") or "").strip().lower()
+            if not hash_hex:
+                return None
+
+            tail64 = raw.get("tail64", None)
+            if tail64 is None:
+                tail64 = _CandidateSelector._tail64_from_hash_hex(hash_hex)
+            tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
+
+            # keep share_diff_est in the output shape, but do not use it
+            # as a primary ranking field because it is monotonic with tail64.
+            share_diff_est = raw.get("share_diff_est", None)
+            if share_diff_est is None:
+                share_diff_est = _CandidateSelector._share_diff_est(tail64)
+            share_diff_est = float(share_diff_est)
+
+            return {
+                "nonce_u32": nonce_u32,
+                "hash_hex": hash_hex,
+                "tail64": tail64,
+                "share_diff_est": share_diff_est,
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_better(a: dict, b: dict) -> bool:
+        """
+        Lower tail64 is better.
+        Lower nonce is the stable tie-break.
+        """
+        at = int(a["tail64"])
+        bt = int(b["tail64"])
+        if at != bt:
+            return at < bt
+        return int(a["nonce_u32"]) < int(b["nonce_u32"])
+
+    @staticmethod
+    def _sort_key(x: dict) -> tuple[int, int]:
+        return (
+            int(x["tail64"]),
+            int(x["nonce_u32"]),
+        )
+
+    @staticmethod
+    def _heap_key(x: dict) -> tuple[int, int]:
+        """
+        Heap stores the current worst kept entry at index 0.
+        More positive is better for replacement testing.
+        """
+        return (
+            -int(x["tail64"]),
+            -int(x["nonce_u32"]),
+        )
+
     def rank(self, candidates: list[dict], max_results: int) -> list[dict]:
         keep = max(1, int(max_results or self.max_keep_default))
 
-        seen: set[tuple[int, str]] = set()
-        ranked: list[dict] = []
+        exact_dupes = 0
+        bad_items = 0
+        weaker_same_nonce = 0
 
-        for item in candidates:
-            nonce_u32 = int(item.get("nonce_u32", 0)) & 0xFFFFFFFF
-            hash_hex = str(item.get("hash_hex", ""))
+        # pass 1:
+        # - normalize candidates
+        # - remove exact duplicates
+        # - keep strongest candidate for each nonce
+        seen_exact: set[tuple[int, str]] = set()
+        best_by_nonce: dict[int, dict] = {}
 
-            key = (nonce_u32, hash_hex)
-            if key in seen:
+        for raw in candidates:
+            cand = self._normalize(raw)
+            if cand is None:
+                bad_items += 1
                 continue
-            seen.add(key)
 
-            tail64 = int(item.get("tail64", self._tail64_from_hash_hex(hash_hex))) & 0xFFFFFFFFFFFFFFFF
-            share_diff_est = float(item.get("share_diff_est", self._share_diff_est(tail64)))
+            nonce_u32 = int(cand["nonce_u32"])
+            hash_hex = str(cand["hash_hex"])
 
-            ranked.append(
-                {
-                    "nonce_u32": nonce_u32,
-                    "hash_hex": hash_hex,
-                    "tail64": tail64,
-                    "share_diff_est": share_diff_est,
-                }
+            exact_key = (nonce_u32, hash_hex)
+            if exact_key in seen_exact:
+                exact_dupes += 1
+                continue
+            seen_exact.add(exact_key)
+
+            prior = best_by_nonce.get(nonce_u32)
+            if prior is None:
+                best_by_nonce[nonce_u32] = cand
+            else:
+                if self._is_better(cand, prior):
+                    best_by_nonce[nonce_u32] = cand
+                weaker_same_nonce += 1
+
+        # fast path: if there are only a few unique nonce winners,
+        # just sort them directly.
+        winners = list(best_by_nonce.values())
+        if len(winners) <= keep:
+            winners.sort(key=self._sort_key)
+            out = winners
+        else:
+            # bounded heap path for larger bursts
+            heap: list[tuple[tuple[int, int], dict]] = []
+            for cand in winners:
+                entry = (self._heap_key(cand), cand)
+                if len(heap) < keep:
+                    heapq.heappush(heap, entry)
+                else:
+                    if entry[0] > heap[0][0]:
+                        heapq.heapreplace(heap, entry)
+
+            out = [cand for _, cand in heap]
+            out.sort(key=self._sort_key)
+
+        if exact_dupes > 0:
+            self._evt_emit(
+                "dedup",
+                details=(
+                    f"exact_duplicates_removed={exact_dupes} "
+                    f"incoming={len(candidates)}"
+                ),
             )
 
-        ranked.sort(
-            key=lambda x: (
-                int(x["tail64"]),
-                -float(x["share_diff_est"]),
-                int(x["nonce_u32"]),
+        if weaker_same_nonce > 0:
+            self._evt_emit(
+                "nonce_collapse",
+                details=(
+                    f"same_nonce_reduced={weaker_same_nonce} "
+                    f"unique_nonce_winners={len(best_by_nonce)}"
+                ),
             )
-        )
-        return ranked[:keep]
 
+        if bad_items > 0:
+            self._evt_emit(
+                "bad",
+                details=(
+                    f"bad_candidates={bad_items} "
+                    f"incoming={len(candidates)}"
+                ),
+            )
+
+        if out:
+            best = out[0]
+            self._evt_emit(
+                "kept_candidates",
+                details=(
+                    f"kept={len(out)} requested={keep} "
+                    f"best_nonce={int(best['nonce_u32'])} "
+                    f"best_tail64={int(best['tail64'])} "
+                    f"best_share_diff={float(best['share_diff_est']):,.2f}"
+                ),
+            )
+
+        return out
 
 @dataclass
 class _ExecutionLane:
@@ -431,15 +1607,9 @@ class _ExecutionLane:
     next_retry_at: float = 0.0
 
 
-class _HybridExecutionController:
+class _HybridExecutionController(_ClassEventLogMixin):
     """
     Ultra-safe controller for heavy-thread RandomX mining.
-
-    Policy:
-    - direct hashing is always the primary path
-    - native helpers are treated as fragile under high concurrency
-    - when thread count / active work is high, NEVER attempt thunk/python_usage
-    - native helpers are only eligible in low-pressure conditions
     """
 
     def __init__(
@@ -461,15 +1631,13 @@ class _HybridExecutionController:
         self._lanes: dict[int, _ExecutionLane] = {}
         self._usage_owner: Optional[int] = None
         self._thunk_lane_count = 0
-        self._max_thunk_lanes = 1
+        self._max_thunk_lanes = 4
         self._active_invocations = 0
         self._active_native_invocations = 0
 
         self._started_at = time.perf_counter()
         self._native_startup_grace_until = self._started_at + 8.0
 
-        # Hard safety gates.
-        # With many mining threads, do not attempt native helper paths at all.
         self._native_thread_cap_for_usage = 4
         self._native_thread_cap_for_thunk = 2
 
@@ -507,6 +1675,64 @@ class _HybridExecutionController:
             "access_violation_invoke_thunk": 0,
             "access_violation_invoke_usage": 0,
         }
+
+        self._evt_init(
+            class_prefix="HybridExecutionController",
+            logger=logger,
+            cooldowns={
+                "usage_promote": 90.0,
+                "thunk_promote": 90.0,
+                "usage_disabled": 180.0,
+                "thunk_disabled": 180.0,
+                "fallback": 90.0,
+                "pressure": 120.0,
+                "close": 120.0,
+            },
+            phrases={
+                "usage_promote": [
+                    "python_usage lane woke up",
+                    "a worker climbed onto the usage path",
+                    "usage execution took a turn at the wheel",
+                    "the usage lane opened briefly",
+                ],
+                "thunk_promote": [
+                    "a thunk lane came online",
+                    "native thunk execution stepped in",
+                    "one worker crossed onto the thunk path",
+                    "the thunk lane flickered to life",
+                ],
+                "usage_disabled": [
+                    "python_usage went dark for this run",
+                    "the usage lane was shut down after a hard hit",
+                    "usage execution bowed out",
+                    "python_usage stood down for safety",
+                ],
+                "thunk_disabled": [
+                    "the thunk lane went dark for this run",
+                    "native thunk execution stood down",
+                    "the thunk path bowed out after a hard hit",
+                    "thunk execution was shelved for safety",
+                ],
+                "fallback": [
+                    "execution drifted back to direct mode",
+                    "the worker fell back onto the safe lane",
+                    "direct execution took over again",
+                    "the fast path folded back into direct work",
+                ],
+                "pressure": [
+                    "native paths stayed quiet under load",
+                    "pressure kept the fragile lanes asleep",
+                    "runtime load held native execution back",
+                    "the controller stayed conservative under pressure",
+                ],
+                "close": [
+                    "execution lanes cooled off",
+                    "the controller wound its lanes down",
+                    "runtime execution stood down cleanly",
+                    "the execution controller settled back to idle",
+                ],
+            },
+        )
 
     def _log(self, msg: str) -> None:
         try:
@@ -556,7 +1782,6 @@ class _HybridExecutionController:
         return min(cap, base * (2.0 ** min(av_count - 1, 4)))
 
     def _native_globally_safe(self) -> bool:
-        # Core rule: never attempt native helpers at high thread counts.
         return self.threads <= self._native_thread_cap_for_usage
 
     def _feature_available_locked(self, feature: str) -> bool:
@@ -566,9 +1791,17 @@ class _HybridExecutionController:
             return False
 
         if self._active_invocations > 1:
+            self._evt_emit(
+                "pressure",
+                details=f"feature={feature} active_invocations={self._active_invocations}",
+            )
             return False
 
         if self._active_native_invocations > 0:
+            self._evt_emit(
+                "pressure",
+                details=f"feature={feature} active_native_invocations={self._active_native_invocations}",
+            )
             return False
 
         if feature == "usage":
@@ -579,6 +1812,10 @@ class _HybridExecutionController:
             if self.python_usage is None:
                 return False
             if self.threads > self._native_thread_cap_for_usage:
+                self._evt_emit(
+                    "pressure",
+                    details=f"feature=usage threads={self.threads} cap={self._native_thread_cap_for_usage}",
+                )
                 return False
             return True
 
@@ -590,6 +1827,10 @@ class _HybridExecutionController:
             if self.jit is None:
                 return False
             if self.threads > self._native_thread_cap_for_thunk:
+                self._evt_emit(
+                    "pressure",
+                    details=f"feature=thunk threads={self.threads} cap={self._native_thread_cap_for_thunk}",
+                )
                 return False
             return True
 
@@ -643,9 +1884,15 @@ class _HybridExecutionController:
             else:
                 self._stats["access_violation_invoke_usage"] += 1
 
-            # One AV is enough to stop retrying for this session under mining load.
             self._usage_permanently_disabled = True
-            self._log("[JITWorker] python_usage permanently disabled for this session after access violation")
+            self._evt_emit(
+                "usage_disabled",
+                details=(
+                    f"stage={stage} worker={lane.worker_index} "
+                    f"av_count={self._usage_av_count} reason={reason}"
+                ),
+                force=True,
+            )
 
         elif feature == "thunk":
             self._thunk_av_count += 1
@@ -659,7 +1906,14 @@ class _HybridExecutionController:
                 self._stats["access_violation_invoke_thunk"] += 1
 
             self._thunk_permanently_disabled = True
-            self._log("[JITWorker] thunk permanently disabled for this session after access violation")
+            self._evt_emit(
+                "thunk_disabled",
+                details=(
+                    f"stage={stage} worker={lane.worker_index} "
+                    f"av_count={self._thunk_av_count} reason={reason}"
+                ),
+                force=True,
+            )
 
         lane.next_retry_at = max(
             lane.next_retry_at,
@@ -674,6 +1928,8 @@ class _HybridExecutionController:
         cooldown: float,
         clear_usage_owner: bool,
     ) -> None:
+        old_mode = lane.mode
+
         if lane.mode == "thunk":
             self._release_thunk_locked(lane)
 
@@ -688,6 +1944,10 @@ class _HybridExecutionController:
         lane.next_retry_at = max(lane.next_retry_at, self._now() + max(1.0, float(cooldown)))
 
         self._stats["fallback_to_direct"] += 1
+        self._evt_emit(
+            "fallback",
+            details=f"worker={lane.worker_index} from={old_mode} reason={reason}",
+        )
 
     def _invoke_python_usage_callable(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
         if self.python_usage is None:
@@ -756,7 +2016,10 @@ class _HybridExecutionController:
                 lane.last_mode_change_at = self._now()
                 self._stats["usage_bind_ok"] += 1
                 self._stats["promotion_ok"] += 1
-                self._log(f"[JITWorker] worker[{st.worker_index}] execution=python_usage")
+                self._evt_emit(
+                    "usage_promote",
+                    details=f"worker={st.worker_index}",
+                )
                 return
             except Exception as e:
                 msg = self._err_text(e)
@@ -786,7 +2049,10 @@ class _HybridExecutionController:
                 self._thunk_lane_count += 1
                 self._stats["thunk_bind_ok"] += 1
                 self._stats["promotion_ok"] += 1
-                self._log(f"[JITWorker] worker[{st.worker_index}] execution=thunk")
+                self._evt_emit(
+                    "thunk_promote",
+                    details=f"worker={st.worker_index}",
+                )
                 return
             except Exception as e:
                 msg = self._err_text(e)
@@ -832,7 +2098,6 @@ class _HybridExecutionController:
             lane.invoke_attempts += 1
 
         try:
-            # Under mining load, direct work always happens.
             rc = int(st.callback(None))
 
             with self._mu:
@@ -841,7 +2106,6 @@ class _HybridExecutionController:
                 lane.direct_successes += 1
                 self._stats["direct_invoke_ok"] += 1
 
-            # Only after direct work succeeds do we optionally sample native.
             with self._mu:
                 if lane.mode == "direct":
                     self._maybe_promote_locked(st, lane)
@@ -958,6 +2222,8 @@ class _HybridExecutionController:
             self._active_invocations = 0
             self._active_native_invocations = 0
 
+        self._evt_emit("close", details=f"threads={self.threads}", force=True)
+
     def snapshot(self) -> dict:
         with self._mu:
             return {
@@ -996,13 +2262,11 @@ class _HybridExecutionController:
                 },
             }
 
-class RandomXDatasetBuilder:
+
+class RandomXDatasetBuilder(_ClassEventLogMixin):
     """
     Centralizes RandomX seed changes so only one thread pays the full
     dataset/cache rebuild cost per seed.
-
-    It does not change the external RandomX wrapper API. It just coordinates
-    calls into rx.ensure_seed(seed_hash).
     """
 
     def __init__(
@@ -1030,6 +2294,43 @@ class RandomXDatasetBuilder:
             "build_fail": 0,
         }
 
+        self._evt_init(
+            class_prefix="RandomXDatasetBuilder",
+            logger=logger,
+            cooldowns={
+                "build_start": 60.0,
+                "build_wait": 75.0,
+                "build_done": 60.0,
+                "build_fail": 90.0,
+            },
+            phrases={
+                "build_start": [
+                    "a fresh dataset build began",
+                    "seed preparation just took the floor",
+                    "RandomX dataset work spun up",
+                    "a new seed build woke up",
+                ],
+                "build_wait": [
+                    "another thread is already tending this seed",
+                    "seed preparation is already in flight",
+                    "the dataset lane is busy with this seed",
+                    "build work is already underway for this seed",
+                ],
+                "build_done": [
+                    "dataset preparation settled into place",
+                    "the seed build landed cleanly",
+                    "RandomX dataset work came together",
+                    "the fresh dataset is ready to breathe",
+                ],
+                "build_fail": [
+                    "dataset preparation hit a wall",
+                    "the seed build stumbled hard",
+                    "RandomX dataset work fell out of step",
+                    "the current build attempt broke apart",
+                ],
+            },
+        )
+
     def _log(self, msg: str) -> None:
         try:
             self.logger(msg)
@@ -1041,6 +2342,10 @@ class RandomXDatasetBuilder:
         if not seed_hash:
             raise ValueError("empty seed_hash")
 
+        build_started_here = False
+        seed_hex = seed_hash.hex()[:16]
+        t0 = time.perf_counter()
+
         with self._cv:
             self._stats["build_requests"] += 1
 
@@ -1050,6 +2355,10 @@ class RandomXDatasetBuilder:
 
                 if self._building_seed == seed_hash:
                     self._stats["build_waits"] += 1
+                    self._evt_emit(
+                        "build_wait",
+                        details=f"seed={seed_hex} ready_epoch={self._ready_epoch}",
+                    )
                     self._cv.wait()
                     continue
 
@@ -1057,9 +2366,18 @@ class RandomXDatasetBuilder:
                     self._building_seed = seed_hash
                     self._build_error = None
                     self._stats["build_starts"] += 1
+                    build_started_here = True
+                    self._evt_emit(
+                        "build_start",
+                        details=f"seed={seed_hex} next_epoch={self._ready_epoch + 1}",
+                    )
                     break
 
                 self._stats["build_waits"] += 1
+                self._evt_emit(
+                    "build_wait",
+                    details=f"seed={seed_hex} building_other_seed=1",
+                )
                 self._cv.wait()
 
         try:
@@ -1070,6 +2388,13 @@ class RandomXDatasetBuilder:
                 self._build_error = e
                 self._stats["build_fail"] += 1
                 self._cv.notify_all()
+
+            if build_started_here:
+                self._evt_emit(
+                    "build_fail",
+                    details=f"seed={seed_hex} error={type(e).__name__}: {e}",
+                    force=True,
+                )
             raise
 
         with self._cv:
@@ -1080,7 +2405,16 @@ class RandomXDatasetBuilder:
             self._stats["build_success"] += 1
             epoch = self._ready_epoch
             self._cv.notify_all()
-            return epoch
+
+        if build_started_here:
+            elapsed = max(0.0, time.perf_counter() - t0)
+            self._evt_emit(
+                "build_done",
+                details=f"seed={seed_hex} epoch={epoch} elapsed_sec={elapsed:.2f}",
+                force=True,
+            )
+
+        return epoch
 
     def current_seed(self) -> bytes:
         with self._mu:
@@ -1101,11 +2435,10 @@ class RandomXDatasetBuilder:
             }
 
 
-class RandomXVmPool:
+class RandomXVmPool(_ClassEventLogMixin):
     """
     Keeps one VM per worker and recreates it only when the RandomX dataset epoch
-    changes. This keeps VM lifecycle stable and moves seed coordination out of
-    the hot loop.
+    changes.
     """
 
     def __init__(
@@ -1129,6 +2462,43 @@ class RandomXVmPool:
             "vm_destroy": 0,
             "warm_calls": 0,
         }
+
+        self._evt_init(
+            class_prefix="RandomXVmPool",
+            logger=logger,
+            cooldowns={
+                "vm_create": 60.0,
+                "vm_rebuild": 60.0,
+                "warm": 90.0,
+                "close": 120.0,
+            },
+            phrases={
+                "vm_create": [
+                    "a worker VM came online",
+                    "the pool opened a fresh VM lane",
+                    "a new RandomX VM stepped into place",
+                    "the pool spun up a worker VM",
+                ],
+                "vm_rebuild": [
+                    "a worker VM rolled onto a new epoch",
+                    "the pool rebuilt a VM for fresh seed state",
+                    "one VM shed its old epoch and came back fresh",
+                    "the VM lane was rebuilt for current work",
+                ],
+                "warm": [
+                    "the VM pool stretched before live work",
+                    "worker VMs were warmed onto the current seed",
+                    "the pool prepped its active lanes",
+                    "seed warmth spread across the worker VMs",
+                ],
+                "close": [
+                    "the VM pool cooled off",
+                    "worker VMs were wound down",
+                    "the pool settled back to idle",
+                    "the VM lanes stood down cleanly",
+                ],
+            },
+        )
 
     def _log(self, msg: str) -> None:
         try:
@@ -1166,6 +2536,10 @@ class RandomXVmPool:
                     "seed_hash": seed_hash,
                 }
                 self._stats["vm_creates"] += 1
+                self._evt_emit(
+                    "vm_create",
+                    details=f"worker={idx} epoch={epoch} seed={seed_hash.hex()[:16]}",
+                )
                 return vm, epoch
 
             if entry.get("vm") is not None and int(entry.get("epoch", 0)) == epoch:
@@ -1178,6 +2552,10 @@ class RandomXVmPool:
             entry["epoch"] = epoch
             entry["seed_hash"] = seed_hash
             self._stats["vm_rebuilds"] += 1
+            self._evt_emit(
+                "vm_rebuild",
+                details=f"worker={idx} epoch={epoch} seed={seed_hash.hex()[:16]}",
+            )
             return vm, epoch
 
     def warm_workers(self, worker_indices: list[int], seed_hash: bytes) -> int:
@@ -1191,13 +2569,24 @@ class RandomXVmPool:
         for idx in worker_indices:
             self.acquire_for_worker(int(idx), seed_hash)
 
+        if worker_indices:
+            self._evt_emit(
+                "warm",
+                details=f"workers={len(worker_indices)} epoch={epoch} seed={seed_hash.hex()[:16]}",
+            )
+
         return epoch
 
     def close(self) -> None:
         with self._mu:
+            count = 0
             for entry in self._entries.values():
+                if entry.get("vm") is not None:
+                    count += 1
                 self._destroy_entry_vm_locked(entry)
             self._entries.clear()
+
+        self._evt_emit("close", details=f"destroyed_vms={count}", force=True)
 
     def snapshot(self) -> dict:
         with self._mu:
@@ -1213,7 +2602,6 @@ class RandomXVmPool:
                     for idx, entry in self._entries.items()
                 },
             }
-
 
 @dataclass
 class _ThreadState:
@@ -1244,6 +2632,8 @@ class _ThreadState:
     thunk: Any = None
     callback: Any = None
     exec_mode: str = "direct"
+
+    candidate_batch: Optional["_CandidateBatch"] = None
 
 
 class JITWorker:
@@ -1283,8 +2673,11 @@ class JITWorker:
         self._threads: list[threading.Thread] = []
         self._mu = threading.RLock()
 
-        self._dispatch = _JobDispatchCoordinator(hashed_job_start=True)
-        self._selector = _CandidateSelector(max_keep_default=16)
+        self._dispatch = _JobDispatchCoordinator(
+            hashed_job_start=True,
+            logger=self.logger,
+        )
+        self._selector = _CandidateSelector(max_keep_default=16, logger=self.logger)
         self._exec = _HybridExecutionController(
             threads=self.threads,
             logger=self.logger,
@@ -1300,7 +2693,11 @@ class JITWorker:
             dataset_builder=self._dataset_builder,
             logger=self.logger,
         )
-
+        self._round_candidate_batch = _CandidateBatch(
+            owner_key="round-batch",
+            max_keep_default=16,
+            logger=self.logger,
+        )
         self._bootstrap_workers()
 
     def _effective_count(self, requested_count: int) -> int:
@@ -1330,6 +2727,8 @@ class JITWorker:
             return 15
         return 7
 
+    # --- PATCH: bootstrap one worker-local batch per worker ----------------
+
     def _bootstrap_workers(self) -> None:
         jit_version = "unavailable"
         try:
@@ -1345,6 +2744,11 @@ class JITWorker:
                 start_event=threading.Event(),
                 done_event=threading.Event(),
                 stop_event=self._stop,
+                candidate_batch=_CandidateBatch(
+                    owner_key=f"worker-batch-{i}",
+                    max_keep_default=max(8, self.batch_size // 64),
+                    logger=self.logger,
+                ),
             )
             st.callback = self._make_callback(st)
             st.thunk = None
@@ -1363,7 +2767,7 @@ class JITWorker:
         self.logger(
             f"[JITWorker] initialized: threads={self.threads} "
             f"batch_size={self.batch_size} jit_version={jit_version} "
-            f"(hybrid mode: capped thunk lanes + single python_usage lane + vm pool)"
+            f"(hybrid mode: capped thunk lanes + single python_usage lane + vm pool + candidate batches)"
         )
 
     def _make_callback(self, st: _ThreadState):
@@ -1404,8 +2808,24 @@ class JITWorker:
                 is_current = self._dispatch.is_current
                 stale_mask = self._stale_check_mask()
 
+                batch = st.candidate_batch
+                if batch is None:
+                    batch = _CandidateBatch(
+                        owner_key=f"worker-batch-{st.worker_index}",
+                        max_keep_default=max(8, keep_best * 2),
+                        logger=self.logger,
+                    )
+                    st.candidate_batch = batch
+
+                # worker batch can keep a little extra so final round merge
+                # still has room to choose the strongest overall candidates.
+                batch.reset(
+                    job_id=job_id,
+                    generation=my_generation,
+                    requested_keep=max(8, min(128, keep_best * 2)),
+                )
+
                 done = 0
-                local_heap: list[tuple[tuple[int, float, int], dict]] = []
 
                 for i in range(count):
                     if stop_flag.is_set():
@@ -1422,25 +2842,14 @@ class JITWorker:
                     tail64 = int.from_bytes(bytes(out_buf[24:32]), "little", signed=False)
 
                     if tail64 < target64:
-                        h32 = bytes(out_buf)
-                        share_diff_est = float("inf") if tail64 == 0 else float((1 << 64) / tail64)
-
-                        self._keep_local_best(
-                            local_heap,
-                            {
-                                "nonce_u32": nonce_u32,
-                                "hash_hex": h32.hex(),
-                                "tail64": tail64,
-                                "share_diff_est": share_diff_est,
-                            },
-                            keep_best,
+                        # only allocate/copy hash bytes on actual hit
+                        batch.offer(
+                            nonce_u32=nonce_u32,
+                            hash_hex=bytes(out_buf).hex(),
+                            tail64=tail64,
                         )
 
-                st.found = [
-                    item
-                    for _, item in sorted(local_heap, key=lambda x: self._candidate_sort_key(x[1]))
-                ]
-
+                st.found = batch.export(keep_best)
                 st.done_hashes = done
                 return done
 
@@ -1495,12 +2904,12 @@ class JITWorker:
                 st.done_event.set()
 
     def hash_job(
-        self,
-        *,
-        job: "MoneroJob",
-        start_nonce: int,
-        count: int,
-        max_results: int,
+            self,
+            *,
+            job: "MoneroJob",
+            start_nonce: int,
+            count: int,
+            max_results: int,
     ) -> dict:
         count = self._effective_count(count)
         if count <= 0:
@@ -1525,8 +2934,6 @@ class JITWorker:
 
         t0 = time.perf_counter()
 
-        # Eagerly ensure the seed is ready once per job dispatch and warm the VMs
-        # for the workers that will actually participate in this batch.
         try:
             threads = min(self.threads, count)
             active_indices = list(range(threads))
@@ -1546,11 +2953,6 @@ class JITWorker:
         cursor = int(actual_start_nonce) & 0xFFFFFFFF
         active_states: list[_ThreadState] = []
 
-        per_thread_candidate_budget = max(
-            4,
-            min(256, max(1, int(max_results)) * 8),
-        )
-
         for i in range(threads):
             take = per_thread + (1 if i < remainder else 0)
             if take <= 0:
@@ -1558,22 +2960,32 @@ class JITWorker:
 
             st = self._states[i]
             st.assigned_job = job
-            st.assigned_generation = generation
+            st.assigned_generation = int(generation)
             st.assigned_start_nonce = cursor
             st.assigned_count = take
-            st.assigned_max_results = per_thread_candidate_budget
+            st.assigned_max_results = max_results
             st.done_hashes = 0
-
+            st.error = None
             if st.found is None:
                 st.found = []
             else:
                 st.found.clear()
 
-            st.error = None
             st.done_event.clear()
-
-            cursor = (cursor + take) & 0xFFFFFFFF
             active_states.append(st)
+            cursor = (cursor + take) & 0xFFFFFFFF
+
+        for i in range(threads, len(self._states)):
+            st = self._states[i]
+            st.assigned_job = None
+            st.assigned_generation = 0
+            st.assigned_start_nonce = 0
+            st.assigned_count = 0
+            st.assigned_max_results = 0
+            st.done_hashes = 0
+            st.error = None
+            if st.found is not None:
+                st.found.clear()
 
         for st in active_states:
             st.start_event.set()
@@ -1582,17 +2994,24 @@ class JITWorker:
             st.done_event.wait()
 
         hashes_done = 0
-        gathered: list[dict] = []
         errors: list[str] = []
+
+        round_batch = self._round_candidate_batch
+        round_batch.reset(
+            job_id=str(job.job_id),
+            generation=int(generation),
+            requested_keep=max_results,
+        )
 
         for st in active_states:
             hashes_done += int(st.done_hashes or 0)
             if st.found:
-                gathered.extend(st.found)
+                round_batch.merge_items(st.found)
             if st.error:
                 errors.append(f"worker[{st.worker_index}] {st.error}")
 
-        found = self._selector.rank(gathered, max_results=max_results)
+        pre_rank = round_batch.export(max(max_results * 8, 256))
+        found = self._selector.rank(pre_rank, max_results)
 
         return {
             "job_id": job.job_id,
