@@ -531,7 +531,7 @@ class MainWindow(QMainWindow):
         pfl = QFormLayout(gb_perf)
 
         self.sp_threads = QSpinBox()
-        self.sp_threads.setRange(1, 256)
+        self.sp_threads.setRange(1, 100000)
         self.sp_threads.setValue(4)
 
         self.ed_randomx = QLineEdit("")
