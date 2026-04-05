@@ -326,6 +326,1558 @@ class _ClassEventLogMixin:
         else:
             self._evt_write(f"[{self._evt_prefix}] {phrase}")
 
+class _RxHashAdvanceLane(_ClassEventLogMixin):
+    """
+    Advanced worker-local RandomX lane.
+
+    This version is tuned to spam much less:
+    - begin logs are job/gen gated and sampled, not emitted for every new job
+    - begin logs happen at most once per job/gen window
+    - finish logs are suppressed for tiny no-signal slices
+    - hit logs only happen on meaningful improvements
+    - progress logs remain very sparse
+    - error logs stay visible but are throttled harder
+    """
+
+    BEGIN_LOG_EVERY_N_ROUNDS = 6
+    BEGIN_LOG_MIN_EXPECTED_HASHES = 128
+    BEGIN_LOG_FORCE_EXPECTED_HASHES = 4096
+
+    FINISH_LOG_MIN_HASHES = 262144
+    HIT_LOG_MIN_IMPROVEMENT_RATIO = 0.95  # require ~15% improvement after first logged best
+
+    __slots__ = (
+        "worker_index",
+        "owner_key",
+        "_hash_into",
+        "_vm",
+        "_blob_buf",
+        "_out_buf",
+        "_job_id",
+        "_generation",
+        "_target64",
+        "_expected_hashes",
+        "_hashes",
+        "_hits",
+        "_failures",
+        "_consecutive_failures",
+        "_best_tail64",
+        "_best_nonce_u32",
+        "_last_error",
+        "_opened_at",
+        "_active",
+        "_summary_enabled",
+        "_warmed",
+        "_last_logged_job",
+        "_last_logged_generation",
+        "_last_logged_bucket",
+        "_seen_any_begin",
+        "_logged_begin_for_current_round",
+        "_last_hit_logged_tail64",
+    )
+
+    _GLOBAL_EVT_MU = threading.RLock()
+    _GLOBAL_SCOPE_NEXT_AT: dict[tuple, float] = {}
+    _GLOBAL_SCOPE_SUPPRESSED: dict[tuple, int] = {}
+
+    def __init__(
+        self,
+        *,
+        worker_index: Optional[int] = None,
+        owner_key: Optional[str] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.worker_index = None if worker_index is None else int(worker_index)
+        self.owner_key = (
+            str(owner_key)
+            if owner_key is not None
+            else (f"worker-{self.worker_index}" if self.worker_index is not None else "rx-advance")
+        )
+
+        self._hash_into = None
+        self._vm = None
+        self._blob_buf = None
+        self._out_buf = None
+
+        self._job_id = ""
+        self._generation = 0
+        self._target64 = 0xFFFFFFFFFFFFFFFF
+        self._expected_hashes = 0
+
+        self._hashes = 0
+        self._hits = 0
+        self._failures = 0
+        self._consecutive_failures = 0
+        self._best_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = -1
+        self._last_error = ""
+        self._opened_at = 0.0
+        self._active = False
+        self._summary_enabled = False
+        self._warmed = False
+
+        self._last_logged_job = ""
+        self._last_logged_generation = 0
+        self._last_logged_bucket = -1
+        self._seen_any_begin = False
+        self._logged_begin_for_current_round = False
+        self._last_hit_logged_tail64 = 0xFFFFFFFFFFFFFFFF
+
+        self._evt_init(
+            class_prefix="RxHashAdvance",
+            logger=logger,
+            cooldowns={
+                "begin": 30.0,
+                "warmup": 40.0,
+                "progress": 60.0,
+                "hit": 30.0,
+                "error": 60.0,
+                "finish": 30.0,
+                "clear": 60.0,
+            },
+            phrases={
+                "begin": [
+                    "the advanced rx lane aligned with fresh work",
+                    "a smarter hashing lane locked onto the worker",
+                    "the RandomX lane opened onto a new round",
+                ],
+                "warmup": [
+                    "the rx lane warmed its path cleanly",
+                    "the hashing lane completed a quiet warmup",
+                    "the RandomX lane primed itself successfully",
+                ],
+                "progress": [
+                    "the rx lane has been chewing steadily",
+                    "the hashing lane built real distance",
+                    "the worker kept the advanced lane moving",
+                ],
+                "hit": [
+                    "the lane surfaced a cleaner hit",
+                    "a sharper tail64 rose out of the rx lane",
+                    "the hashing lane found a better result",
+                ],
+                "error": [
+                    "the advanced rx lane caught a hashing fault",
+                    "the hashing lane tripped and surfaced an error",
+                    "the rx lane broke stride and raised a failure",
+                ],
+                "finish": [
+                    "the advanced rx lane wrapped a useful slice",
+                    "the hashing lane closed out a productive pass",
+                    "the RandomX lane settled after its run",
+                ],
+                "clear": [
+                    "the advanced rx lane cooled back to idle",
+                    "the hashing lane stepped down from live work",
+                    "the active rx lane was released",
+                ],
+            },
+        )
+
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    @staticmethod
+    def _u64(v: int) -> int:
+        return int(v) & 0xFFFFFFFFFFFFFFFF
+
+    @staticmethod
+    def _tail64_fast(out_buf) -> int:
+        return (
+            int(out_buf[24])
+            | (int(out_buf[25]) << 8)
+            | (int(out_buf[26]) << 16)
+            | (int(out_buf[27]) << 24)
+            | (int(out_buf[28]) << 32)
+            | (int(out_buf[29]) << 40)
+            | (int(out_buf[30]) << 48)
+            | (int(out_buf[31]) << 56)
+        )
+
+    @staticmethod
+    def _count_bucket(count: int) -> int:
+        count = max(0, int(count))
+        if count <= 0:
+            return 0
+        if count <= 8:
+            return 8
+        if count <= 16:
+            return 16
+        if count <= 32:
+            return 32
+        if count <= 64:
+            return 64
+        if count <= 128:
+            return 128
+        if count <= 256:
+            return 256
+        if count <= 512:
+            return 512
+        if count <= 1024:
+            return 1024
+        if count <= 4096:
+            return 4096
+        return 16384
+
+    def _scoped_evt_emit(
+        self,
+        key: str,
+        *,
+        scope_key: tuple,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        force: bool = False,
+        phrases: Optional[list[str]] = None,
+    ) -> bool:
+        now = time.perf_counter()
+        cd = float(self._evt_cooldowns.get(key, 45.0 if cooldown is None else cooldown))
+
+        suppressed = 0
+        with self._GLOBAL_EVT_MU:
+            next_at = float(self._GLOBAL_SCOPE_NEXT_AT.get(scope_key, 0.0))
+            if not force and now < next_at:
+                self._GLOBAL_SCOPE_SUPPRESSED[scope_key] = int(
+                    self._GLOBAL_SCOPE_SUPPRESSED.get(scope_key, 0)
+                ) + 1
+                return False
+
+            suppressed = int(self._GLOBAL_SCOPE_SUPPRESSED.pop(scope_key, 0))
+            self._GLOBAL_SCOPE_NEXT_AT[scope_key] = now + cd
+
+        phrase = self._evt_pick(key, phrases)
+        extra = f" suppressed={suppressed}" if suppressed > 0 else ""
+        if details:
+            self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}{extra}")
+        else:
+            self._evt_write(f"[{self._evt_prefix}] {phrase}{extra}")
+        return True
+
+    def _job_evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        force: bool = False,
+        phrases: Optional[list[str]] = None,
+    ) -> bool:
+        return self._scoped_evt_emit(
+            key,
+            scope_key=(self._evt_prefix, "job", key, self._job_id, int(self._generation)),
+            details=details,
+            cooldown=cooldown,
+            force=force,
+            phrases=phrases,
+        )
+
+    def _owner_evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        force: bool = False,
+        phrases: Optional[list[str]] = None,
+    ) -> bool:
+        return self._scoped_evt_emit(
+            key,
+            scope_key=(self._evt_prefix, "owner", key, self.owner_key),
+            details=details,
+            cooldown=cooldown,
+            force=force,
+            phrases=phrases,
+        )
+
+    def _class_evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        force: bool = False,
+        phrases: Optional[list[str]] = None,
+    ) -> bool:
+        return self._scoped_evt_emit(
+            key,
+            scope_key=(self._evt_prefix, "class", key),
+            details=details,
+            cooldown=cooldown,
+            force=force,
+            phrases=phrases,
+        )
+
+    def _should_sample_begin_round(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        expected_hashes: int,
+        force_log: bool,
+    ) -> bool:
+        if force_log:
+            return True
+
+        expected_hashes = max(0, int(expected_hashes))
+
+        if expected_hashes < self.BEGIN_LOG_MIN_EXPECTED_HASHES:
+            return False
+
+        if expected_hashes >= self.BEGIN_LOG_FORCE_EXPECTED_HASHES:
+            return True
+
+        raw = f"{job_id}|{int(generation)}".encode("utf-8", "ignore")
+        hv = int.from_bytes(hashlib.blake2s(raw, digest_size=8).digest(), "little", signed=False)
+        return (hv % int(self.BEGIN_LOG_EVERY_N_ROUNDS)) == 0
+
+    def begin(
+        self,
+        *,
+        hash_into,
+        vm,
+        blob_buf,
+        out_buf,
+        job_id: str,
+        generation: int,
+        target64: int,
+        expected_hashes: int,
+        enable_summary_log: bool = False,
+        force_log: bool = False,
+    ) -> None:
+        self._hash_into = hash_into
+        self._vm = vm
+        self._blob_buf = blob_buf
+        self._out_buf = out_buf
+        self._job_id = str(job_id)
+        self._generation = int(generation)
+        self._target64 = self._u64(target64)
+        self._expected_hashes = max(0, int(expected_hashes))
+
+        self._hashes = 0
+        self._hits = 0
+        self._failures = 0
+        self._consecutive_failures = 0
+        self._best_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = -1
+        self._last_error = ""
+        self._opened_at = time.perf_counter()
+        self._active = True
+        self._summary_enabled = bool(enable_summary_log)
+        self._warmed = False
+        self._last_hit_logged_tail64 = 0xFFFFFFFFFFFFFFFF
+
+        bucket = self._count_bucket(self._expected_hashes)
+        round_changed = (
+            (self._job_id != self._last_logged_job)
+            or (self._generation != self._last_logged_generation)
+            or (bucket != self._last_logged_bucket)
+        )
+
+        if round_changed:
+            self._logged_begin_for_current_round = False
+
+        should_attempt_begin = (
+            force_log
+            or (
+                round_changed
+                and not self._logged_begin_for_current_round
+                and self._should_sample_begin_round(
+                    job_id=self._job_id,
+                    generation=self._generation,
+                    expected_hashes=self._expected_hashes,
+                    force_log=force_log,
+                )
+            )
+        )
+
+        if should_attempt_begin:
+            emitted = self._job_evt_emit(
+                "begin",
+                details=(
+                    f"job={self._job_id} gen={self._generation} "
+                    f"owner={self.owner_key} expected={self._expected_hashes}"
+                ),
+                cooldown=60.0,
+                force=force_log,
+            )
+            if emitted:
+                self._logged_begin_for_current_round = True
+
+        self._last_logged_job = self._job_id
+        self._last_logged_generation = self._generation
+        self._last_logged_bucket = bucket
+        self._seen_any_begin = True
+
+    def warmup(self) -> None:
+        if not self._active or self._hash_into is None:
+            raise RuntimeError("RxHashAdvanceLane is not active")
+
+        if self._warmed:
+            return
+
+        try:
+            self._hash_into(self._vm, self._blob_buf, self._out_buf)
+        except Exception as e:
+            self._failures += 1
+            self._consecutive_failures += 1
+            self._last_error = f"{type(e).__name__}: {e}"
+            self._class_evt_emit(
+                "error",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                    f"phase=warmup failures={self._failures} err={self._last_error[:220]}"
+                ),
+                cooldown=90.0,
+            )
+            raise
+
+        self._warmed = True
+        self._owner_evt_emit(
+            "warmup",
+            details=f"owner={self.owner_key} job={self._job_id} gen={self._generation}",
+            cooldown=80.0,
+        )
+
+    def hash_once(self) -> int:
+        if not self._active or self._hash_into is None:
+            raise RuntimeError("RxHashAdvanceLane is not active")
+
+        try:
+            self._hash_into(self._vm, self._blob_buf, self._out_buf)
+        except Exception as e:
+            self._failures += 1
+            self._consecutive_failures += 1
+            self._last_error = f"{type(e).__name__}: {e}"
+            self._class_evt_emit(
+                "error",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                    f"failures={self._failures} consecutive={self._consecutive_failures} "
+                    f"err={self._last_error[:220]}"
+                ),
+                cooldown=90.0,
+            )
+            raise
+
+        self._hashes += 1
+        self._consecutive_failures = 0
+
+        if self._hashes in (262144, 1048576, 4194304, 16777216):
+            elapsed = max(1e-9, time.perf_counter() - self._opened_at)
+            self._owner_evt_emit(
+                "progress",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                    f"hashes={self._hashes} hps={(self._hashes / elapsed):.2f}"
+                ),
+                cooldown=120.0,
+            )
+
+        return self._tail64_fast(self._out_buf)
+
+    def hash_loop(
+        self,
+        *,
+        count: int,
+        write_next_nonce,
+        batch,
+        stop_flag,
+        stale_mask: int,
+        is_current,
+        job_id: str,
+        generation: int,
+    ) -> int:
+        done = 0
+        target64 = self._target64
+        out_buf = self._out_buf
+
+        for i in range(max(0, int(count))):
+            if stop_flag.is_set():
+                break
+
+            if (i & stale_mask) == 0 and not is_current(job_id, generation):
+                break
+
+            nonce_u32 = write_next_nonce()
+            tail64 = self.hash_once()
+            done += 1
+
+            if tail64 < target64:
+                self._hits += 1
+                if tail64 < self._best_tail64:
+                    old_best = self._best_tail64
+                    self._best_tail64 = tail64
+                    self._best_nonce_u32 = int(nonce_u32)
+
+                    should_log_hit = False
+                    if self._summary_enabled:
+                        if self._last_hit_logged_tail64 == 0xFFFFFFFFFFFFFFFF:
+                            should_log_hit = True
+                        elif old_best < 0xFFFFFFFFFFFFFFFF:
+                            should_log_hit = (
+                                float(tail64) <= float(old_best) * self.HIT_LOG_MIN_IMPROVEMENT_RATIO
+                            )
+
+                    if should_log_hit:
+                        emitted = self._owner_evt_emit(
+                            "hit",
+                            details=(
+                                f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                                f"hits={self._hits} best_nonce={int(nonce_u32)} best_tail64={int(tail64)}"
+                            ),
+                            cooldown=60.0,
+                        )
+                        if emitted:
+                            self._last_hit_logged_tail64 = int(tail64)
+
+                batch.offer(
+                    nonce_u32=nonce_u32,
+                    hash_hex=bytes(out_buf).hex(),
+                    tail64=tail64,
+                )
+
+        return done
+
+    def finish(self, *, done_hashes: Optional[int] = None) -> None:
+        done = self._hashes if done_hashes is None else max(0, int(done_hashes))
+        elapsed = max(0.0, time.perf_counter() - self._opened_at)
+        hps = (float(done) / elapsed) if elapsed > 0.0 else 0.0
+
+        should_log_finish = (
+            self._summary_enabled
+            and (
+                self._hits > 0
+                or self._failures > 0
+                or done >= self.FINISH_LOG_MIN_HASHES
+            )
+        )
+
+        if should_log_finish:
+            self._job_evt_emit(
+                "finish",
+                details=(
+                    f"job={self._job_id} gen={self._generation} "
+                    f"owner={self.owner_key} done={done} hits={self._hits} failures={self._failures} "
+                    f"best_nonce={self._best_nonce_u32} best_tail64={self._best_tail64} "
+                    f"elapsed={elapsed:.6f}s hps={hps:.2f}"
+                ),
+                cooldown=60.0,
+            )
+
+        self._active = False
+
+    def clear(self) -> None:
+        had_state = self._active or self._hashes > 0 or self._failures > 0
+
+        old_job = self._job_id
+        old_generation = self._generation
+        old_hashes = self._hashes
+        old_hits = self._hits
+        old_failures = self._failures
+
+        self._hash_into = None
+        self._vm = None
+        self._blob_buf = None
+        self._out_buf = None
+        self._job_id = ""
+        self._generation = 0
+        self._target64 = 0xFFFFFFFFFFFFFFFF
+        self._expected_hashes = 0
+        self._hashes = 0
+        self._hits = 0
+        self._failures = 0
+        self._consecutive_failures = 0
+        self._best_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = -1
+        self._last_error = ""
+        self._opened_at = 0.0
+        self._active = False
+        self._summary_enabled = False
+        self._warmed = False
+        self._last_hit_logged_tail64 = 0xFFFFFFFFFFFFFFFF
+
+        if had_state and (old_hashes >= 1048576 or old_failures > 0 or old_hits > 0):
+            self._owner_evt_emit(
+                "clear",
+                details=(
+                    f"owner={self.owner_key} last_job={old_job} "
+                    f"last_gen={old_generation} hashes={old_hashes} "
+                    f"hits={old_hits} failures={old_failures}"
+                ),
+                cooldown=120.0,
+            )
+
+    def snapshot(self) -> dict:
+        elapsed = max(0.0, time.perf_counter() - self._opened_at) if self._opened_at > 0.0 else 0.0
+        hps = (float(self._hashes) / elapsed) if elapsed > 0.0 else 0.0
+        return {
+            "owner_key": self.owner_key,
+            "worker_index": self.worker_index,
+            "job_id": self._job_id,
+            "generation": self._generation,
+            "expected_hashes": self._expected_hashes,
+            "hashes": self._hashes,
+            "hits": self._hits,
+            "failures": self._failures,
+            "consecutive_failures": self._consecutive_failures,
+            "best_tail64": self._best_tail64,
+            "best_nonce_u32": self._best_nonce_u32,
+            "last_error": self._last_error,
+            "elapsed_sec": elapsed,
+            "hps_est": hps,
+            "active": self._active,
+        }
+
+class _Tail64Probe(_ClassEventLogMixin):
+    """
+    Hot-path-safe tail64 reader for RandomX output buffers.
+
+    Design goals:
+    - take tail64 extraction out of the callback body
+    - do not blow up logs
+    - avoid bytes(out_buf[24:32]) allocation in the hot loop
+    - keep logging limited to rare anomalies / rare summaries
+    - preserve a clean per-worker object model like the other helpers
+
+    Intended usage:
+        probe.begin(job_id=..., generation=..., target64=...)
+        read_tail64 = probe.read_tail64
+
+        for ...:
+            rx_hash_into(...)
+            tail64 = read_tail64(out_buf)
+            if tail64 < target64:
+                probe.note_hit(nonce_u32=nonce_u32, tail64=tail64)
+                ...
+
+        probe.finish(done_hashes=done)
+    """
+
+    __slots__ = (
+        "worker_index",
+        "owner_key",
+        "_job_id",
+        "_generation",
+        "_target64",
+        "_reads",
+        "_hits",
+        "_bad_reads",
+        "_best_tail64",
+        "_best_nonce_u32",
+        "_best_logged_tail64",
+        "_summary_enabled",
+        "_active",
+    )
+
+    _GLOBAL_EVT_MU = threading.RLock()
+    _GLOBAL_EVT_NEXT_AT: dict[tuple[str, str], float] = {}
+    _GLOBAL_EVT_SUPPRESSED: dict[tuple[str, str], int] = {}
+
+    def __init__(
+        self,
+        *,
+        worker_index: Optional[int] = None,
+        owner_key: Optional[str] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.worker_index = None if worker_index is None else int(worker_index)
+        self.owner_key = (
+            str(owner_key)
+            if owner_key is not None
+            else (f"worker-{self.worker_index}" if self.worker_index is not None else "tail64-probe")
+        )
+
+        self._job_id = ""
+        self._generation = 0
+        self._target64 = 0xFFFFFFFFFFFFFFFF
+        self._reads = 0
+        self._hits = 0
+        self._bad_reads = 0
+        self._best_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = -1
+        self._best_logged_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._summary_enabled = False
+        self._active = False
+
+        self._evt_init(
+            class_prefix="Tail64Probe",
+            logger=logger,
+            cooldowns={
+                "bad_read": 120.0,
+                "best_hit": 30.0,
+                "summary": 60.0,
+                "clear": 120.0,
+            },
+            phrases={
+                "bad_read": [
+                    "the tail reader stepped around a malformed buffer",
+                    "tail64 extraction hit an unexpected buffer shape",
+                    "the tail probe caught a bad output frame",
+                    "a broken tail64 read was safely discarded",
+                ],
+                "best_hit": [
+                    "a sharper tail64 surfaced on this lane",
+                    "the worker found a better tail64 than before",
+                    "a cleaner tail64 rose to the top of this run",
+                    "the tail probe saw a new personal best",
+                ],
+                "summary": [
+                    "the tail reader wrapped up a useful run",
+                    "tail64 tracking settled out for this slice",
+                    "the tail probe finished a productive pass",
+                    "this tail64 pass came in with useful signal",
+                ],
+                "clear": [
+                    "the tail probe cooled back to idle",
+                    "tail64 tracking was released",
+                    "the active tail reader stood down",
+                    "tail64 state went quiet again",
+                ],
+            },
+        )
+
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    @staticmethod
+    def _u64(v: int) -> int:
+        return int(v) & 0xFFFFFFFFFFFFFFFF
+
+    def _global_evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        phrases: Optional[list[str]] = None,
+        force: bool = False,
+        global_scope: str = "class",
+    ) -> None:
+        gate = (self._evt_prefix, str(key)) if global_scope == "class" else (self.owner_key, str(key))
+
+        now = time.perf_counter()
+        cd = float(
+            self._evt_cooldowns.get(
+                key,
+                45.0 if cooldown is None else cooldown,
+            )
+        )
+
+        suppressed = 0
+        with self._GLOBAL_EVT_MU:
+            next_at = float(self._GLOBAL_EVT_NEXT_AT.get(gate, 0.0))
+            if not force and now < next_at:
+                self._GLOBAL_EVT_SUPPRESSED[gate] = int(self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)) + 1
+                return
+
+            suppressed = int(self._GLOBAL_EVT_SUPPRESSED.pop(gate, 0))
+            self._GLOBAL_EVT_NEXT_AT[gate] = now + cd
+
+        phrase = self._evt_pick(key, phrases)
+        extra = f" suppressed={suppressed}" if suppressed > 0 else ""
+        if details:
+            self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}{extra}")
+        else:
+            self._evt_write(f"[{self._evt_prefix}] {phrase}{extra}")
+
+    def begin(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        target64: int,
+        enable_summary_log: bool = False,
+    ) -> None:
+        self._job_id = str(job_id)
+        self._generation = int(generation)
+        self._target64 = self._u64(target64)
+        self._reads = 0
+        self._hits = 0
+        self._bad_reads = 0
+        self._best_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = -1
+        self._best_logged_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._summary_enabled = bool(enable_summary_log)
+        self._active = True
+
+    @staticmethod
+    def _read_tail64_fast(out_buf) -> int:
+        """
+        Read bytes 24..31 little-endian without allocating bytes(...).
+
+        Safe assumption here:
+        - out_buf is the 32-byte RandomX hash output buffer already used in the worker.
+        """
+        return (
+            int(out_buf[24])
+            | (int(out_buf[25]) << 8)
+            | (int(out_buf[26]) << 16)
+            | (int(out_buf[27]) << 24)
+            | (int(out_buf[28]) << 32)
+            | (int(out_buf[29]) << 40)
+            | (int(out_buf[30]) << 48)
+            | (int(out_buf[31]) << 56)
+        )
+
+    def read_tail64(self, out_buf) -> int:
+        """
+        Hot-path reader.
+        No normal logging here.
+        Only rare anomaly logging if the buffer is not readable.
+        """
+        try:
+            tail64 = self._read_tail64_fast(out_buf)
+        except Exception:
+            self._bad_reads += 1
+            self._global_evt_emit(
+                "bad_read",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} bad_reads={self._bad_reads}"
+                ),
+                global_scope="class",
+            )
+            return 0xFFFFFFFFFFFFFFFF
+
+        self._reads += 1
+
+        if tail64 < self._best_tail64:
+            self._best_tail64 = int(tail64)
+
+        return int(tail64)
+
+    def note_hit(self, *, nonce_u32: int, tail64: int) -> None:
+        """
+        Call only on actual hits, not on every hash.
+        This keeps logging off the normal hot path.
+        """
+        self._hits += 1
+        nonce_u32 = self._u32(nonce_u32)
+        tail64 = self._u64(tail64)
+
+        if tail64 < self._best_tail64:
+            self._best_tail64 = tail64
+            self._best_nonce_u32 = int(nonce_u32)
+        elif self._best_nonce_u32 < 0:
+            self._best_nonce_u32 = int(nonce_u32)
+
+        if not self._summary_enabled:
+            return
+
+        # only log rare, real improvements
+        if tail64 < self._best_logged_tail64:
+            self._best_logged_tail64 = tail64
+            self._global_evt_emit(
+                "best_hit",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} hits={self._hits} "
+                    f"best_nonce={nonce_u32} best_tail64={tail64}"
+                ),
+                global_scope="owner",
+            )
+
+    def finish(self, *, done_hashes: int) -> None:
+        done_hashes = max(0, int(done_hashes))
+
+        if self._summary_enabled and (self._hits > 0 or self._bad_reads > 0):
+            self._global_evt_emit(
+                "summary",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} reads={self._reads} "
+                    f"done={done_hashes} hits={self._hits} "
+                    f"bad_reads={self._bad_reads} "
+                    f"best_nonce={self._best_nonce_u32} "
+                    f"best_tail64={self._best_tail64}"
+                ),
+                global_scope="owner",
+            )
+
+        self._active = False
+
+    def clear(self) -> None:
+        had_state = self._active or self._reads > 0 or self._hits > 0 or self._bad_reads > 0
+
+        old_job = self._job_id
+        old_generation = self._generation
+        old_reads = self._reads
+        old_hits = self._hits
+
+        self._job_id = ""
+        self._generation = 0
+        self._target64 = 0xFFFFFFFFFFFFFFFF
+        self._reads = 0
+        self._hits = 0
+        self._bad_reads = 0
+        self._best_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = -1
+        self._best_logged_tail64 = 0xFFFFFFFFFFFFFFFF
+        self._summary_enabled = False
+        self._active = False
+
+        if had_state and (old_hits > 0 or old_reads >= 1048576):
+            self._global_evt_emit(
+                "clear",
+                details=(
+                    f"owner={self.owner_key} last_job={old_job} "
+                    f"last_gen={old_generation} reads={old_reads} hits={old_hits}"
+                ),
+                global_scope="owner",
+            )
+
+    def snapshot(self) -> dict:
+        return {
+            "owner_key": self.owner_key,
+            "worker_index": self.worker_index,
+            "job_id": self._job_id,
+            "generation": self._generation,
+            "target64": self._target64,
+            "reads": self._reads,
+            "hits": self._hits,
+            "bad_reads": self._bad_reads,
+            "best_tail64": self._best_tail64,
+            "best_nonce_u32": self._best_nonce_u32,
+            "active": self._active,
+        }
+
+class _NonceStrideWriter(_ClassEventLogMixin):
+    """
+    Per-worker nonce stream writer for the RandomX hot loop.
+
+    Logging policy:
+    - no log on every bind
+    - no log on every slice refresh
+    - bind logs only when:
+        * first bind for this writer
+        * job/generation changes
+        * stride changes
+        * count shape changes materially
+        * forced explicitly
+    - progress logs are sparse and globally throttled
+    - wrap logs are globally throttled
+    - clear logs are suppressed unless the writer actually did work
+    """
+
+    __slots__ = (
+        "worker_index",
+        "owner_key",
+        "_nonce_ptr",
+        "_job_id",
+        "_generation",
+        "_start_nonce",
+        "_next_nonce",
+        "_stride",
+        "_count",
+        "_writes",
+        "_wraps",
+        "_last_nonce",
+        "_bound",
+        "_seen_any_bind",
+        "_last_bind_sig",
+        "_last_logged_job",
+        "_last_logged_generation",
+        "_last_logged_stride",
+        "_last_logged_count_bucket",
+    )
+
+    _GLOBAL_EVT_MU = threading.RLock()
+    _GLOBAL_EVT_NEXT_AT: dict[tuple[str, str], float] = {}
+    _GLOBAL_EVT_SUPPRESSED: dict[tuple[str, str], int] = {}
+
+    def __init__(
+        self,
+        *,
+        worker_index: Optional[int] = None,
+        owner_key: Optional[str] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.worker_index = None if worker_index is None else int(worker_index)
+        self.owner_key = (
+            str(owner_key)
+            if owner_key is not None
+            else (f"worker-{self.worker_index}" if self.worker_index is not None else "nonce-writer")
+        )
+
+        self._nonce_ptr = None
+        self._job_id = ""
+        self._generation = 0
+        self._start_nonce = 0
+        self._next_nonce = 0
+        self._stride = 1
+        self._count = 0
+        self._writes = 0
+        self._wraps = 0
+        self._last_nonce: Optional[int] = None
+        self._bound = False
+
+        self._seen_any_bind = False
+        self._last_bind_sig: Optional[tuple] = None
+        self._last_logged_job = ""
+        self._last_logged_generation = 0
+        self._last_logged_stride = 0
+        self._last_logged_count_bucket = -1
+
+        self._evt_init(
+            class_prefix="NonceStrideWriter",
+            logger=logger,
+            cooldowns={
+                "bind": 45.0,
+                "wrap": 60.0,
+                "progress": 90.0,
+                "clear": 120.0,
+            },
+            phrases={
+                "bind": [
+                    "nonce lane aligned with fresh work",
+                    "the writer settled onto a new nonce shape",
+                    "nonce ownership shifted onto a new slice",
+                    "the nonce stream re-formed around new work",
+                ],
+                "wrap": [
+                    "the nonce stream crossed the uint32 seam",
+                    "nonce space wrapped under load",
+                    "the writer rolled across the 32-bit edge",
+                    "the nonce lane looped through its boundary",
+                ],
+                "progress": [
+                    "the nonce lane has been advancing steadily",
+                    "the writer has been chewing through a long run",
+                    "nonce stepping continues through active work",
+                    "the writer has built up real distance on this lane",
+                ],
+                "clear": [
+                    "the nonce writer cooled back to idle",
+                    "the active nonce stream was released",
+                    "the writer stepped down from live work",
+                    "nonce ownership went quiet again",
+                ],
+            },
+        )
+
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    @staticmethod
+    def _count_bucket(count: int) -> int:
+        count = max(0, int(count))
+        if count <= 0:
+            return 0
+        if count <= 8:
+            return 8
+        if count <= 16:
+            return 16
+        if count <= 32:
+            return 32
+        if count <= 64:
+            return 64
+        if count <= 128:
+            return 128
+        if count <= 256:
+            return 256
+        if count <= 512:
+            return 512
+        return 1024
+
+    def _global_evt_emit(
+        self,
+        key: str,
+        *,
+        details: str = "",
+        cooldown: Optional[float] = None,
+        phrases: Optional[list[str]] = None,
+        force: bool = False,
+        global_scope: str = "class",
+    ) -> None:
+        if global_scope == "owner":
+            gate = (self.owner_key, str(key))
+        else:
+            gate = (self._evt_prefix, str(key))
+
+        now = time.perf_counter()
+        cd = float(
+            self._evt_cooldowns.get(
+                key,
+                45.0 if cooldown is None else cooldown,
+            )
+        )
+
+        suppressed = 0
+        with self._GLOBAL_EVT_MU:
+            next_at = float(self._GLOBAL_EVT_NEXT_AT.get(gate, 0.0))
+            if not force and now < next_at:
+                self._GLOBAL_EVT_SUPPRESSED[gate] = int(self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)) + 1
+                return
+
+            suppressed = int(self._GLOBAL_EVT_SUPPRESSED.pop(gate, 0))
+            self._GLOBAL_EVT_NEXT_AT[gate] = now + cd
+
+        phrase = self._evt_pick(key, phrases)
+        extra = f" suppressed={suppressed}" if suppressed > 0 else ""
+        if details:
+            self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}{extra}")
+        else:
+            self._evt_write(f"[{self._evt_prefix}] {phrase}{extra}")
+
+    def _should_log_bind(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        stride: int,
+        count: int,
+        force_log: bool,
+    ) -> bool:
+        if force_log:
+            return True
+
+        count_bucket = self._count_bucket(count)
+
+        if not self._seen_any_bind:
+            return True
+
+        if job_id != self._last_logged_job:
+            return True
+
+        if int(generation) != self._last_logged_generation:
+            return True
+
+        if int(stride) != self._last_logged_stride:
+            return True
+
+        if count_bucket != self._last_logged_count_bucket:
+            return True
+
+        return False
+
+    def bind(
+        self,
+        *,
+        nonce_ptr,
+        start_nonce: int,
+        stride: int,
+        count: int,
+        job_id: str = "",
+        generation: int = 0,
+        force_log: bool = False,
+    ) -> None:
+        job_id = str(job_id)
+        generation = int(generation)
+        start_nonce = self._u32(start_nonce)
+        stride = max(1, int(stride))
+        count = max(0, int(count))
+
+        bind_sig = (job_id, generation, start_nonce, stride, count)
+
+        self._nonce_ptr = nonce_ptr
+        self._job_id = job_id
+        self._generation = generation
+        self._start_nonce = start_nonce
+        self._next_nonce = start_nonce
+        self._stride = stride
+        self._count = count
+        self._writes = 0
+        self._wraps = 0
+        self._last_nonce = None
+        self._bound = True
+
+        if count <= 0:
+            self._last_bind_sig = bind_sig
+            return
+
+        should_log = self._should_log_bind(
+            job_id=job_id,
+            generation=generation,
+            stride=stride,
+            count=count,
+            force_log=force_log,
+        )
+
+        if should_log:
+            self._global_evt_emit(
+                "bind",
+                details=(
+                    f"owner={self.owner_key} job={job_id} "
+                    f"gen={generation} start={start_nonce} "
+                    f"stride={stride} count={count}"
+                ),
+                force=force_log,
+                global_scope="class",
+            )
+            self._last_logged_job = job_id
+            self._last_logged_generation = generation
+            self._last_logged_stride = stride
+            self._last_logged_count_bucket = self._count_bucket(count)
+
+        self._seen_any_bind = True
+        self._last_bind_sig = bind_sig
+
+    def clear(self) -> None:
+        had_work = self._bound and (self._count > 0 or self._writes > 0)
+
+        old_job = self._job_id
+        old_generation = self._generation
+        old_writes = self._writes
+        old_wraps = self._wraps
+
+        self._nonce_ptr = None
+        self._job_id = ""
+        self._generation = 0
+        self._start_nonce = 0
+        self._next_nonce = 0
+        self._stride = 1
+        self._count = 0
+        self._writes = 0
+        self._wraps = 0
+        self._last_nonce = None
+        self._bound = False
+
+        if had_work and (old_writes >= 65536 or old_wraps > 0):
+            self._global_evt_emit(
+                "clear",
+                details=(
+                    f"owner={self.owner_key} last_job={old_job} "
+                    f"last_gen={old_generation} writes={old_writes} wraps={old_wraps}"
+                ),
+                global_scope="owner",
+            )
+
+    def write_next(self) -> int:
+        """
+        Hot-path method.
+        Writes the next nonce into nonce_ptr[0] and returns it.
+
+        Keeps the fast path unchanged except for the stored rolling next_nonce.
+        """
+        if not self._bound or self._nonce_ptr is None:
+            raise RuntimeError("NonceStrideWriter is not bound")
+
+        nonce_u32 = self._next_nonce
+        self._nonce_ptr[0] = nonce_u32
+
+        next_nonce = (nonce_u32 + self._stride) & 0xFFFFFFFF
+        self._next_nonce = next_nonce
+        self._writes += 1
+
+        if next_nonce < nonce_u32:
+            self._wraps += 1
+            self._global_evt_emit(
+                "wrap",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} wraps={self._wraps} "
+                    f"last_nonce={nonce_u32} next_nonce={next_nonce} stride={self._stride}"
+                ),
+                global_scope="class",
+            )
+
+        self._last_nonce = nonce_u32
+
+        if self._writes in (65536, 262144, 1048576, 4194304):
+            self._global_evt_emit(
+                "progress",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} writes={self._writes} "
+                    f"last_nonce={nonce_u32} stride={self._stride}"
+                ),
+                global_scope="owner",
+            )
+
+        return nonce_u32
+
+    def nonce_for_index(self, i: int) -> int:
+        i = max(0, int(i))
+        return (self._start_nonce + (i * self._stride)) & 0xFFFFFFFF
+
+    def snapshot(self) -> dict:
+        return {
+            "owner_key": self.owner_key,
+            "worker_index": self.worker_index,
+            "job_id": self._job_id,
+            "generation": self._generation,
+            "start_nonce": self._start_nonce,
+            "next_nonce": self._next_nonce,
+            "stride": self._stride,
+            "count": self._count,
+            "writes": self._writes,
+            "wraps": self._wraps,
+            "last_nonce": self._last_nonce,
+            "bound": self._bound,
+        }
+
+class _ShareDiversityCoordinator(_ClassEventLogMixin):
+    """
+    Final-stage diversity chooser for JITWorker.
+
+    Why this helps:
+    - does not basic-dedupe every repeated proof forever
+    - remembers recently returned proofs for a short TTL
+    - softly prefers different nonce stripes before returning the same proof again
+    - keeps tail64 as the main quality signal
+    """
+
+    def __init__(
+        self,
+        *,
+        logger: Optional[Callable[[str], None]] = None,
+        ttl_ms: float = 18000.0,
+        max_recent: int = 8192,
+        stripe_shift: int = 12,
+    ) -> None:
+        self.logger = logger or (lambda s: None)
+        self.ttl_ms = max(1000.0, float(ttl_ms))
+        self.max_recent = max(128, int(max_recent))
+        self.stripe_shift = max(6, int(stripe_shift))
+
+        self._mu = threading.RLock()
+        self._recent: dict[str, tuple[float, int]] = {}  # proof_key -> (seen_at, count)
+        self._last_job_id: str = ""
+        self._last_generation: int = 0
+
+        self._evt_init(
+            class_prefix="ShareDiversity",
+            logger=self.logger,
+            cooldowns={
+                "round": 30.0,
+                "recent": 45.0,
+                "stripe": 45.0,
+                "picked": 20.0,
+                "prune": 60.0,
+            },
+            phrases={
+                "round": [
+                    "a new return-shaping round opened",
+                    "diversity tracking woke onto fresh work",
+                    "the share-return shaper stepped into a new round",
+                ],
+                "recent": [
+                    "recent proofs were held back briefly",
+                    "the same proof trail was cooled off",
+                    "fresh candidates were favored over echoes",
+                ],
+                "stripe": [
+                    "nonce lanes were spread across the return set",
+                    "the returned set reached across multiple nonce stripes",
+                    "the selector leaned toward a wider nonce footprint",
+                ],
+                "picked": [
+                    "a sharper diverse set rolled out",
+                    "the round returned a more varied hit set",
+                    "diversity shaping pushed a cleaner result set forward",
+                ],
+                "prune": [
+                    "old return memory was swept away",
+                    "stale proof memory was trimmed back",
+                    "expired diversity memory was cleared",
+                ],
+            },
+        )
+
+    @staticmethod
+    def _u32(v: int) -> int:
+        return int(v) & 0xFFFFFFFF
+
+    @staticmethod
+    def _u64(v: int) -> int:
+        return int(v) & 0xFFFFFFFFFFFFFFFF
+
+    @staticmethod
+    def _norm_hash_hex(v: Any) -> str:
+        return str(v or "").strip().lower()
+
+    def _now(self) -> float:
+        return time.perf_counter()
+
+    def _proof_key(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        nonce_u32: int,
+        hash_hex: str,
+    ) -> str:
+        raw = (
+            f"{job_id}|{int(generation)}|{int(nonce_u32) & 0xFFFFFFFF}|{self._norm_hash_hex(hash_hex)}"
+        ).encode("utf-8", "ignore")
+        return hashlib.blake2s(raw, digest_size=16).hexdigest()
+
+    def _prune_locked(self) -> None:
+        now = self._now()
+        ttl_sec = self.ttl_ms / 1000.0
+
+        if not self._recent:
+            return
+
+        doomed = [k for k, (ts, _count) in self._recent.items() if (now - ts) >= ttl_sec]
+        for k in doomed:
+            self._recent.pop(k, None)
+
+        if len(self._recent) > self.max_recent:
+            ordered = sorted(self._recent.items(), key=lambda kv: (float(kv[1][0]), int(kv[1][1])))
+            drop_n = len(self._recent) - self.max_recent
+            for k, _ in ordered[:drop_n]:
+                self._recent.pop(k, None)
+
+        if doomed:
+            self._evt_emit("prune", details=f"expired={len(doomed)} kept={len(self._recent)}")
+
+    def begin_round(self, *, job_id: str, generation: int) -> None:
+        job_id = str(job_id)
+        generation = int(generation)
+
+        with self._mu:
+            if self._last_job_id != job_id or self._last_generation != generation:
+                self._last_job_id = job_id
+                self._last_generation = generation
+                self._evt_emit(
+                    "round",
+                    details=f"job={job_id} gen={generation}",
+                )
+            self._prune_locked()
+
+    def pick(
+        self,
+        *,
+        job_id: str,
+        generation: int,
+        candidates: list[dict],
+        max_results: int,
+    ) -> list[dict]:
+        keep = max(1, int(max_results))
+        if not candidates:
+            return []
+
+        job_id = str(job_id)
+        generation = int(generation)
+
+        with self._mu:
+            self._prune_locked()
+            now = self._now()
+
+            prepared: list[dict] = []
+            for raw in candidates:
+                try:
+                    nonce_u32 = self._u32(raw["nonce_u32"])
+                    hash_hex = self._norm_hash_hex(raw["hash_hex"])
+                    tail64 = self._u64(raw["tail64"])
+                    share_diff_est = float(raw.get("share_diff_est", 0.0))
+                    if not hash_hex:
+                        continue
+
+                    proof_key = self._proof_key(
+                        job_id=job_id,
+                        generation=generation,
+                        nonce_u32=nonce_u32,
+                        hash_hex=hash_hex,
+                    )
+                    stripe = int(nonce_u32 >> self.stripe_shift)
+                    recent_entry = self._recent.get(proof_key)
+                    recent_seen = 1 if recent_entry is not None else 0
+                    recent_count = int(recent_entry[1]) if recent_entry is not None else 0
+
+                    item = dict(raw)
+                    item["_proof_key"] = proof_key
+                    item["_stripe"] = stripe
+                    item["_recent_seen"] = recent_seen
+                    item["_recent_count"] = recent_count
+                    item["_tail64_int"] = int(tail64)
+                    item["_nonce_u32_int"] = int(nonce_u32)
+                    item["_share_diff_est_float"] = float(share_diff_est)
+                    prepared.append(item)
+                except Exception:
+                    continue
+
+            if not prepared:
+                return []
+
+            selected: list[dict] = []
+            stripe_counts: dict[int, int] = {}
+
+            while prepared and len(selected) < keep:
+                best_idx: Optional[int] = None
+                best_score: Optional[tuple] = None
+
+                for idx, cand in enumerate(prepared):
+                    stripe = int(cand["_stripe"])
+                    recent_seen = int(cand["_recent_seen"])
+                    recent_count = int(cand["_recent_count"])
+
+                    same_stripe_pen = int(stripe_counts.get(stripe, 0))
+                    near_stripe_pen = (
+                        int(stripe_counts.get(stripe - 1, 0))
+                        + int(stripe_counts.get(stripe + 1, 0))
+                    )
+
+                    # tuple order matters:
+                    # 1) unseen proofs before recent echoes
+                    # 2) lower repeat count before heavily resurfaced proofs
+                    # 3) new stripes before already-used stripes
+                    # 4) neighboring stripe crowding penalty
+                    # 5) then tail64 quality
+                    # 6) stable tie-break by nonce
+                    score = (
+                        recent_seen,
+                        recent_count,
+                        same_stripe_pen,
+                        near_stripe_pen,
+                        int(cand["_tail64_int"]),
+                        int(cand["_nonce_u32_int"]),
+                    )
+
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_idx = idx
+
+                assert best_idx is not None
+                chosen = prepared.pop(best_idx)
+
+                stripe = int(chosen["_stripe"])
+                proof_key = str(chosen["_proof_key"])
+
+                stripe_counts[stripe] = int(stripe_counts.get(stripe, 0)) + 1
+
+                self._recent[proof_key] = (now, int(self._recent.get(proof_key, (now, 0))[1]) + 1)
+
+                out = {
+                    "nonce_u32": int(chosen["nonce_u32"]),
+                    "hash_hex": str(chosen["hash_hex"]),
+                    "tail64": int(chosen["tail64"]),
+                    "share_diff_est": float(chosen.get("share_diff_est", 0.0)),
+                }
+                selected.append(out)
+
+            if selected:
+                used_stripes = len({int(x["nonce_u32"]) >> self.stripe_shift for x in selected})
+                if any(self._proof_key(
+                    job_id=job_id,
+                    generation=generation,
+                    nonce_u32=int(x["nonce_u32"]),
+                    hash_hex=str(x["hash_hex"]),
+                ) in self._recent for x in selected):
+                    self._evt_emit(
+                        "recent",
+                        details=f"selected={len(selected)} pool={len(candidates)}",
+                    )
+                if used_stripes > 1:
+                    self._evt_emit(
+                        "stripe",
+                        details=f"selected={len(selected)} used_stripes={used_stripes}",
+                    )
+
+                best = selected[0]
+                self._evt_emit(
+                    "picked",
+                    details=(
+                        f"selected={len(selected)} pool={len(candidates)} "
+                        f"best_nonce={int(best['nonce_u32'])} best_tail64={int(best['tail64'])}"
+                    ),
+                )
+
+            return selected
+
 class _CandidateBatch(_ClassEventLogMixin):
     """
     Fast candidate batch with sparse natural-event logging.
@@ -2619,6 +4171,7 @@ class _ThreadState:
     assigned_start_nonce: int = 0
     assigned_count: int = 0
     assigned_max_results: int = 0
+    assigned_stride: int = 1
 
     done_hashes: int = 0
     found: list[dict] | None = None
@@ -2634,7 +4187,8 @@ class _ThreadState:
     exec_mode: str = "direct"
 
     candidate_batch: Optional["_CandidateBatch"] = None
-
+    nonce_writer: Optional["_NonceStrideWriter"] = None
+    tail64_probe: Optional["_Tail64Probe"] = None
 
 class JITWorker:
     """
@@ -2678,6 +4232,12 @@ class JITWorker:
             logger=self.logger,
         )
         self._selector = _CandidateSelector(max_keep_default=16, logger=self.logger)
+        self._share_diversity = _ShareDiversityCoordinator(
+            logger=self.logger,
+            ttl_ms=18000.0,
+            max_recent=8192,
+            stripe_shift=12,
+        )
         self._exec = _HybridExecutionController(
             threads=self.threads,
             logger=self.logger,
@@ -2695,7 +4255,7 @@ class JITWorker:
         )
         self._round_candidate_batch = _CandidateBatch(
             owner_key="round-batch",
-            max_keep_default=16,
+            max_keep_default=32,
             logger=self.logger,
         )
         self._bootstrap_workers()
@@ -2800,9 +4360,8 @@ class JITWorker:
                 keep_best = max(1, int(st.assigned_max_results))
                 start_nonce = int(st.assigned_start_nonce) & 0xFFFFFFFF
                 count = max(0, int(st.assigned_count))
-
+                stride = max(1, int(getattr(st, "assigned_stride", 1)))
                 stop_flag = self._stop
-                nonce_ptr = st.nonce_ptr
                 blob_buf = st.blob_buf
                 out_buf = st.out_buf
                 is_current = self._dispatch.is_current
@@ -2825,30 +4384,83 @@ class JITWorker:
                     requested_keep=max(8, min(128, keep_best * 2)),
                 )
 
-                done = 0
+                nonce_writer = st.nonce_writer
+                if nonce_writer is None:
+                    nonce_writer = _NonceStrideWriter(
+                        worker_index=st.worker_index,
+                        owner_key=f"worker-{st.worker_index}",
+                        logger=self.logger,
+                    )
+                    st.nonce_writer = nonce_writer
 
-                for i in range(count):
-                    if stop_flag.is_set():
-                        break
+                nonce_writer.bind(
+                    nonce_ptr=st.nonce_ptr,
+                    start_nonce=start_nonce,
+                    stride=stride,
+                    count=count,
+                    job_id=job_id,
+                    generation=my_generation,
+                )
 
-                    if (i & stale_mask) == 0 and not is_current(job_id, my_generation):
-                        break
+                write_next_nonce = nonce_writer.write_next
 
-                    nonce_u32 = (start_nonce + i) & 0xFFFFFFFF
-                    nonce_ptr[0] = nonce_u32
-                    rx_hash_into(st.vm, blob_buf, out_buf)
-                    done += 1
+                tail64_probe = st.tail64_probe
+                if tail64_probe is None:
+                    tail64_probe = _Tail64Probe(
+                        worker_index=st.worker_index,
+                        owner_key=f"worker-{st.worker_index}",
+                        logger=self.logger,
+                    )
+                    st.tail64_probe = tail64_probe
 
-                    tail64 = int.from_bytes(bytes(out_buf[24:32]), "little", signed=False)
+                tail64_probe.begin(
+                    job_id=job_id,
+                    generation=my_generation,
+                    target64=target64,
+                    enable_summary_log=True
+                )
 
-                    if tail64 < target64:
-                        # only allocate/copy hash bytes on actual hit
-                        batch.offer(
-                            nonce_u32=nonce_u32,
-                            hash_hex=bytes(out_buf).hex(),
-                            tail64=tail64,
-                        )
+                rx_lane = getattr(st, "rx_lane", None)
+                if rx_lane is None:
+                    rx_lane = _RxHashAdvanceLane(
+                        worker_index=st.worker_index,
+                        owner_key=f"worker-{st.worker_index}",
+                        logger=self.logger,
+                    )
+                    st.rx_lane = rx_lane
 
+                rx_lane.begin(
+                    hash_into=rx_hash_into,
+                    vm=st.vm,
+                    blob_buf=blob_buf,
+                    out_buf=out_buf,
+                    job_id=job_id,
+                    generation=my_generation,
+                    target64=target64,
+                    expected_hashes=count,
+                    enable_summary_log=True,
+                )
+
+                # optional:
+                # rx_lane.warmup()
+
+                done = rx_lane.hash_loop(
+                    count=count,
+                    write_next_nonce=write_next_nonce,
+                    batch=batch,
+                    stop_flag=stop_flag,
+                    stale_mask=stale_mask,
+                    is_current=is_current,
+                    job_id=job_id,
+                    generation=my_generation,
+                )
+
+                if tail64_probe is not None:
+                    # keep probe in sync only if you still want both systems
+                    # otherwise remove the probe entirely
+                    tail64_probe.finish(done_hashes=done)
+
+                rx_lane.finish(done_hashes=done)
                 st.found = batch.export(keep_best)
                 st.done_hashes = done
                 return done
@@ -2932,6 +4544,11 @@ class JITWorker:
         except Exception:
             pass
 
+        self._share_diversity.begin_round(
+            job_id=str(job.job_id),
+            generation=int(generation),
+        )
+
         t0 = time.perf_counter()
 
         try:
@@ -2947,10 +4564,12 @@ class JITWorker:
                 "errors": [f"randomx_prepare {type(e).__name__}: {e}"],
             }
 
+        # interleaved residue-class layout:
+        # worker 0 -> start+0, start+0+threads, ...
+        # worker 1 -> start+1, start+1+threads, ...
         per_thread = count // threads
         remainder = count % threads
 
-        cursor = int(actual_start_nonce) & 0xFFFFFFFF
         active_states: list[_ThreadState] = []
 
         for i in range(threads):
@@ -2961,9 +4580,10 @@ class JITWorker:
             st = self._states[i]
             st.assigned_job = job
             st.assigned_generation = int(generation)
-            st.assigned_start_nonce = cursor
+            st.assigned_start_nonce = (int(actual_start_nonce) + i) & 0xFFFFFFFF
             st.assigned_count = take
             st.assigned_max_results = max_results
+            st.assigned_stride = threads
             st.done_hashes = 0
             st.error = None
             if st.found is None:
@@ -2973,7 +4593,6 @@ class JITWorker:
 
             st.done_event.clear()
             active_states.append(st)
-            cursor = (cursor + take) & 0xFFFFFFFF
 
         for i in range(threads, len(self._states)):
             st = self._states[i]
@@ -2982,6 +4601,7 @@ class JITWorker:
             st.assigned_start_nonce = 0
             st.assigned_count = 0
             st.assigned_max_results = 0
+            st.assigned_stride = 1
             st.done_hashes = 0
             st.error = None
             if st.found is not None:
@@ -3000,7 +4620,7 @@ class JITWorker:
         round_batch.reset(
             job_id=str(job.job_id),
             generation=int(generation),
-            requested_keep=max_results,
+            requested_keep=max(max_results * 8, 256),
         )
 
         for st in active_states:
@@ -3010,8 +4630,22 @@ class JITWorker:
             if st.error:
                 errors.append(f"worker[{st.worker_index}] {st.error}")
 
-        pre_rank = round_batch.export(max(max_results * 8, 256))
-        found = self._selector.rank(pre_rank, max_results)
+        # keep a broader pool than before so diversity has room to choose
+        pre_rank = round_batch.export(max(max_results * 16, 256))
+
+        # first pass: quality
+        ranked_pool = self._selector.rank(
+            pre_rank,
+            max(max_results * 6, 64),
+        )
+
+        # second pass: freshness + stripe diversity
+        found = self._share_diversity.pick(
+            job_id=str(job.job_id),
+            generation=int(generation),
+            candidates=ranked_pool,
+            max_results=max_results,
+        )
 
         return {
             "job_id": job.job_id,
@@ -3088,3 +4722,14 @@ class JITWorker:
         for st in self._states:
             st.vm = None
             st.vm_epoch = 0
+            st.blob_buf = None
+            st.nonce_ptr = None
+            st.out_buf = None
+            st.last_seed = b""
+            st.last_blob = b""
+            if st.nonce_writer is not None:
+                try:
+                    st.nonce_writer.clear()
+                except Exception:
+                    pass
+            st.nonce_writer = None

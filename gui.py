@@ -662,7 +662,7 @@ class MainWindow(QMainWindow):
         self.sp_bn_rx_batch.setValue(64)
 
         self.sp_submit_workers = QSpinBox()
-        self.sp_submit_workers.setRange(1, 32)
+        self.sp_submit_workers.setRange(1, 10000)
         self.sp_submit_workers.setValue(4)
 
         self.sp_scan_iters = QSpinBox()
