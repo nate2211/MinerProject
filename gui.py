@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QSizePolicy,
-    QScrollArea,
+    QScrollArea, QDoubleSpinBox,
 )
 
 from miner_core import Miner
@@ -239,8 +239,14 @@ class MinerConfig:
     use_parallel_monero_worker: bool = False
     parallel_python_dll: str = ""
     parallel_python_batch_size: int = 1024
+
     use_jit_worker: bool = False
     jit_batch_size: int = 1024
+
+    use_p2pool_share_hunter: bool = False
+    p2pool_share_hunter_batch_size: int = 4096
+    p2pool_share_hunter_keep_best: int = 16
+    p2pool_share_hunter_near_miss_ratio: float = 4.0
 
 
 class MinerWorker(QThread):
@@ -365,6 +371,15 @@ class MinerWorker(QThread):
             if "randomx_use_secure_jit" in sig.parameters:
                 miner_kwargs["randomx_use_secure_jit"] = bool(self.cfg.randomx_use_secure_jit)
 
+            if "use_p2pool_share_hunter" in sig.parameters:
+                miner_kwargs["use_p2pool_share_hunter"] = bool(self.cfg.use_p2pool_share_hunter)
+            if "p2pool_share_hunter_batch_size" in sig.parameters:
+                miner_kwargs["p2pool_share_hunter_batch_size"] = int(self.cfg.p2pool_share_hunter_batch_size)
+            if "p2pool_share_hunter_keep_best" in sig.parameters:
+                miner_kwargs["p2pool_share_hunter_keep_best"] = int(self.cfg.p2pool_share_hunter_keep_best)
+            if "p2pool_share_hunter_near_miss_ratio" in sig.parameters:
+                miner_kwargs["p2pool_share_hunter_near_miss_ratio"] = float(self.cfg.p2pool_share_hunter_near_miss_ratio)
+
             self._miner = Miner(**miner_kwargs)
 
             last_stats: Dict[str, Any] = {}
@@ -382,15 +397,18 @@ class MinerWorker(QThread):
                 b_p2 = last_stats.get("backend_p2pool")
                 b_rx = last_stats.get("backend_randomx")
                 b_pm = bool(last_stats.get("backend_parallel_monero_worker"))
-                pp_batch = last_stats.get("parallel_python_batch_size")
                 b_jit = bool(last_stats.get("backend_jit_worker"))
+                b_hunter = bool(last_stats.get("backend_p2pool_share_hunter"))
+                pp_batch = last_stats.get("parallel_python_batch_size")
                 jit_batch = last_stats.get("jit_batch_size")
+                hunter_batch = last_stats.get("p2pool_share_hunter_batch_size")
 
                 self.log_line.emit(
                     f"[stats] {hps:,.0f} H/s | A:{acc} R:{rej} | height={height} | "
                     f"job={job_id} | p2pool={b_p2} rx={b_rx} "
                     f"parallel_worker={b_pm} jit_worker={b_jit} "
-                    f"batch={pp_batch or jit_batch}"
+                    f"p2pool_hunter={b_hunter} "
+                    f"batch={hunter_batch or pp_batch or jit_batch}"
                 )
 
                 if self._bn_heartbeat:
@@ -405,6 +423,7 @@ class MinerWorker(QThread):
                         )
                     except Exception as e:
                         self.log_line.emit(f"[blocknet] heartbeat error: {e}")
+
 
                 if self._bn_put and self.cfg.blocknet_key.strip():
                     try:
@@ -455,7 +474,10 @@ def _mono_font(point_size: int = 10) -> QFont:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + ParallelMoneroWorker + JITWorker")
+        self.setWindowTitle(
+            "Nate's Monero Miner (P2Pool) — BlockNet + VirtualASIC + ParallelMoneroWorker + "
+            "JITWorker + P2PoolShareHunter"
+        )
         self.worker: Optional[MinerWorker] = None
         self.started_at: float = 0.0
 
@@ -624,7 +646,23 @@ class MainWindow(QMainWindow):
         self.cb_jit_worker = QCheckBox(
             "Use JITWorker — local RandomX hashing through PythonJIT/JITWorker"
         )
+        self.cb_p2pool_share_hunter = QCheckBox(
+            "Use P2PoolShareHunter — local RandomX share hunter that keeps the best low-tail64 candidates"
+        )
 
+        self.sp_p2pool_share_hunter_batch_size = QSpinBox()
+        self.sp_p2pool_share_hunter_batch_size.setRange(1, 1_000_000)
+        self.sp_p2pool_share_hunter_batch_size.setValue(4096)
+
+        self.sp_p2pool_share_hunter_keep_best = QSpinBox()
+        self.sp_p2pool_share_hunter_keep_best.setRange(1, 1024)
+        self.sp_p2pool_share_hunter_keep_best.setValue(16)
+
+        self.sp_p2pool_share_hunter_near_miss_ratio = QDoubleSpinBox()
+        self.sp_p2pool_share_hunter_near_miss_ratio.setRange(1.00, 64.00)
+        self.sp_p2pool_share_hunter_near_miss_ratio.setDecimals(2)
+        self.sp_p2pool_share_hunter_near_miss_ratio.setSingleStep(0.25)
+        self.sp_p2pool_share_hunter_near_miss_ratio.setValue(4.00)
         self.sp_jit_batch_size = QSpinBox()
         self.sp_jit_batch_size.setRange(1, 1_000_000)
         self.sp_jit_batch_size.setValue(1024)
@@ -679,7 +717,12 @@ class MainWindow(QMainWindow):
         mfl.addRow(self.cb_vasic_scan)
         mfl.addRow(self.cb_parallel_monero_worker)
         mfl.addRow(self.cb_jit_worker)
+        mfl.addRow(self.cb_p2pool_share_hunter)
+        mfl.addRow("Hunter batch size", self.sp_p2pool_share_hunter_batch_size)
+        mfl.addRow("Hunter keep best", self.sp_p2pool_share_hunter_keep_best)
+        mfl.addRow("Hunter near-miss ratio", self.sp_p2pool_share_hunter_near_miss_ratio)
         mfl.addRow("JIT batch size", self.sp_jit_batch_size)
+
         mfl.addRow("ParallelPython DLL", self._hbox(self.ed_parallel_python_dll, self.btn_browse_parallel_python_dll))
         mfl.addRow("ParallelPython batch size", self.sp_parallel_python_batch_size)
         mfl.addRow("API Relay (host:port)", self.ed_bn_api_relay)
@@ -696,6 +739,9 @@ class MainWindow(QMainWindow):
         info = QLabel(
             "Only one scan mode should be enabled at a time. "
             "ParallelMoneroWorker uses local RandomX hashing through the ParallelPython callback/export path. "
+            "JITWorker uses PythonJIT/JITWorker. "
+            "P2PoolShareHunter keeps the best low-tail64 candidates in each local batch so rare P2Pool-worthy "
+            "results are less likely to be ignored. "
             "VirtualASIC expects a compatible kernel that writes result records as "
             "[nonce_u32 little-endian][32-byte hash] and a count buffer."
         )
@@ -704,7 +750,7 @@ class MainWindow(QMainWindow):
         mfl.addRow(info)
 
         self.left_layout.addWidget(gb_bn_mine)
-
+        self.cb_p2pool_share_hunter.toggled.connect(self._sync_scan_mode_exclusive)
         self.cb_bn_p2pool.toggled.connect(self._sync_scan_checks)
         self.cb_bn_randomx.toggled.connect(self._sync_scan_checks)
         self.cb_bn_p2pool_scan.toggled.connect(self._sync_scan_mode_exclusive)
@@ -890,6 +936,7 @@ class MainWindow(QMainWindow):
             self.cb_vasic_scan,
             self.cb_parallel_monero_worker,
             self.cb_jit_worker,
+            self.cb_p2pool_share_hunter,
         ):
             if cb is sender:
                 continue
@@ -914,7 +961,7 @@ class MainWindow(QMainWindow):
         self.cb_vasic_scan.setEnabled(True)
         self.cb_parallel_monero_worker.setEnabled(True)
         self.cb_jit_worker.setEnabled(True)
-
+        self.cb_p2pool_share_hunter.setEnabled(True)
     def _on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
         self._set_log_focus(tab_name == "Log")
@@ -1158,6 +1205,7 @@ class MainWindow(QMainWindow):
         use_virtualasic_scan = bool(self.cb_vasic_scan.isChecked())
         use_parallel_monero_worker = bool(self.cb_parallel_monero_worker.isChecked())
         use_jit_worker = bool(self.cb_jit_worker.isChecked())
+        use_p2pool_share_hunter = bool(self.cb_p2pool_share_hunter.isChecked())
 
         bn_api_relay = self.ed_bn_api_relay.text().strip()
         vasic_dll = self.ed_vasic_dll.text().strip()
@@ -1166,6 +1214,9 @@ class MainWindow(QMainWindow):
         parallel_python_dll = self.ed_parallel_python_dll.text().strip()
         parallel_python_batch_size = int(self.sp_parallel_python_batch_size.value())
         jit_batch_size = int(self.sp_jit_batch_size.value())
+        p2pool_share_hunter_batch_size = int(self.sp_p2pool_share_hunter_batch_size.value())
+        p2pool_share_hunter_keep_best = int(self.sp_p2pool_share_hunter_keep_best.value())
+        p2pool_share_hunter_near_miss_ratio = float(self.sp_p2pool_share_hunter_near_miss_ratio.value())
         submit_workers = int(self.sp_submit_workers.value())
         scan_iters = int(self.sp_scan_iters.value())
 
@@ -1178,6 +1229,7 @@ class MainWindow(QMainWindow):
                 use_virtualasic_scan,
                 use_parallel_monero_worker,
                 use_jit_worker,
+                use_p2pool_share_hunter,
             ) if v
         )
         if enabled_scan_modes > 1:
@@ -1191,6 +1243,12 @@ class MainWindow(QMainWindow):
             parallel_python_dll = resolve_resource_path("", fallback_names=("ParallelPython.dll", "parallelpython.dll"))
         if use_jit_worker and jit_batch_size <= 0:
             raise ValueError("JIT batch size must be at least 1")
+        if use_p2pool_share_hunter and p2pool_share_hunter_batch_size <= 0:
+            raise ValueError("P2PoolShareHunter batch size must be at least 1")
+        if use_p2pool_share_hunter and p2pool_share_hunter_keep_best <= 0:
+            raise ValueError("P2PoolShareHunter keep-best must be at least 1")
+        if use_p2pool_share_hunter and p2pool_share_hunter_near_miss_ratio < 1.0:
+            raise ValueError("P2PoolShareHunter near-miss ratio must be at least 1.0")
 
         use_bn_reporting = bool(self.cb_bn.isChecked())
 
@@ -1233,6 +1291,10 @@ class MainWindow(QMainWindow):
             parallel_python_batch_size=parallel_python_batch_size,
             use_jit_worker=use_jit_worker,
             jit_batch_size=jit_batch_size,
+            use_p2pool_share_hunter=use_p2pool_share_hunter,
+            p2pool_share_hunter_batch_size=p2pool_share_hunter_batch_size,
+            p2pool_share_hunter_keep_best=p2pool_share_hunter_keep_best,
+            p2pool_share_hunter_near_miss_ratio=p2pool_share_hunter_near_miss_ratio,
         )
 
     def _start(self) -> None:
@@ -1335,6 +1397,10 @@ class MainWindow(QMainWindow):
                 "parallel_python_batch_size": int(self.sp_parallel_python_batch_size.value()),
                 "use_jit_worker": bool(self.cb_jit_worker.isChecked()),
                 "jit_batch_size": int(self.sp_jit_batch_size.value()),
+                "use_p2pool_share_hunter": bool(self.cb_p2pool_share_hunter.isChecked()),
+                "p2pool_share_hunter_batch_size": int(self.sp_p2pool_share_hunter_batch_size.value()),
+                "p2pool_share_hunter_keep_best": int(self.sp_p2pool_share_hunter_keep_best.value()),
+                "p2pool_share_hunter_near_miss_ratio": float(self.sp_p2pool_share_hunter_near_miss_ratio.value()),
             }
 
         data["color_logs"] = bool(self.cb_color_logs.isChecked())
@@ -1406,6 +1472,20 @@ class MainWindow(QMainWindow):
 
         self.cb_jit_worker.setChecked(bool(data.get("use_jit_worker", self.cb_jit_worker.isChecked())))
         self.sp_jit_batch_size.setValue(int(data.get("jit_batch_size", self.sp_jit_batch_size.value())))
+
+        self.cb_p2pool_share_hunter.setChecked(
+            bool(data.get("use_p2pool_share_hunter", self.cb_p2pool_share_hunter.isChecked()))
+        )
+        self.sp_p2pool_share_hunter_batch_size.setValue(
+            int(data.get("p2pool_share_hunter_batch_size", self.sp_p2pool_share_hunter_batch_size.value()))
+        )
+        self.sp_p2pool_share_hunter_keep_best.setValue(
+            int(data.get("p2pool_share_hunter_keep_best", self.sp_p2pool_share_hunter_keep_best.value()))
+        )
+        self.sp_p2pool_share_hunter_near_miss_ratio.setValue(
+            float(data.get("p2pool_share_hunter_near_miss_ratio", self.sp_p2pool_share_hunter_near_miss_ratio.value()))
+        )
+
 
         self.cb_color_logs.setChecked(bool(data.get("color_logs", True)))
         self._color_logs_enabled = bool(self.cb_color_logs.isChecked())

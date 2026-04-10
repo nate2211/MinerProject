@@ -18,6 +18,7 @@ hidden_imports = [
     'python_runtime.py',
     'python_usage.py'
     'python_jit.py',
+    'p2pool_share_hunter.py',
 ]
 
 a = Analysis(
@@ -30,6 +31,7 @@ a = Analysis(
         ('PythonRuntime.dll', '.'),
         ('PythonUsage.dll', '.'),
         ('PythonJIT.dll', '.'),
+        ('RemoteConnection.dll', '.'),
     ],
     datas=[
         ('virtualasic_monero_scan.cl', '.'),

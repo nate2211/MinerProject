@@ -29,6 +29,7 @@ from blocknet_mining_backend import (
     BlockNetCpuScanner,
 )
 from parallel_monero_worker import ParallelMoneroWorker
+from p2pool_share_hunter import P2PoolShareHunterWorker, RemoteConnection
 
 
 @dataclass
@@ -242,6 +243,10 @@ class Miner:
         parallel_python_batch_size: int = 1024,
         use_jit_worker: bool = False,
         jit_batch_size: int = 1024,
+        use_p2pool_share_hunter: bool = False,
+        p2pool_share_hunter_batch_size: int = 4096,
+        p2pool_share_hunter_keep_best: int = 16,
+        p2pool_share_hunter_near_miss_ratio: float = 4.0,
         randomx_use_large_pages: bool = True,
         randomx_use_full_mem: bool = True,
         randomx_use_jit: bool = True,
@@ -277,6 +282,7 @@ class Miner:
         self.use_blocknet_cpu_scan = bool(use_blocknet_cpu_scan)
         self.use_virtualasic_scan = bool(use_virtualasic_scan)
         self.use_parallel_monero_worker = bool(use_parallel_monero_worker)
+        self.use_p2pool_share_hunter = bool(use_p2pool_share_hunter)
 
         self.virtualasic_dll = str(virtualasic_dll or "").strip()
         self.virtualasic_kernel = str(virtualasic_kernel or "").strip()
@@ -303,6 +309,10 @@ class Miner:
         self.parallel_python_batch_size = max(1, int(parallel_python_batch_size))
         self.use_jit_worker = bool(use_jit_worker)
         self.jit_batch_size = max(1, int(jit_batch_size))
+        self.use_p2pool_share_hunter = bool(use_p2pool_share_hunter)
+        self.p2pool_share_hunter_batch_size = max(1, int(p2pool_share_hunter_batch_size))
+        self.p2pool_share_hunter_keep_best = max(1, int(p2pool_share_hunter_keep_best))
+        self.p2pool_share_hunter_near_miss_ratio = max(1.0, float(p2pool_share_hunter_near_miss_ratio))
         scan_mode_count = sum(
             1 for x in (
                 self.use_blocknet_p2pool_scan,
@@ -312,6 +322,7 @@ class Miner:
                 self.use_virtualasic_scan,
                 self.use_parallel_monero_worker,
                 self.use_jit_worker,
+                self.use_p2pool_share_hunter,
             ) if x
         )
         if scan_mode_count > 1:
@@ -319,14 +330,22 @@ class Miner:
                 "Only one scan mode can be enabled at a time: "
                 "use_blocknet_p2pool_scan, use_blocknet_randomx_scan, "
                 "use_blocknet_gpu_scan, use_blocknet_cpu_scan, "
-                "use_virtualasic_scan, use_parallel_monero_worker, use_jit_worker"
+                "use_virtualasic_scan, use_parallel_monero_worker, "
+                "use_jit_worker, use_p2pool_share_hunter"
             )
 
         self.submit_workers = max(1, int(submit_workers))
 
         if self.use_blocknet_p2pool_scan and not self.use_blocknet_p2pool:
             raise RuntimeError("use_blocknet_p2pool_scan=True requires use_blocknet_p2pool=True")
-
+        if self.use_p2pool_share_hunter:
+            self.logger(
+                f"[Miner] P2PoolShareHunter enabled: "
+                f"threads={self.threads} "
+                f"batch_size={self.p2pool_share_hunter_batch_size} "
+                f"keep_best={self.p2pool_share_hunter_keep_best} "
+                f"near_miss_ratio={self.p2pool_share_hunter_near_miss_ratio:.2f}"
+            )
         if self.use_virtualasic_scan:
             if not self.virtualasic_kernel:
                 self.logger("[Miner] VirtualASIC enabled with empty kernel path; auto-resolution will be attempted.")
@@ -351,14 +370,15 @@ class Miner:
             or self.use_virtualasic_scan
             or self.use_parallel_monero_worker
             or self.use_jit_worker
+            or self.use_p2pool_share_hunter
         ):
             self.use_blocknet_randomx = False
-
         self._bn_cfg: Optional[BlockNetApiCfg] = None
         self._bn_p2pool: Optional[BlockNetP2PoolBackend] = None
         self._bn_rx: Optional[BlockNetRandomXHasher] = None
         self._bn_gpu: Optional[BlockNetGpuScanner] = None
         self._bn_cpu: Optional[BlockNetCpuScanner] = None
+        self._p2pool_share_hunter: Optional[P2PoolShareHunterWorker] = None
         self._rx_batch = max(1, int(randomx_batch_size))
 
         need_blocknet = (
@@ -417,7 +437,49 @@ class Miner:
             self._bn_cpu = None
             self._bn_rx = None
             self.rx = RandomX(self.logger, **self._randomx_kwargs)
-
+        elif self.use_p2pool_share_hunter:
+            self.logger("[Miner] Using local P2PoolShareHunter backend...")
+            self._bn_gpu = None
+            self._bn_cpu = None
+            self._bn_rx = None
+            self.rx = RandomX(self.logger, **self._randomx_kwargs)
+            remote_connection = RemoteConnection(
+                peers=[
+                    (stratum_host, 37888),
+                    ("65.21.227.114", 37888),
+                    ("81.243.196.208", 37888),
+                    ("109.136.90.93", 37888),
+                    ("85.86.210.5", 37888),
+                    ("99.106.143.239", 37888),
+                    ("75.69.100.106", 37888),
+                    ("216.235.112.21", 37888),
+                    ("71.33.136.192", 37888),
+                    ("116.202.67.189", 37888),
+                    ("66.36.230.75", 37888),
+                    ("5.9.73.216", 37888),
+                    ("86.246.14.229", 37888),
+                ],
+                logger=logger,
+                connect_timeout_sec=2.0,
+                recv_timeout_sec=1.0,
+                reconnect_delay_sec=10.0,
+                log_cooldown_sec=60.0,
+                peer_rx_log_cooldown_sec=20.0,
+                hint_log_cooldown_sec=45.0,
+                hot_rx_window_sec=30.0,
+                router_base_url="http://" + stratum_host + ":8844",
+                pcap_bpf_filter="(ip or ip6 or arp) and not (udp and (port 137 or port 138))",
+            )
+            self._p2pool_share_hunter = P2PoolShareHunterWorker(
+                remote_connection=remote_connection,
+                threads=self.threads,
+                logger=self.logger,
+                randomx=self.rx,
+                batch_size=self.p2pool_share_hunter_batch_size,
+                keep_best=self.p2pool_share_hunter_keep_best,
+                near_miss_ratio=self.p2pool_share_hunter_near_miss_ratio,
+                stratum_host=stratum_host
+            )
         elif self.use_parallel_monero_worker:
             self.logger("[Miner] Using local ParallelMoneroWorker backend...")
             self._bn_gpu = None
@@ -501,6 +563,11 @@ class Miner:
         if self._jit_worker is not None:
             try:
                 self._jit_worker.stop()
+            except Exception:
+                pass
+        if self._p2pool_share_hunter is not None:
+            try:
+                self._p2pool_share_hunter.stop()
             except Exception:
                 pass
         loop = self._async_loop
@@ -719,14 +786,15 @@ class Miner:
         vasic: Optional[VirtualASICScanner] = None
 
         local_randomx_mode = (
-            not self.use_blocknet_randomx
-            and not self.use_blocknet_randomx_scan
-            and not self.use_blocknet_p2pool_scan
-            and not self.use_blocknet_gpu_scan
-            and not self.use_blocknet_cpu_scan
-            and not self.use_virtualasic_scan
-            and not self.use_parallel_monero_worker
-            and not self.use_jit_worker
+                not self.use_blocknet_randomx
+                and not self.use_blocknet_randomx_scan
+                and not self.use_blocknet_p2pool_scan
+                and not self.use_blocknet_gpu_scan
+                and not self.use_blocknet_cpu_scan
+                and not self.use_virtualasic_scan
+                and not self.use_parallel_monero_worker
+                and not self.use_jit_worker
+                and not self.use_p2pool_share_hunter
         )
         needs_local_vm = local_randomx_mode or self.use_virtualasic_scan
 
@@ -909,6 +977,64 @@ class Miner:
                     except Exception as e:
                         self.last_err = f"parallel monero worker failed: {self._fmt_exc(e)}"
                         self.logger(f"[Worker-{idx}] parallel monero worker error: {self._fmt_exc(e)}")
+                        time.sleep(0.02)
+                elif self.use_p2pool_share_hunter:
+                    try:
+                        assert self._p2pool_share_hunter is not None
+
+                        seq_snapshot = int(last_seq)
+                        cur_job_id = str(cur_job.job_id or "")
+
+                        def _is_current(expected_job_id: str, expected_generation: int) -> bool:
+                            if self.job_state.seq != int(expected_generation):
+                                return False
+                            live_job = self.job_state.get()
+                            if live_job is None:
+                                return False
+                            return str(live_job.job_id or "") == str(expected_job_id)
+
+                        def _submit_candidate(nonce_u32: int, value64: int, result32: bytes) -> None:
+                            if str(cur_job.job_id or "") != cur_job_id:
+                                return
+                            share_put(
+                                Share(job_id=cur_job.job_id, nonce_u32=int(nonce_u32), result32=bytes(result32)))
+
+                        start_nonce = self.job_state.alloc_nonce_block(self.p2pool_share_hunter_batch_size)
+                        resp = self._p2pool_share_hunter.hash_job(
+                            job=cur_job,
+                            start_nonce=start_nonce,
+                            count=self.p2pool_share_hunter_batch_size,
+                            max_results=self.scan_max_results,
+                            is_current=_is_current,
+                            generation=seq_snapshot,
+                            poll_interval=128,
+                            stale_poll_interval=32,
+                            submit_candidate=_submit_candidate,
+                        )
+
+                        done = int(resp.get("hashes_done") or 0)
+                        if done > 0:
+                            self.add_hashes(done)
+
+                        # keep compatibility if submit callback is not the only path
+                        found = resp.get("found") or []
+                        if isinstance(found, list):
+                            for one in found:
+                                try:
+                                    n = int(one.get("nonce_u32"))
+                                    hx = str(one.get("hash_hex") or "")
+                                    h32 = bytes.fromhex(hx)
+                                    if len(h32) == 32:
+                                        share_put(Share(job_id=cur_job.job_id, nonce_u32=n, result32=h32))
+                                except Exception:
+                                    continue
+
+                        if done <= 0:
+                            time.sleep(0.001)
+
+                    except Exception as e:
+                        self.last_err = f"p2pool share hunter failed: {self._fmt_exc(e)}"
+                        self.logger(f"[Worker-{idx}] p2pool share hunter error: {self._fmt_exc(e)}")
                         time.sleep(0.02)
                 elif self.use_jit_worker:
                     try:
@@ -1358,6 +1484,8 @@ class Miner:
                         backend_rx = "blocknet_randomx_scan"
                     elif self.use_blocknet_randomx:
                         backend_rx = "blocknet_hash_batch"
+                    elif self.use_p2pool_share_hunter:
+                        backend_rx = "p2pool_share_hunter"
                     else:
                         backend_rx = "local"
 
@@ -1400,6 +1528,16 @@ class Miner:
                             ),
                             "virtualasic_stage_vm_descriptor": (
                                 self.virtualasic_stage_vm_descriptor if self.use_virtualasic_scan else None
+                            ),
+                            "backend_p2pool_share_hunter": self.use_p2pool_share_hunter,
+                            "p2pool_share_hunter_batch_size": (
+                                self.p2pool_share_hunter_batch_size if self.use_p2pool_share_hunter else None
+                            ),
+                            "p2pool_share_hunter_keep_best": (
+                                self.p2pool_share_hunter_keep_best if self.use_p2pool_share_hunter else None
+                            ),
+                            "p2pool_share_hunter_near_miss_ratio": (
+                                self.p2pool_share_hunter_near_miss_ratio if self.use_p2pool_share_hunter else None
                             ),
                         })
 
@@ -1496,7 +1634,12 @@ class Miner:
                 except Exception:
                     pass
                 self._parallel_worker = None
-
+            if self._p2pool_share_hunter is not None:
+                try:
+                    self._p2pool_share_hunter.close()
+                except Exception:
+                    pass
+                self._p2pool_share_hunter = None
             self._active_cli = None
             self._async_loop = None
             self.logger("[Miner] Shutdown complete.")
