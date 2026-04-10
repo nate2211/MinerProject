@@ -70,6 +70,87 @@ def _normalize_router_api_base_url(base_url: Optional[str], default_port: int = 
     return f'{scheme}://{host}:{port_value}'
 
 
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _safe_str(v: Any) -> str:
+    try:
+        return str(v or '')
+    except Exception:
+        return ''
+
+
+def _ip_is_multicast_or_broadcast(ip_s: str) -> bool:
+    raw = str(ip_s or '').strip()
+    if not raw:
+        return False
+    if raw == '255.255.255.255':
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(raw.split('%', 1)[0])
+    except Exception:
+        return False
+    return bool(ip_obj.is_multicast)
+
+
+def _ip_is_link_local(ip_s: str) -> bool:
+    raw = str(ip_s or '').strip()
+    if not raw:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(raw.split('%', 1)[0])
+    except Exception:
+        return False
+    return bool(ip_obj.is_link_local)
+
+
+_CAPTURE_NOISE_TOPICS = {
+    'ssdp',
+    'mdns',
+    'llmnr',
+    'nbns',
+    'dhcp',
+    'dhcpv6',
+}
+
+_CAPTURE_UDP_NOISE_PORTS = {137, 138, 1900, 5353, 5355, 546, 547}
+_CAPTURE_PEER_PORTS = {18080, 18081, 18083, 3333, 37888, 37889, 37890}
+
+
+class _PeerSeenGate:
+    __slots__ = ('_mu', '_seen')
+
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self._seen: Dict[str, float] = {}
+
+    def admit(self, key: str, *, now: Optional[float] = None, ttl_sec: float = 8.0) -> bool:
+        key_s = str(key or '').strip()
+        if not key_s:
+            return False
+        t = float(now if now is not None else time.time())
+        with self._mu:
+            old = float(self._seen.get(key_s, 0.0))
+            self._seen[key_s] = t
+            cutoff = t - max(4.0, float(ttl_sec) * 4.0)
+            stale = [k for k, ts in self._seen.items() if ts < cutoff]
+            for k in stale:
+                self._seen.pop(k, None)
+            return (t - old) >= float(ttl_sec)
+
+    def touch(self, key: str, *, now: Optional[float] = None) -> None:
+        key_s = str(key or '').strip()
+        if not key_s:
+            return
+        with self._mu:
+            self._seen[key_s] = float(now if now is not None else time.time())
+
+
 @dataclass
 class CaptureDevice:
     name: str
@@ -404,45 +485,186 @@ class LibpcapBackend:
         return self._active_device_name
 
     def _decode_packet(self, raw: bytes, *, ts_sec: int, ts_usec: int, wire_len: int, cap_len: int) -> Dict[str, Any]:
+        blob = bytes(raw or b'')
         packet: Dict[str, Any] = {
-            'kind': 'packet', 'ts': float(ts_sec) + (float(ts_usec) / 1_000_000.0), 'ts_sec': ts_sec, 'ts_usec': ts_usec,
-            'wire_len': wire_len, 'cap_len': cap_len, 'captured_len': cap_len, 'raw_len': cap_len, 'raw_hex_preview': raw[:64].hex(),
-            'raw_hex': raw.hex(), 'raw_base64': base64.b64encode(raw).decode('ascii'), 'summary': f'{cap_len} bytes',
-            'topic': 'ethernet', 'l3': 'unknown', 'proto': 'unknown', 'src_mac': None, 'dst_mac': None, 'src_ip': None,
-            'dst_ip': None, 'sport': None, 'dport': None, 'flags': None, 'has_raw': True, 'capture_quality': 'libpcap_raw',
+            'kind': 'packet',
+            'ts': float(ts_sec) + (float(ts_usec) / 1_000_000.0),
+            'ts_sec': ts_sec,
+            'ts_usec': ts_usec,
+            'wire_len': wire_len,
+            'cap_len': cap_len,
+            'captured_len': cap_len,
+            'raw_len': cap_len,
+            'raw_hex_preview': blob[:64].hex(),
+            'raw_hex': blob.hex(),
+            'raw_base64': base64.b64encode(blob).decode('ascii'),
+            'summary': f'{cap_len} bytes',
+            'topic': 'ethernet',
+            'l2': 'ethernet',
+            'l3': 'unknown',
+            'proto': 'unknown',
+            'src_mac': None,
+            'dst_mac': None,
+            'src_ip': None,
+            'dst_ip': None,
+            'sport': None,
+            'dport': None,
+            'flags': None,
+            'has_raw': True,
+            'capture_quality': 'libpcap_raw',
+            'payload_len': 0,
+            'is_multicast': False,
+            'is_broadcast': False,
+            'is_link_local': False,
         }
-        if len(raw) < 14:
+        if len(blob) < 14:
             return packet
-        dst_mac = ':'.join(f'{b:02x}' for b in raw[0:6])
-        src_mac = ':'.join(f'{b:02x}' for b in raw[6:12])
-        eth_type = struct.unpack('!H', raw[12:14])[0]
-        packet.update({'src_mac': src_mac, 'dst_mac': dst_mac, 'eth_type': f'0x{eth_type:04x}', 'source': 'libpcap', 'iface': self._active_device_name})
-        if eth_type == 0x0800 and len(raw) >= 34:
+
+        dst_mac_bytes = blob[0:6]
+        src_mac_bytes = blob[6:12]
+        dst_mac = ':'.join(f'{b:02x}' for b in dst_mac_bytes)
+        src_mac = ':'.join(f'{b:02x}' for b in src_mac_bytes)
+        eth_type = struct.unpack('!H', blob[12:14])[0]
+        offset = 14
+
+        if eth_type in (0x8100, 0x88A8) and len(blob) >= 18:
+            packet['vlan_tci'] = struct.unpack('!H', blob[14:16])[0]
+            eth_type = struct.unpack('!H', blob[16:18])[0]
+            offset = 18
+
+        packet.update({
+            'src_mac': src_mac,
+            'dst_mac': dst_mac,
+            'eth_type': f'0x{eth_type:04x}',
+            'source': 'libpcap',
+            'iface': self._active_device_name,
+            'is_multicast': bool(dst_mac_bytes and (dst_mac_bytes[0] & 0x01)),
+            'is_broadcast': dst_mac == 'ff:ff:ff:ff:ff:ff',
+        })
+
+        if eth_type == 0x0800 and len(blob) >= offset + 20:
             packet['l3'] = 'ipv4'
-            ihl = (raw[14] & 0x0F) * 4
-            if len(raw) < 14 + ihl:
+            version_ihl = blob[offset]
+            version = (version_ihl >> 4) & 0x0F
+            ihl = (version_ihl & 0x0F) * 4
+            if version != 4 or ihl < 20 or len(blob) < offset + ihl:
                 return packet
-            proto = raw[23]
-            src_ip = socket.inet_ntoa(raw[26:30])
-            dst_ip = socket.inet_ntoa(raw[30:34])
-            packet.update({'src_ip': src_ip, 'dst_ip': dst_ip})
-            offset = 14 + ihl
-            if proto == 6 and len(raw) >= offset + 20:
-                sport, dport, seq, ack, off_flags = struct.unpack('!HHIIH', raw[offset: offset + 14])
-                flags = off_flags & 0x01FF
-                packet.update({'proto': 'tcp', 'topic': 'transport', 'sport': sport, 'dport': dport, 'seq': seq, 'ack': ack, 'flags': self._tcp_flags_text(flags), 'summary': f'TCP {src_ip}:{sport} -> {dst_ip}:{dport} {self._tcp_flags_text(flags)}'})
+            total_len = struct.unpack('!H', blob[offset + 2: offset + 4])[0]
+            proto_num = blob[offset + 9]
+            src_ip = socket.inet_ntoa(blob[offset + 12: offset + 16])
+            dst_ip = socket.inet_ntoa(blob[offset + 16: offset + 20])
+            packet.update({
+                'src_ip': src_ip,
+                'dst_ip': dst_ip,
+                'is_link_local': _ip_is_link_local(src_ip) or _ip_is_link_local(dst_ip),
+            })
+            payload_end = min(len(blob), offset + max(total_len, ihl))
+            l4_off = offset + ihl
+
+            if proto_num == 6 and len(blob) >= l4_off + 20:
+                sport, dport = struct.unpack('!HH', blob[l4_off:l4_off + 4])
+                seq = struct.unpack('!I', blob[l4_off + 4:l4_off + 8])[0]
+                ack = struct.unpack('!I', blob[l4_off + 8:l4_off + 12])[0]
+                data_offset = ((blob[l4_off + 12] >> 4) & 0x0F) * 4
+                flags_raw = blob[l4_off + 13]
+                payload_start = min(payload_end, l4_off + max(20, data_offset))
+                payload_len = max(0, payload_end - payload_start)
+                packet.update({
+                    'proto': 'tcp',
+                    'topic': 'transport',
+                    'sport': int(sport),
+                    'dport': int(dport),
+                    'seq': int(seq),
+                    'ack': int(ack),
+                    'flags': self._tcp_flags_text(flags_raw),
+                    'payload_len': int(payload_len),
+                })
                 self._apply_topic_from_ports(packet)
-            elif proto == 17 and len(raw) >= offset + 8:
-                sport, dport, udp_len, _ = struct.unpack('!HHHH', raw[offset: offset + 8])
-                packet.update({'proto': 'udp', 'topic': 'transport', 'sport': sport, 'dport': dport, 'summary': f'UDP {src_ip}:{sport} -> {dst_ip}:{dport} len={udp_len}'})
+            elif proto_num == 17 and len(blob) >= l4_off + 8:
+                sport, dport, udp_len, _ = struct.unpack('!HHHH', blob[l4_off:l4_off + 8])
+                payload_len = max(0, min(len(blob), l4_off + max(8, udp_len)) - (l4_off + 8))
+                packet.update({
+                    'proto': 'udp',
+                    'topic': 'transport',
+                    'sport': int(sport),
+                    'dport': int(dport),
+                    'payload_len': int(payload_len),
+                    'summary': f'UDP {src_ip}:{sport} -> {dst_ip}:{dport} len={udp_len}',
+                })
                 self._apply_topic_from_ports(packet)
-            elif proto == 1 and len(raw) >= offset + 4:
+            elif proto_num == 1 and len(blob) >= l4_off + 4:
                 packet.update({'proto': 'icmp', 'topic': 'icmp', 'summary': f'ICMP {src_ip} -> {dst_ip}'})
             else:
-                packet.update({'proto': str(proto), 'summary': f'IPv4 proto={proto} {src_ip} -> {dst_ip}'})
+                packet.update({'proto': str(proto_num), 'summary': f'IPv4 proto={proto_num} {src_ip} -> {dst_ip}'})
+            if packet.get('sport') and packet.get('dport'):
+                packet['peer_key'] = f"{packet['dst_ip']}:{packet['dport']}"
             return packet
-        if eth_type == 0x0806 and len(raw) >= 42:
-            packet.update({'topic': 'arp', 'l3': 'arp', 'proto': 'arp', 'src_ip': socket.inet_ntoa(raw[28:32]), 'dst_ip': socket.inet_ntoa(raw[38:42]), 'summary': f'ARP {socket.inet_ntoa(raw[28:32])} -> {socket.inet_ntoa(raw[38:42])}'})
+
+        if eth_type == 0x86DD and len(blob) >= offset + 40:
+            packet['l3'] = 'ipv6'
+            next_header = blob[offset + 6]
+            payload_len = struct.unpack('!H', blob[offset + 4:offset + 6])[0]
+            src_ip = socket.inet_ntop(socket.AF_INET6, blob[offset + 8: offset + 24])
+            dst_ip = socket.inet_ntop(socket.AF_INET6, blob[offset + 24: offset + 40])
+            packet.update({
+                'src_ip': src_ip,
+                'dst_ip': dst_ip,
+                'is_link_local': _ip_is_link_local(src_ip) or _ip_is_link_local(dst_ip),
+                'is_multicast': packet['is_multicast'] or _ip_is_multicast_or_broadcast(dst_ip),
+            })
+            l4_off = offset + 40
+            payload_end = min(len(blob), l4_off + max(0, payload_len))
+
+            if next_header == 6 and len(blob) >= l4_off + 20:
+                sport, dport = struct.unpack('!HH', blob[l4_off:l4_off + 4])
+                seq = struct.unpack('!I', blob[l4_off + 4:l4_off + 8])[0]
+                ack = struct.unpack('!I', blob[l4_off + 8:l4_off + 12])[0]
+                data_offset = ((blob[l4_off + 12] >> 4) & 0x0F) * 4
+                flags_raw = blob[l4_off + 13]
+                payload_start = min(payload_end, l4_off + max(20, data_offset))
+                packet.update({
+                    'proto': 'tcp',
+                    'topic': 'transport',
+                    'sport': int(sport),
+                    'dport': int(dport),
+                    'seq': int(seq),
+                    'ack': int(ack),
+                    'flags': self._tcp_flags_text(flags_raw),
+                    'payload_len': max(0, payload_end - payload_start),
+                })
+                self._apply_topic_from_ports(packet)
+            elif next_header == 17 and len(blob) >= l4_off + 8:
+                sport, dport, udp_len, _ = struct.unpack('!HHHH', blob[l4_off:l4_off + 8])
+                packet.update({
+                    'proto': 'udp',
+                    'topic': 'transport',
+                    'sport': int(sport),
+                    'dport': int(dport),
+                    'payload_len': max(0, min(len(blob), l4_off + max(8, udp_len)) - (l4_off + 8)),
+                    'summary': f'UDP6 {src_ip}:{sport} -> {dst_ip}:{dport} len={udp_len}',
+                })
+                self._apply_topic_from_ports(packet)
+            elif next_header == 58:
+                packet.update({'proto': 'icmpv6', 'topic': 'icmp', 'summary': f'ICMPv6 {src_ip} -> {dst_ip}'})
+            else:
+                packet.update({'proto': str(next_header), 'summary': f'IPv6 nh={next_header} {src_ip} -> {dst_ip}'})
+            if packet.get('sport') and packet.get('dport'):
+                packet['peer_key'] = f"{packet['dst_ip']}:{packet['dport']}"
+            return packet
+
+        if eth_type == 0x0806 and len(blob) >= offset + 28:
+            src_ip = socket.inet_ntoa(blob[offset + 14: offset + 18])
+            dst_ip = socket.inet_ntoa(blob[offset + 24: offset + 28])
+            packet.update({
+                'topic': 'arp',
+                'l3': 'arp',
+                'proto': 'arp',
+                'src_ip': src_ip,
+                'dst_ip': dst_ip,
+                'summary': f'ARP {src_ip} -> {dst_ip}',
+            })
+            return packet
+
         return packet
 
     @staticmethod
@@ -458,7 +680,12 @@ class LibpcapBackend:
     def _apply_topic_from_ports(packet: Dict[str, Any]) -> None:
         dport = int(packet.get('dport') or 0)
         sport = int(packet.get('sport') or 0)
-        topics = {53: 'dns', 67: 'dhcp', 68: 'dhcp', 80: 'http', 443: 'https', 3333: 'stratum', 37888: 'p2pool', 37889: 'p2pool', 18080: 'monero', 18081: 'monero', 18083: 'monero'}
+        topics = {
+            53: 'dns', 67: 'dhcp', 68: 'dhcp', 80: 'http', 137: 'nbns', 138: 'nbns',
+            443: 'https', 546: 'dhcpv6', 547: 'dhcpv6', 1900: 'ssdp', 3333: 'stratum',
+            5353: 'mdns', 5355: 'llmnr', 37888: 'p2pool', 37889: 'p2pool', 37890: 'p2pool',
+            18080: 'monero', 18081: 'monero', 18083: 'monero'
+        }
         packet['topic'] = topics.get(dport) or topics.get(sport) or packet.get('topic') or 'transport'
         proto = packet.get('proto')
         src_ip = packet.get('src_ip')
@@ -1658,30 +1885,42 @@ class RouterPacketStream:
         desc = str(getattr(dev, 'description', '') or '')
         lower = f"{name} {desc}".lower()
         score = 0
-        if 'loopback' in lower:
-            score -= 100
-        if 'npcap_loopback' in lower:
-            score -= 100
+
+        current = str(self.device_name or '').strip().lower()
+        if current and name.lower() == current:
+            score += 250
+
+        if 'loopback' in lower or 'npcap_loopback' in lower:
+            score -= 120
         if '\\device\\npf_' in lower:
-            score += 20
+            score += 24
+        if 'tap-windows' in lower or 'tap adapter' in lower or 'tun' in lower or 'wintun' in lower:
+            score += 28
+        if 'hyper-v' in lower or 'vmswitch' in lower:
+            score += 22
         if 'wi-fi' in lower or 'wifi' in lower or 'wireless' in lower:
-            score += 14
+            score += 18
         if 'ethernet' in lower:
-            score += 12
-        if 'hyper-v' in lower or 'vmswitch' in lower or 'virtualbox' in lower:
-            score -= 6
+            score += 16
+        if 'virtualbox' in lower:
+            score -= 4
         if 'bluetooth' in lower:
-            score -= 10
+            score -= 12
+
         addrs = list(getattr(dev, 'addresses', []) or [])
         priv = 0
+        link_local = 0
         for addr in addrs:
             try:
                 ip = ipaddress.ip_address(str(addr).split('%', 1)[0])
             except Exception:
                 continue
-            if ip.version == 4 and (ip.is_private or ip.is_link_local):
+            if ip.version == 4 and ip.is_private:
                 priv += 1
-        score += min(10, priv * 2)
+            if ip.is_link_local:
+                link_local += 1
+        score += min(14, priv * 3)
+        score += min(10, link_local * 2)
         return (score, len(addrs), lower)
 
     def _auto_select_device(self) -> str:
@@ -2190,6 +2429,7 @@ class MinerInterface:
         self._tx_packets = 0
         self._last_error = ''
         self._last_packet_ts = 0.0
+        self._last_peer_packet_ts = 0.0
         self._last_device_packet: Dict[str, Any] = {}
         self._peer_device_hints: Dict[str, Dict[str, Any]] = {}
         self._capture_generation = 0
@@ -2199,6 +2439,7 @@ class MinerInterface:
         self._inject_garbage = 0
         self._capture_high_value = 0
         self._capture_low_value = 0
+        self._capture_noise_drop = 0
         self._last_log_emit_ts = 0.0
         self._start_ts = 0.0
         self._capture_watchdog_stop = threading.Event()
@@ -2207,9 +2448,15 @@ class MinerInterface:
         self._candidate_device_descs: Dict[str, str] = {}
         self._candidate_index = -1
         self._capture_restart_count = 0
-        self._force_router_for_all_capture = True
+        self._force_router_for_all_capture = False
         self._last_capture_reason = ''
         self._feedback_suppress = 0
+        self._last_rearm_ts = 0.0
+        self._watchdog_quiet_count = 0
+        self._watchdog_grace_sec = 18.0
+        self._watchdog_quiet_sec = 18.0
+        self._watchdog_quiet_cycles_before_rotate = 3
+        self._peer_seen_gate = _PeerSeenGate()
 
     def _log(self, msg: str) -> None:
         text = str(msg or '')
@@ -2269,7 +2516,11 @@ class MinerInterface:
         raw = str(self.bpf_filter or '').strip()
         if raw:
             return raw
-        return 'ip or ip6 or arp'
+        return (
+            '(arp or '
+            '(ip and not ip multicast and not (udp and (port 137 or port 138 or port 1900 or port 5353 or port 5355))) or '
+            '(ip6 and not ip6 multicast and not (udp and (port 1900 or port 5353 or port 5355 or port 546 or port 547))))'
+        )
 
     def _device_rank(self, dev: CaptureDevice) -> Tuple[int, int, str]:
         name = str(getattr(dev, 'name', '') or '')
@@ -2367,6 +2618,8 @@ class MinerInterface:
                 timeout_ms=self.timeout_ms,
             )
             self._capture_restart_count += 1
+            self._last_rearm_ts = time.time()
+            self._watchdog_quiet_count = 0
             why = f' reason={reason}' if reason else ''
             desc = self._candidate_device_descs.get(self.device_name, '')
             self._log(f'[MinerInterface] 🎣 capture armed device={self.device_name} filter={effective_filter or "<none>"}{why} desc={desc or "<none>"}')
@@ -2382,21 +2635,34 @@ class MinerInterface:
                 with self._mu:
                     started = bool(self._started)
                     last_ts = float(self._last_packet_ts or 0.0)
+                    last_peer_ts = float(self._last_peer_packet_ts or 0.0)
                     start_ts = float(self._start_ts or 0.0)
                     backend = self._backend
+                    last_rearm_ts = float(self._last_rearm_ts or 0.0)
                 if not started or not self.enable_capture:
                     continue
                 now = time.time()
-                quiet_for = now - (last_ts or start_ts or now)
-                running = bool(backend.capture_running) if backend is not None else False
-                if not running:
-                    with self._mu:
-                        self._start_capture_locked(rotate=False, reason='watchdog_not_running')
+                if (now - start_ts) < self._watchdog_grace_sec:
                     continue
-                if quiet_for >= 6.0:
+                running = bool(backend.capture_running) if backend is not None else False
+                activity_anchor = max(last_ts, last_peer_ts, start_ts)
+                quiet_for = now - activity_anchor
+                if not running:
+                    if (now - last_rearm_ts) >= 6.0:
+                        with self._mu:
+                            self._start_capture_locked(rotate=False, reason='watchdog_not_running')
+                    continue
+                if quiet_for >= self._watchdog_quiet_sec:
                     with self._mu:
-                        self._log(f'[MinerInterface] 🔄 quiet capture for {quiet_for:.1f}s; rotating device')
-                        self._start_capture_locked(rotate=True, reason='watchdog_quiet')
+                        self._watchdog_quiet_count += 1
+                        quiet_count = int(self._watchdog_quiet_count)
+                    if quiet_count >= self._watchdog_quiet_cycles_before_rotate and (now - last_rearm_ts) >= 8.0:
+                        with self._mu:
+                            self._log(f'[MinerInterface] 🔄 quiet peer capture for {quiet_for:.1f}s; rotating device')
+                            self._start_capture_locked(rotate=True, reason='watchdog_quiet')
+                    continue
+                with self._mu:
+                    self._watchdog_quiet_count = 0
             except Exception as e:
                 self._log(f'[MinerInterface] watchdog warning: {type(e).__name__}: {e}')
 
@@ -2414,6 +2680,8 @@ class MinerInterface:
 
     def _local_ingest_router_packet(self, packet: RouterPacket, *, reason: str = 'miner_local_ingest') -> bool:
         if packet is None or not packet.to_bytes():
+            return False
+        if _ip_is_multicast_or_broadcast(getattr(packet, 'dst_ip', '')) and getattr(packet, 'topic', '') not in {'p2pool', 'monero'}:
             return False
         ok = False
         try:
@@ -2437,6 +2705,9 @@ class MinerInterface:
 
     def _inject_router_packet(self, packet: RouterPacket, *, peer_key: str = '', reason: str = 'miner_inject') -> bool:
         if packet is None or not packet.to_bytes():
+            return False
+
+        if _ip_is_multicast_or_broadcast(getattr(packet, 'dst_ip', '')) and getattr(packet, 'topic', '') not in {'p2pool', 'monero'}:
             return False
 
         raw_base_url = str(getattr(self.remote_connection, 'router_base_url', '') or '').strip()
@@ -2579,6 +2850,7 @@ class MinerInterface:
                 return
             self._rx_packets += 1
             self._last_packet_ts = time.time()
+            self._last_peer_packet_ts = self._last_packet_ts
         self._log_activity(f'[MinerInterface] 📥 socket-rx peer={peer_key} bytes={len(blob)}', force=True, min_interval_sec=0.5)
         try:
             self.remote_connection._received_packets.append({
@@ -2609,6 +2881,61 @@ class MinerInterface:
         except Exception:
             pass
 
+    def _capture_service_kind(self, packet: Dict[str, Any]) -> int:
+        topic = _safe_str(packet.get('topic')).lower()
+        sport = _safe_int(packet.get('sport'), 0)
+        dport = _safe_int(packet.get('dport'), 0)
+        if topic == 'p2pool' or sport in self.remote_connection._P2POOL_PORTS or dport in self.remote_connection._P2POOL_PORTS:
+            return RemoteConnectionDll.RC_SERVICE_P2POOL_P2P
+        if topic == 'monero' or sport in self.remote_connection._MONERO_PORTS or dport in self.remote_connection._MONERO_PORTS:
+            return RemoteConnectionDll.RC_SERVICE_MONERO_P2P
+        return RemoteConnectionDll.RC_SERVICE_UNKNOWN
+
+    def _capture_peer_key(self, packet: Dict[str, Any], service_kind: int) -> str:
+        src_ip = _safe_str(packet.get('src_ip'))
+        dst_ip = _safe_str(packet.get('dst_ip'))
+        sport = _safe_int(packet.get('sport'), 0)
+        dport = _safe_int(packet.get('dport'), 0)
+        if service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN:
+            if dport in (_CAPTURE_PEER_PORTS | self.remote_connection._MONERO_PORTS | self.remote_connection._P2POOL_PORTS):
+                return f'{dst_ip}:{dport}' if dst_ip and dport > 0 else ''
+            if sport in (_CAPTURE_PEER_PORTS | self.remote_connection._MONERO_PORTS | self.remote_connection._P2POOL_PORTS):
+                return f'{src_ip}:{sport}' if src_ip and sport > 0 else ''
+        if dst_ip and dport > 0:
+            return f'{dst_ip}:{dport}'
+        if src_ip and sport > 0:
+            return f'{src_ip}:{sport}'
+        return ''
+
+    def _remember_peer_hint(self, packet: Dict[str, Any], peer_key: str) -> None:
+        if not peer_key:
+            return
+        with self._mu:
+            self._peer_device_hints[str(peer_key)] = dict(packet)
+
+    def _capture_packet_is_noise(self, packet: Dict[str, Any], service_kind: int) -> bool:
+        topic = _safe_str(packet.get('topic')).lower()
+        proto = _safe_str(packet.get('proto')).lower()
+        dst_ip = _safe_str(packet.get('dst_ip'))
+        sport = _safe_int(packet.get('sport'), 0)
+        dport = _safe_int(packet.get('dport'), 0)
+        payload_len = _safe_int(packet.get('payload_len'), 0)
+        flags = _safe_str(packet.get('flags')).upper()
+
+        if service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN:
+            return False
+        if topic in _CAPTURE_NOISE_TOPICS:
+            return True
+        if _ip_is_multicast_or_broadcast(dst_ip):
+            return True
+        if proto == 'udp' and (sport in _CAPTURE_UDP_NOISE_PORTS or dport in _CAPTURE_UDP_NOISE_PORTS):
+            return True
+        if proto == 'tcp' and payload_len <= 0 and flags in {'ACK', 'RST', 'FIN', 'NONE'} and dport not in _CAPTURE_PEER_PORTS and sport not in _CAPTURE_PEER_PORTS:
+            return True
+        if not _safe_str(packet.get('src_ip')) and not _safe_str(packet.get('dst_ip')):
+            return True
+        return False
+
     def _on_capture_packet(self, packet: Dict[str, Any]) -> None:
         if not isinstance(packet, dict):
             return
@@ -2623,175 +2950,109 @@ class MinerInterface:
             self._last_packet_ts = now
             self._last_device_packet = dict(packet)
         try:
-            src_ip = str(packet.get('src_ip') or '')
-            dst_ip = str(packet.get('dst_ip') or '')
-            sport = int(packet.get('sport') or 0)
-            dport = int(packet.get('dport') or 0)
-            topic = str(packet.get('topic') or '')
-            proto = str(packet.get('proto') or packet.get('l4') or '')
-            service_kind = RemoteConnectionDll.RC_SERVICE_UNKNOWN
-            if topic == 'p2pool' or sport in self.remote_connection._P2POOL_PORTS or dport in self.remote_connection._P2POOL_PORTS:
-                service_kind = RemoteConnectionDll.RC_SERVICE_P2POOL_P2P
-            elif topic == 'monero' or sport in self.remote_connection._MONERO_PORTS or dport in self.remote_connection._MONERO_PORTS:
-                service_kind = RemoteConnectionDll.RC_SERVICE_MONERO_P2P
-            if src_ip and sport:
-                self._peer_device_hints[f'{src_ip}:{sport}'] = dict(packet)
-            if dst_ip and dport:
-                self._peer_device_hints[f'{dst_ip}:{dport}'] = dict(packet)
-            router_pkt = RouterPacket.from_capture_dict(packet, iface=self.IFACE_NAME, source='minerinterface:capture', capture_quality='miner_injected')
+            src_ip = _safe_str(packet.get('src_ip'))
+            dst_ip = _safe_str(packet.get('dst_ip'))
+            sport = _safe_int(packet.get('sport'), 0)
+            dport = _safe_int(packet.get('dport'), 0)
+            topic = _safe_str(packet.get('topic'))
+            proto = _safe_str(packet.get('proto') or packet.get('l4'))
+            service_kind = self._capture_service_kind(packet)
+            peer_key = self._capture_peer_key(packet, service_kind)
+
+            if peer_key:
+                self._remember_peer_hint(packet, peer_key)
+                with self._mu:
+                    self._last_peer_packet_ts = now
+
+            if hasattr(self.remote_connection, 'note_passive_peer_observation') and peer_key:
+                try:
+                    self.remote_connection.note_passive_peer_observation(
+                        peer_key=peer_key,
+                        service_kind=service_kind,
+                        via='libpcap',
+                        src_ip=src_ip,
+                        src_port=sport,
+                        dst_ip=dst_ip,
+                        dst_port=dport,
+                        payload_len=_safe_int(packet.get('payload_len'), 0),
+                        flags=_safe_str(packet.get('flags')),
+                        topic=topic,
+                    )
+                except Exception:
+                    pass
+
+            is_noise = self._capture_packet_is_noise(packet, service_kind)
+            if is_noise:
+                with self._mu:
+                    self._capture_low_value += 1
+                    self._capture_noise_drop += 1
+                    self._last_capture_reason = 'capture_noise_drop'
+                self._log_activity(
+                    f'[MinerInterface] 🛑 dropped noise topic={topic or "?"} proto={proto or "?"} peer={peer_key or "?"} bytes={_safe_int(packet.get("raw_len"), 0)}',
+                    force=False,
+                    min_interval_sec=0.30,
+                )
+                return
+
+            router_pkt = RouterPacket.from_capture_dict(
+                packet,
+                iface=self.IFACE_NAME,
+                source='minerinterface:capture',
+                capture_quality='miner_injected',
+            )
             pkt_meta = router_pkt.to_event_dict().get('result') or {}
             blob = router_pkt.to_bytes()
-            high_value = self.remote_connection._is_high_value_transport_packet(pkt_meta, blob, threshold=0.40)
+            threshold = 0.32 if service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN else 0.54
+            high_value = self.remote_connection._is_high_value_transport_packet(pkt_meta, blob, threshold=threshold)
+
             with self._mu:
                 if high_value:
                     self._capture_high_value += 1
                 else:
                     self._capture_low_value += 1
+
             self.remote_connection.ingest_packet_raw_event({'result': pkt_meta})
-            inject_reason = 'capture_rx' if high_value else 'capture_rx_low_value'
-            injected = self._inject_router_packet(router_pkt, peer_key=router_pkt.peer_key(), reason=inject_reason)
+
+            should_inject = bool(
+                high_value
+                or service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN
+                or (peer_key and self._peer_seen_gate.admit(peer_key, now=now, ttl_sec=6.0))
+            )
+
+            inject_reason = 'capture_rx' if high_value else ('capture_peer_observe' if should_inject else 'capture_seen_only')
+            injected = False
+            if should_inject:
+                injected = self._inject_router_packet(router_pkt, peer_key=peer_key, reason=inject_reason)
             self._last_capture_reason = inject_reason
-            plen = len(blob)
+
             self._log_activity(
-                f"[MinerInterface] 🧲 capture idx={self.rx_packets} topic={topic or '?'} proto={proto or '?'} peer={router_pkt.peer_key() or '?'} bytes={plen} high_value={str(bool(high_value)).lower()} injected={str(bool(injected)).lower()}",
-                force=(self.rx_packets <= 8),
+                f'[MinerInterface] 🧲 capture idx={self.rx_packets} topic={topic or "?"} proto={proto or "?"} peer={peer_key or "?"} bytes={len(blob)} high_value={str(bool(high_value)).lower()} inject={str(bool(should_inject)).lower()} injected={str(bool(injected)).lower()}',
+                force=(self.rx_packets <= 8 or service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN),
                 min_interval_sec=0.25,
             )
-            payload = b''
-            try:
-                payload, _meta = self.remote_connection._payload_from_maybe_packet(blob)
-            except Exception:
-                payload = blob
-            if payload and service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN:
-                peer_key = f'{dst_ip}:{dport}' if dport in (self.remote_connection._MONERO_PORTS | self.remote_connection._P2POOL_PORTS) else f'{src_ip}:{sport}'
-                direction = self.remote_connection._direction_for_packet(src_ip, sport, dst_ip, dport)
-                self.remote_connection.feed_stream_bytes(
-                    stream_id=f'libpcap:{src_ip}:{sport}>{dst_ip}:{dport}',
-                    peer=peer_key,
-                    direction=direction,
-                    data=payload,
-                    service=service_kind,
-                    timestamp_ms=int(now * 1000.0),
-                )
+
+            if service_kind != RemoteConnectionDll.RC_SERVICE_UNKNOWN:
+                payload = b''
+                try:
+                    payload, _meta = self.remote_connection._payload_from_maybe_packet(blob)
+                except Exception:
+                    payload = blob
+                if payload:
+                    direction = self.remote_connection._direction_for_packet(src_ip, sport, dst_ip, dport)
+                    peer_for_stream = peer_key or (f'{dst_ip}:{dport}' if dst_ip and dport else f'{src_ip}:{sport}' if src_ip and sport else '')
+                    if peer_for_stream:
+                        self.remote_connection.feed_stream_bytes(
+                            stream_id=f'libpcap:{src_ip}:{sport}>{dst_ip}:{dport}',
+                            peer=peer_for_stream,
+                            direction=direction,
+                            data=payload,
+                            service=service_kind,
+                            timestamp_ms=int(now * 1000.0),
+                        )
         except Exception as e:
             with self._mu:
                 self._last_error = str(e)
             self._log(f'[MinerInterface] capture handler warning: {type(e).__name__}: {e}')
-
-    def send_frame(self, frame: bytes, *, peer_key: Optional[str] = None, reason: str = 'raw_frame') -> bool:
-        blob = bytes(frame or b'')
-        if not blob:
-            return False
-        backend = self._backend
-        device_name = self.device_name
-        if backend is None or not device_name:
-            return False
-        try:
-            backend.send_packet(blob)
-            with self._mu:
-                self._tx_packets += 1
-                self._tx_queue.append((peer_key, blob[:128], reason))
-            return True
-        except Exception as e:
-            with self._mu:
-                self._last_error = str(e)
-            return False
-
-    def queue_socket_payload(self, peer_key: str, payload: bytes, *, reason: str = 'minerinterface_socket_payload') -> int:
-        blob = bytes(payload or b'')
-        if not blob:
-            return 0
-        try:
-            pkt = self._router_packet_from_socket_payload(peer_key, blob, outbound=True, reason=reason)
-            if pkt is not None:
-                self._inject_router_packet(pkt, peer_key=peer_key, reason=reason)
-        except Exception:
-            pass
-        rc = self.remote_connection.send_payload(blob, host=str(peer_key).split(':')[0], port=int(str(peer_key).split(':')[1]))
-        if rc > 0:
-            with self._mu:
-                self._tx_packets += 1
-                self._tx_queue.append((peer_key, blob[:128], reason))
-        return rc
-
-    def send_monero_handshake(self, peer_key: str, *, service_kind: int = RemoteConnectionDll.RC_SERVICE_MONERO_P2P, reason: str = 'minerinterface_handshake') -> int:
-        try:
-            return self.send_monero_packet(MoneroPacket.handshake(self.remote_connection, peer_key, reason=reason))
-        except Exception as e:
-            with self._mu:
-                self._last_error = str(e)
-            return 0
-
-    def send_p2pool_handshake(self, peer_key: str, *, reason: str = 'minerinterface_p2pool_handshake') -> int:
-        try:
-            return self.send_p2pool_packet(P2PoolPacket.handshake(self.remote_connection, peer_key, reason=reason))
-        except Exception as e:
-            with self._mu:
-                self._last_error = str(e)
-            return 0
-
-    def send_ping(self, peer_key: str, *, service_kind: int = RemoteConnectionDll.RC_SERVICE_MONERO_P2P, reason: str = 'minerinterface_ping') -> int:
-        try:
-            if int(service_kind) == RemoteConnectionDll.RC_SERVICE_P2POOL_P2P:
-                return self.send_p2pool_packet(P2PoolPacket.ping(self.remote_connection, peer_key, reason=reason))
-            return self.send_monero_packet(MoneroPacket.ping(self.remote_connection, peer_key, reason=reason))
-        except Exception as e:
-            with self._mu:
-                self._last_error = str(e)
-            return 0
-
-    def maybe_send_hot_hash_probe(self, peer_key: str, score: float) -> int:
-        score = float(score)
-        if score <= 0.0:
-            return 0
-        service_kind = int(self.remote_connection._peer_services.get(peer_key, RemoteConnectionDll.RC_SERVICE_P2POOL_P2P))
-        sent = 0
-        try:
-            if service_kind == RemoteConnectionDll.RC_SERVICE_P2POOL_P2P:
-                if score >= 6.0:
-                    sent += self.send_p2pool_packet(P2PoolPacket.handshake(self.remote_connection, peer_key, reason='hot_hash_probe_p2pool_handshake'))
-                    sent += self.send_p2pool_packet(P2PoolPacket.timed_sync(self.remote_connection, peer_key, reason='hot_hash_probe_p2pool_timed_sync'))
-                    sent += self.send_p2pool_packet(P2PoolPacket.support_flags(self.remote_connection, peer_key, reason='hot_hash_probe_p2pool_support_flags'))
-                    return sent
-                if score >= 3.0:
-                    sent += self.send_p2pool_packet(P2PoolPacket.timed_sync(self.remote_connection, peer_key, reason='hot_hash_probe_p2pool_timed_sync'))
-                    sent += self.send_p2pool_packet(P2PoolPacket.support_flags(self.remote_connection, peer_key, reason='hot_hash_probe_p2pool_support_flags'))
-                    return sent
-                if score >= 1.50:
-                    return self.send_p2pool_handshake(peer_key, reason='hot_hash_probe_p2pool_handshake')
-                return self.send_ping(peer_key, service_kind=service_kind, reason='hot_hash_probe_p2pool_ping')
-            if score >= 4.50:
-                sent += self.send_monero_packet(MoneroPacket.handshake(self.remote_connection, peer_key, reason='hot_hash_probe_monero_handshake'))
-                sent += self.send_monero_packet(MoneroPacket.timed_sync(self.remote_connection, peer_key, reason='hot_hash_probe_monero_timed_sync'))
-                return sent
-            if score >= 2.0:
-                return self.send_monero_handshake(peer_key, service_kind=service_kind, reason='hot_hash_probe_monero_handshake')
-            return self.send_ping(peer_key, service_kind=service_kind, reason='hot_hash_probe_monero_ping')
-        except Exception as e:
-            with self._mu:
-                self._last_error = str(e)
-            return sent
-
-    def snapshot(self) -> Dict[str, Any]:
-        with self._mu:
-            return {
-                'started': bool(self._started),
-                'device_name': self.device_name,
-                'capture_running': bool(self._backend.capture_running) if self._backend is not None else False,
-                'rx_packets': int(self._rx_packets),
-                'tx_packets': int(self._tx_packets),
-                'last_error': str(self._last_error or ''),
-                'last_packet_ts': float(self._last_packet_ts or 0.0),
-                'last_device_packet': dict(self._last_device_packet),
-                'known_peers': len(self._peer_device_hints),
-                'inject_success': int(self._inject_success),
-                'inject_fail': int(self._inject_fail),
-                'inject_garbage': int(self._inject_garbage),
-                'capture_high_value': int(self._capture_high_value),
-                'capture_low_value': int(self._capture_low_value),
-                'capture_restart_count': int(self._capture_restart_count),
-                'last_capture_reason': str(self._last_capture_reason or ''),
-            }
 
 
 class RemoteConnection:
@@ -3533,6 +3794,35 @@ class RemoteConnection:
             }
             self._peer_state[peer_key] = st
         return st
+
+    def note_passive_peer_observation(
+        self,
+        *,
+        peer_key: str,
+        service_kind: int,
+        via: str,
+        src_ip: str = '',
+        src_port: int = 0,
+        dst_ip: str = '',
+        dst_port: int = 0,
+        payload_len: int = 0,
+        flags: str = '',
+        topic: str = '',
+    ) -> None:
+        peer_key_s = str(peer_key or '').strip()
+        if not peer_key_s:
+            return
+        now = time.time()
+        with self._mu:
+            st = self._ensure_peer_state_locked(peer_key_s)
+            st['last_activity_ts'] = now
+            if int(payload_len) > 0:
+                st['last_rx_ts'] = now
+                st['rx_packets'] = int(st.get('rx_packets', 0)) + 1
+                st['rx_bytes'] = int(st.get('rx_bytes', 0)) + int(payload_len)
+            st['last_preview'] = f'{via}:{topic}:{flags}:{payload_len}'
+            if int(service_kind) in (RemoteConnectionDll.RC_SERVICE_MONERO_P2P, RemoteConnectionDll.RC_SERVICE_P2POOL_P2P):
+                self._peer_services[peer_key_s] = int(service_kind)
 
     @staticmethod
     def _shannon_entropy(data: bytes) -> float:
@@ -6937,16 +7227,6 @@ class P2PoolShareHunterWorker:
         return out
 
     def _run_lane(self, st: _WorkerLane) -> None:
-        st.error = None
-        st.hashes_done = 0
-        st.stale_aborts = 0
-        st.chain_hits = 0
-        st.submitted_hits = 0
-        st.streak_groups = 0
-        st.max_streak_len = 0
-        st.found = []
-        st.best = []
-
         job = st.assigned_job
         if job is None or st.assigned_count <= 0:
             return
@@ -6980,7 +7260,9 @@ class P2PoolShareHunterWorker:
 
         found_pool = _UniqueNonceCandidatePool(limit=max(64, result_cap * 16))
         best_pool = _UniqueNonceCandidatePool(limit=max(64, best_cap * 16))
-        pending_submit_pool = _UniqueNonceCandidatePool(limit=max(self._pending_submit_limit, result_cap * 16))
+        pending_submit_pool = _UniqueNonceCandidatePool(
+            limit=max(self._pending_submit_limit, result_cap * 16)
+        )
 
         burst_pool = _UniqueNonceCandidatePool(limit=max(32, result_cap * 8))
         last_burst_nonce: Optional[int] = None
@@ -6988,9 +7270,55 @@ class P2PoolShareHunterWorker:
         streak_len = 0
         harvest_budget_left = 0
         stale_triggered = False
-        batch_submit_target = max(self._min_unique_flush, min(self._max_unique_flush, max(2, result_cap * 2)))
+        batch_submit_target = max(
+            self._min_unique_flush,
+            min(self._max_unique_flush, max(2, result_cap * 2)),
+        )
         if submit_immediately:
             batch_submit_target = 1
+
+        next_live_check = 0
+        next_stale_check = 0
+        pending_direct_notes = 0
+
+        def _flush_direct_notes() -> None:
+            nonlocal pending_direct_notes
+            if pending_direct_notes <= 0:
+                return
+            controller = self.python_usage_controller
+            if controller is not None:
+                try:
+                    controller.note_direct_hashes(st.worker_index, pending_direct_notes)
+                except Exception:
+                    pass
+            pending_direct_notes = 0
+
+        def _should_abort_current_local(
+                step_index: int,
+                local_live_check: int,
+                local_stale_check: int,
+        ) -> Tuple[bool, int, int]:
+            if is_current is None:
+                return False, local_live_check, local_stale_check
+
+            should_check = False
+            if step_index >= local_stale_check:
+                local_stale_check = step_index + stale_poll_interval
+                should_check = True
+            if step_index >= local_live_check:
+                local_live_check = step_index + poll_interval
+                should_check = True
+
+            if not should_check:
+                return False, local_live_check, local_stale_check
+
+            try:
+                if not bool(is_current()):
+                    return True, local_live_check, local_stale_check
+            except Exception:
+                pass
+
+            return False, local_live_check, local_stale_check
 
         def _reset_burst() -> None:
             nonlocal burst_pool, last_burst_nonce, streak_len
@@ -7042,10 +7370,36 @@ class P2PoolShareHunterWorker:
             rows = pending_submit_pool.rows_sorted()
             pending_submit_pool.clear()
             harvest_budget_left = 0
-            return int(self._flush_candidates(job_key=job_key, rows=rows, submit_candidate=submit_candidate))
+            return int(
+                self._flush_candidates(
+                    job_key=job_key,
+                    rows=rows,
+                    submit_candidate=submit_candidate,
+                )
+            )
 
-        def _consume_hash_result(row_nonce_u32: int, row_value64: int, row_result32: bytes) -> None:
+        def _post_hash_progress(hashes_advanced: int) -> None:
+            nonlocal harvest_budget_left
+            step_n = max(0, int(hashes_advanced))
+            if step_n > 0 and harvest_budget_left > 0:
+                harvest_budget_left = max(0, int(harvest_budget_left) - step_n)
+
+            if len(burst_pool) > 0 and harvest_budget_left <= 0:
+                committed_now = _commit_burst()
+                if committed_now > 0:
+                    st.submitted_hits += _flush_pending(force=False)
+                _reset_burst()
+
+            if len(pending_submit_pool) > 0:
+                st.submitted_hits += _flush_pending(force=False)
+
+        def _consume_candidate_result(
+                row_nonce_u32: int,
+                row_value64: int,
+                row_result32: bytes,
+        ) -> None:
             nonlocal last_burst_nonce, streak_len
+
             row = (int(row_nonce_u32), int(row_value64), bytes(row_result32))
 
             if row_value64 < target64:
@@ -7084,69 +7438,71 @@ class P2PoolShareHunterWorker:
             elif row_value64 < near_cutoff:
                 best_pool.add(row)
 
-            if len(burst_pool) > 0 and harvest_budget_left <= 0:
-                committed_now = _commit_burst()
-                if committed_now > 0:
-                    st.submitted_hits += _flush_pending(force=False)
-                _reset_burst()
-
-            if len(pending_submit_pool) > 0:
-                st.submitted_hits += _flush_pending(force=False)
-
         def _run_usage_hash_chunk(chunk_n: int) -> Dict[str, Any]:
             local_rows: List[Tuple[int, int, bytes]] = []
             local_nonce = int(nonce_u32) & 0xFFFFFFFF
             local_remaining = int(remaining)
             local_steps = int(local_step_counter)
+            local_live_check = int(next_live_check)
+            local_stale_check = int(next_stale_check)
+            local_hashes_done = 0
             local_stale_abort = False
 
             for _ in range(max(1, int(chunk_n))):
                 if local_remaining <= 0:
                     break
-                if self._stop.is_set() or (external_stop_is_set is not None and external_stop_is_set()):
+                if self._stop.is_set() or (
+                        external_stop_is_set is not None and external_stop_is_set()
+                ):
                     break
 
-                if is_current is not None and (local_steps % stale_poll_interval == 0):
-                    try:
-                        if not bool(is_current()):
-                            local_stale_abort = True
-                            break
-                    except Exception:
-                        pass
-
-                if is_current is not None and (local_steps % poll_interval == 0):
-                    try:
-                        if not bool(is_current()):
-                            local_stale_abort = True
-                            break
-                    except Exception:
-                        pass
+                should_abort, local_live_check, local_stale_check = _should_abort_current_local(
+                    local_steps,
+                    local_live_check,
+                    local_stale_check,
+                )
+                if should_abort:
+                    local_stale_abort = True
+                    break
 
                 nonce_ptr[0] = local_nonce
                 hash_into(st.vm, st.blob_buf, out_buf)
-                value64 = int(value64_view.value) if use_view else int(read_tail64(out_buf))
-                local_rows.append((int(local_nonce), int(value64), bytes(out_buf)))
 
+                value64 = int(value64_view.value) if use_view else int(read_tail64(out_buf))
+                if value64 < near_cutoff:
+                    local_rows.append((int(local_nonce), int(value64), bytes(out_buf)))
+
+                local_hashes_done += 1
                 local_steps += 1
                 local_nonce = (local_nonce + stride) & 0xFFFFFFFF
                 local_remaining -= 1
 
             return {
                 "rows": local_rows,
+                "hashes_done": int(local_hashes_done),
                 "nonce_after": int(local_nonce) & 0xFFFFFFFF,
                 "remaining_after": int(local_remaining),
                 "steps_after": int(local_steps),
+                "next_live_check_after": int(local_live_check),
+                "next_stale_check_after": int(local_stale_check),
                 "stale_abort": bool(local_stale_abort),
             }
 
         while remaining > 0:
-            if self._stop.is_set() or (external_stop_is_set is not None and external_stop_is_set()):
+            if self._stop.is_set() or (
+                    external_stop_is_set is not None and external_stop_is_set()
+            ):
                 break
 
             used_usage = False
             usage_controller = self.python_usage_controller
+            effective_chunk_cap = 1 if submit_immediately else hash_chunk_cap
+
             if usage_controller is not None and usage_controller.should_run(st.worker_index):
-                chunk_n = min(max(1, int(hash_chunk_cap)), max(1, int(usage_controller.suggested_chunk_hashes(remaining))))
+                chunk_n = min(
+                    max(1, int(effective_chunk_cap)),
+                    max(1, int(usage_controller.suggested_chunk_hashes(remaining))),
+                )
                 used_usage, usage_result = usage_controller.invoke_chunk(
                     st.worker_index,
                     _run_usage_hash_chunk,
@@ -7154,21 +7510,35 @@ class P2PoolShareHunterWorker:
                 )
                 if used_usage and isinstance(usage_result, dict):
                     rows = list(usage_result.get("rows") or [])
+                    chunk_hashes_done = max(
+                        0,
+                        int(usage_result.get("hashes_done", len(rows))),
+                    )
+
                     for row_nonce_u32, row_value64, row_result32 in rows:
-                        st.hashes_done += 1
-                        if harvest_budget_left > 0:
-                            harvest_budget_left -= 1
-                        _consume_hash_result(int(row_nonce_u32), int(row_value64), bytes(row_result32))
+                        _consume_candidate_result(
+                            int(row_nonce_u32),
+                            int(row_value64),
+                            bytes(row_result32),
+                        )
+
+                    st.hashes_done += chunk_hashes_done
+                    _post_hash_progress(chunk_hashes_done)
 
                     nonce_u32 = int(usage_result.get("nonce_after", nonce_u32)) & 0xFFFFFFFF
                     remaining = max(0, int(usage_result.get("remaining_after", remaining)))
-                    local_step_counter = max(local_step_counter, int(usage_result.get("steps_after", local_step_counter)))
-
-                    if rows:
-                        try:
-                            usage_controller.note_direct_hashes(st.worker_index, 0)
-                        except Exception:
-                            pass
+                    local_step_counter = max(
+                        local_step_counter,
+                        int(usage_result.get("steps_after", local_step_counter)),
+                    )
+                    next_live_check = max(
+                        next_live_check,
+                        int(usage_result.get("next_live_check_after", next_live_check)),
+                    )
+                    next_stale_check = max(
+                        next_stale_check,
+                        int(usage_result.get("next_stale_check_after", next_stale_check)),
+                    )
 
                     if bool(usage_result.get("stale_abort", False)):
                         st.stale_aborts += 1
@@ -7177,45 +7547,55 @@ class P2PoolShareHunterWorker:
 
                     continue
 
-            if is_current is not None and (local_step_counter % stale_poll_interval == 0):
-                try:
-                    if not bool(is_current()):
-                        st.stale_aborts += 1
-                        stale_triggered = True
-                        break
-                except Exception:
-                    pass
+            chunk_n = min(max(1, int(effective_chunk_cap)), remaining)
+            chunk_hashed = 0
 
-            if is_current is not None and (local_step_counter % poll_interval == 0):
-                try:
-                    if not bool(is_current()):
-                        st.stale_aborts += 1
-                        stale_triggered = True
-                        break
-                except Exception:
-                    pass
+            for _ in range(chunk_n):
+                if self._stop.is_set() or (
+                        external_stop_is_set is not None and external_stop_is_set()
+                ):
+                    break
 
-            nonce_ptr[0] = nonce_u32
-            hash_into(st.vm, st.blob_buf, out_buf)
+                should_abort, next_live_check, next_stale_check = _should_abort_current_local(
+                    local_step_counter,
+                    next_live_check,
+                    next_stale_check,
+                )
+                if should_abort:
+                    st.stale_aborts += 1
+                    stale_triggered = True
+                    break
 
-            st.hashes_done += 1
-            local_step_counter += 1
+                nonce_ptr[0] = nonce_u32
+                hash_into(st.vm, st.blob_buf, out_buf)
 
-            if self.python_usage_controller is not None:
-                try:
-                    self.python_usage_controller.note_direct_hashes(st.worker_index, 1)
-                except Exception:
-                    pass
+                value64 = int(value64_view.value) if use_view else int(read_tail64(out_buf))
 
-            if harvest_budget_left > 0:
-                harvest_budget_left -= 1
+                st.hashes_done += 1
+                local_step_counter += 1
+                chunk_hashed += 1
+                pending_direct_notes += 1
 
-            value64 = int(value64_view.value) if use_view else int(read_tail64(out_buf))
-            result32 = bytes(out_buf)
-            _consume_hash_result(int(nonce_u32), int(value64), result32)
+                if value64 < near_cutoff:
+                    _consume_candidate_result(
+                        int(nonce_u32),
+                        int(value64),
+                        bytes(out_buf),
+                    )
 
-            nonce_u32 = (nonce_u32 + stride) & 0xFFFFFFFF
-            remaining -= 1
+                nonce_u32 = (nonce_u32 + stride) & 0xFFFFFFFF
+                remaining -= 1
+
+                if remaining <= 0:
+                    break
+
+            _post_hash_progress(chunk_hashed)
+            _flush_direct_notes()
+
+            if stale_triggered:
+                break
+
+        _flush_direct_notes()
 
         if len(burst_pool) > 0:
             _commit_burst()
