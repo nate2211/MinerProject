@@ -669,76 +669,96 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
 
     # --- OPTIMIZED: Main Loop (Critical for Profit) ---
     def hash_loop(
-        self,
-        *,
-        count: int, write_next_nonce, batch, stop_flag,
-        stale_mask: int, is_current, job_id: str,
-        generation: int,
+            self,
+            *,
+            count: int, write_next_nonce, batch, stop_flag,
+            stale_mask: int, is_current, job_id: str,
+            generation: int,
     ) -> int:
-        # Hoist *everything* needed to local variables for max speed
         done = 0
-        target64 = self._target64
+
+        target64 = int(self._target64) & 0xFFFFFFFFFFFFFFFF
         out_buf = self._out_buf
         hash_into = self._hash_into
-        best_tail64 = self._best_tail64
-        best_nonce = self._best_nonce_u32
-        hits = self._hits
-        last_hit = self._last_hit_logged_tail64
+
+        best_tail64 = int(self._best_tail64) & 0xFFFFFFFFFFFFFFFF
+        best_nonce = int(self._best_nonce_u32)
+        hits = int(self._hits)
+        last_hit = int(self._last_hit_logged_tail64)
+
         owner = self.owner_key
         j_id = self._job_id
-        j_gen = self._generation
-        h_in_count = 0
+        j_gen = int(self._generation)
 
-        for i in range(int(count)):
+        if hash_into is None or out_buf is None:
+            self._last_error = "hash_loop called while lane is not active"
+            return 0
+
+        safe_count = max(0, int(count or 0))
+        safe_stale_mask = int(stale_mask or 0)
+
+        for i in range(safe_count):
             if stop_flag.is_set():
                 break
-            # Fast stale mask check
-            if (i & stale_mask) == 0 and not is_current(job_id, generation):
-                break
+
+            if safe_stale_mask >= 0 and (i & safe_stale_mask) == 0:
+                if not is_current(job_id, generation):
+                    break
 
             nonce_u32 = write_next_nonce()
-            tail64 = hash_into(self._vm, self._blob_buf, out_buf)
+            if nonce_u32 is None:
+                break
+
+            # IMPORTANT:
+            # randomx.hash_into usually writes the hash into out_buf and returns None.
+            # So do not trust its return value as tail64.
+            maybe_tail64 = hash_into(self._vm, self._blob_buf, out_buf)
+
+            if maybe_tail64 is None:
+                tail64 = self._tail64_fast(out_buf)
+            else:
+                tail64 = int(maybe_tail64) & 0xFFFFFFFFFFFFFFFF
+
             done += 1
 
-            # Hit Check
             if tail64 < target64:
                 hits += 1
-                # Check if better than current best
+
                 if tail64 < best_tail64:
                     old_best = best_tail64
                     best_tail64 = tail64
-                    best_nonce = int(nonce_u32)
+                    best_nonce = int(nonce_u32) & 0xFFFFFFFF
 
                     should_log_hit = False
                     if self._summary_enabled:
                         if last_hit == 0xFFFFFFFFFFFFFFFF:
                             should_log_hit = True
                         elif old_best < 0xFFFFFFFFFFFFFFFF:
-                            # Ratio check
                             if float(tail64) <= float(old_best) * self.HIT_LOG_MIN_IMPROVEMENT_RATIO:
                                 should_log_hit = True
 
                     if should_log_hit:
                         hit_msg = (
                             f"owner={owner} job={j_id} gen={j_gen} "
-                            f"hits={hits} best_nonce={int(nonce_u32)} best_tail64={int(tail64)}"
+                            f"hits={hits} best_nonce={best_nonce} best_tail64={int(tail64)}"
                         )
                         emitted = self._owner_evt_emit("hit", details=hit_msg, cooldown=60.0)
                         if emitted:
                             last_hit = int(tail64)
 
-                # Batch offer
-                # Optimization: Try to minimize bytes() copy if out_buf supports hex directly
-                # Fallback to standard for compatibility
                 batch.offer(
-                    nonce_u32=nonce_u32,
+                    nonce_u32=int(nonce_u32) & 0xFFFFFFFF,
                     hash_hex=bytes(out_buf).hex(),
-                    tail64=tail64,
+                    tail64=int(tail64) & 0xFFFFFFFFFFFFFFFF,
                 )
 
-            # Count hashes processed
-            if tail64 < target64:
-                h_in_count += 1 # Just tracking local hits
+        # Write local hot-loop state back to the object.
+        self._hashes += int(done)
+        self._hits = int(hits)
+        self._best_tail64 = int(best_tail64) & 0xFFFFFFFFFFFFFFFF
+        self._best_nonce_u32 = int(best_nonce)
+        self._last_hit_logged_tail64 = int(last_hit) & 0xFFFFFFFFFFFFFFFF
+        self._consecutive_failures = 0
 
         return done
 
