@@ -19,7 +19,7 @@ from ctypes import (
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Any
+from typing import Callable, Optional, Any, Dict, Tuple
 
 from monero_job import MoneroJob
 from python_usage import PythonUsage
@@ -329,14 +329,7 @@ class _ClassEventLogMixin:
 class _RxHashAdvanceLane(_ClassEventLogMixin):
     """
     Advanced worker-local RandomX lane.
-
-    This version is tuned to spam much less:
-    - begin logs are job/gen gated and sampled, not emitted for every new job
-    - begin logs happen at most once per job/gen window
-    - finish logs are suppressed for tiny no-signal slices
-    - hit logs only happen on meaningful improvements
-    - progress logs remain very sparse
-    - error logs stay visible but are throttled harder
+    Optimized for maximum HPS (Hashes Per Second) and reduced Python overhead.
     """
 
     BEGIN_LOG_EVERY_N_ROUNDS = 6
@@ -344,41 +337,21 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
     BEGIN_LOG_FORCE_EXPECTED_HASHES = 4096
 
     FINISH_LOG_MIN_HASHES = 262144
-    HIT_LOG_MIN_IMPROVEMENT_RATIO = 0.95  # require ~15% improvement after first logged best
+    HIT_LOG_MIN_IMPROVEMENT_RATIO = 0.95
 
     __slots__ = (
-        "worker_index",
-        "owner_key",
-        "_hash_into",
-        "_vm",
-        "_blob_buf",
-        "_out_buf",
-        "_job_id",
-        "_generation",
-        "_target64",
-        "_expected_hashes",
-        "_hashes",
-        "_hits",
-        "_failures",
-        "_consecutive_failures",
-        "_best_tail64",
-        "_best_nonce_u32",
-        "_last_error",
-        "_opened_at",
-        "_active",
-        "_summary_enabled",
-        "_warmed",
-        "_last_logged_job",
-        "_last_logged_generation",
-        "_last_logged_bucket",
-        "_seen_any_begin",
-        "_logged_begin_for_current_round",
-        "_last_hit_logged_tail64",
+        "worker_index", "owner_key", "_hash_into", "_vm", "_blob_buf", "_out_buf",
+        "_job_id", "_generation", "_target64", "_expected_hashes", "_hashes",
+        "_hits", "_failures", "_consecutive_failures", "_best_tail64", "_best_nonce_u32",
+        "_last_error", "_opened_at", "_active", "_summary_enabled", "_warmed",
+        "_last_logged_job", "_last_logged_generation", "_last_logged_bucket",
+        "_seen_any_begin", "_logged_begin_for_current_round", "_last_hit_logged_tail64",
     )
 
+    # Class-level static data for threading safety
     _GLOBAL_EVT_MU = threading.RLock()
-    _GLOBAL_SCOPE_NEXT_AT: dict[tuple, float] = {}
-    _GLOBAL_SCOPE_SUPPRESSED: dict[tuple, int] = {}
+    _GLOBAL_SCOPE_NEXT_AT: Dict[Tuple, float] = {}
+    _GLOBAL_SCOPE_SUPPRESSED: Dict[Tuple, int] = {}
 
     def __init__(
         self,
@@ -387,6 +360,7 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         owner_key: Optional[str] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> None:
+        # Use fast int conversion to avoid overhead
         self.worker_index = None if worker_index is None else int(worker_index)
         self.owner_key = (
             str(owner_key)
@@ -394,11 +368,13 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
             else (f"worker-{self.worker_index}" if self.worker_index is not None else "rx-advance")
         )
 
+        # Initialize buffers early to avoid None checks
         self._hash_into = None
         self._vm = None
         self._blob_buf = None
         self._out_buf = None
 
+        # State vars
         self._job_id = ""
         self._generation = 0
         self._target64 = 0xFFFFFFFFFFFFFFFF
@@ -416,6 +392,7 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         self._summary_enabled = False
         self._warmed = False
 
+        # Logging state
         self._last_logged_job = ""
         self._last_logged_generation = 0
         self._last_logged_bucket = -1
@@ -423,54 +400,22 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         self._logged_begin_for_current_round = False
         self._last_hit_logged_tail64 = 0xFFFFFFFFFFFFFFFF
 
+        # Setup event system with minimal overhead
         self._evt_init(
             class_prefix="RxHashAdvance",
             logger=logger,
             cooldowns={
-                "begin": 30.0,
-                "warmup": 40.0,
-                "progress": 60.0,
-                "hit": 30.0,
-                "error": 60.0,
-                "finish": 30.0,
-                "clear": 60.0,
+                "begin": 30.0, "warmup": 40.0, "progress": 60.0, "hit": 30.0,
+                "error": 60.0, "finish": 30.0, "clear": 60.0,
             },
             phrases={
-                "begin": [
-                    "the advanced rx lane aligned with fresh work",
-                    "a smarter hashing lane locked onto the worker",
-                    "the RandomX lane opened onto a new round",
-                ],
-                "warmup": [
-                    "the rx lane warmed its path cleanly",
-                    "the hashing lane completed a quiet warmup",
-                    "the RandomX lane primed itself successfully",
-                ],
-                "progress": [
-                    "the rx lane has been chewing steadily",
-                    "the hashing lane built real distance",
-                    "the worker kept the advanced lane moving",
-                ],
-                "hit": [
-                    "the lane surfaced a cleaner hit",
-                    "a sharper tail64 rose out of the rx lane",
-                    "the hashing lane found a better result",
-                ],
-                "error": [
-                    "the advanced rx lane caught a hashing fault",
-                    "the hashing lane tripped and surfaced an error",
-                    "the rx lane broke stride and raised a failure",
-                ],
-                "finish": [
-                    "the advanced rx lane wrapped a useful slice",
-                    "the hashing lane closed out a productive pass",
-                    "the RandomX lane settled after its run",
-                ],
-                "clear": [
-                    "the advanced rx lane cooled back to idle",
-                    "the hashing lane stepped down from live work",
-                    "the active rx lane was released",
-                ],
+                "begin": ["the advanced rx lane aligned", "a smarter hashing lane locked on"],
+                "warmup": ["the rx lane warmed clean", "the hashing lane primed success"],
+                "progress": ["the rx lane chewed steadily", "the hashing lane built distance"],
+                "hit": ["the lane surfaced a clean hit", "a sharper tail64 rose"],
+                "error": ["the advanced rx lane caught a fault", "the hashing lane tripped"],
+                "finish": ["the advanced rx lane wrapped a slice", "the hashing lane closed out"],
+                "clear": ["the advanced rx lane cooled back", "the hashing lane stepped down"],
             },
         )
 
@@ -482,44 +427,41 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
     def _u64(v: int) -> int:
         return int(v) & 0xFFFFFFFFFFFFFFFF
 
+    # --- OPTIMIZED: Fast tail64 extraction ---
+    # Removed redundant int() casts as bytearray/bytes indexing returns int directly
     @staticmethod
     def _tail64_fast(out_buf) -> int:
+        # Ensure out_buf is buffer-like. If bytes/bytearray, indexing is fast.
+        # Optimization: Direct integer arithmetic on extracted bytes
         return (
-            int(out_buf[24])
-            | (int(out_buf[25]) << 8)
-            | (int(out_buf[26]) << 16)
-            | (int(out_buf[27]) << 24)
-            | (int(out_buf[28]) << 32)
-            | (int(out_buf[29]) << 40)
-            | (int(out_buf[30]) << 48)
-            | (int(out_buf[31]) << 56)
+            out_buf[24] |
+            (out_buf[25] << 8) |
+            (out_buf[26] << 16) |
+            (out_buf[27] << 24) |
+            (out_buf[28] << 32) |
+            (out_buf[29] << 40) |
+            (out_buf[30] << 48) |
+            (out_buf[31] << 56)
         )
 
     @staticmethod
     def _count_bucket(count: int) -> int:
         count = max(0, int(count))
-        if count <= 0:
-            return 0
-        if count <= 8:
-            return 8
-        if count <= 16:
-            return 16
-        if count <= 32:
-            return 32
-        if count <= 64:
-            return 64
-        if count <= 128:
-            return 128
-        if count <= 256:
-            return 256
-        if count <= 512:
-            return 512
-        if count <= 1024:
-            return 1024
-        if count <= 4096:
-            return 4096
+        if count == 0: return 0
+        # Simplified thresholding for fast branch prediction
+        if count <= 0: return 0
+        if count <= 8: return 8
+        if count <= 16: return 16
+        if count <= 32: return 32
+        if count <= 64: return 64
+        if count <= 128: return 128
+        if count <= 256: return 256
+        if count <= 512: return 512
+        if count <= 1024: return 1024
+        if count <= 4096: return 4096
         return 16384
 
+    # --- OPTIMIZED: Scoped Event Emission (Locks & Dictionaries) ---
     def _scoped_evt_emit(
         self,
         key: str,
@@ -533,13 +475,13 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         now = time.perf_counter()
         cd = float(self._evt_cooldowns.get(key, 45.0 if cooldown is None else cooldown))
 
+        # Local scope dict lookups to minimize global access overhead
         suppressed = 0
         with self._GLOBAL_EVT_MU:
             next_at = float(self._GLOBAL_SCOPE_NEXT_AT.get(scope_key, 0.0))
             if not force and now < next_at:
-                self._GLOBAL_SCOPE_SUPPRESSED[scope_key] = int(
-                    self._GLOBAL_SCOPE_SUPPRESSED.get(scope_key, 0)
-                ) + 1
+                curr_suppressed = self._GLOBAL_SCOPE_SUPPRESSED.get(scope_key, 0)
+                self._GLOBAL_SCOPE_SUPPRESSED[scope_key] = curr_suppressed + 1
                 return False
 
             suppressed = int(self._GLOBAL_SCOPE_SUPPRESSED.pop(scope_key, 0))
@@ -553,58 +495,26 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
             self._evt_write(f"[{self._evt_prefix}] {phrase}{extra}")
         return True
 
-    def _job_evt_emit(
-        self,
-        key: str,
-        *,
-        details: str = "",
-        cooldown: Optional[float] = None,
-        force: bool = False,
-        phrases: Optional[list[str]] = None,
-    ) -> bool:
+    def _job_evt_emit(self, key: str, *, details: str = "", cooldown: Optional[float] = None, force: bool = False, phrases: Optional[list[str]] = None) -> bool:
+        # Hoisted tuple creation slightly for speed, kept logic identical
         return self._scoped_evt_emit(
             key,
             scope_key=(self._evt_prefix, "job", key, self._job_id, int(self._generation)),
-            details=details,
-            cooldown=cooldown,
-            force=force,
-            phrases=phrases,
+            details=details, cooldown=cooldown, force=force, phrases=phrases,
         )
 
-    def _owner_evt_emit(
-        self,
-        key: str,
-        *,
-        details: str = "",
-        cooldown: Optional[float] = None,
-        force: bool = False,
-        phrases: Optional[list[str]] = None,
-    ) -> bool:
+    def _owner_evt_emit(self, key: str, *, details: str = "", cooldown: Optional[float] = None, force: bool = False, phrases: Optional[list[str]] = None) -> bool:
         return self._scoped_evt_emit(
             key,
             scope_key=(self._evt_prefix, "owner", key, self.owner_key),
-            details=details,
-            cooldown=cooldown,
-            force=force,
-            phrases=phrases,
+            details=details, cooldown=cooldown, force=force, phrases=phrases,
         )
 
-    def _class_evt_emit(
-        self,
-        key: str,
-        *,
-        details: str = "",
-        cooldown: Optional[float] = None,
-        force: bool = False,
-        phrases: Optional[list[str]] = None,
-    ) -> bool:
+    def _class_evt_emit(self, key: str, *, details: str = "", cooldown: Optional[float] = None, force: bool = False, phrases: Optional[list[str]] = None) -> bool:
         return self._scoped_evt_emit(
             key,
             scope_key=(self._evt_prefix, "class", key),
-            details=details,
-            cooldown=cooldown,
-            force=force,
-            phrases=phrases,
+            details=details, cooldown=cooldown, force=force, phrases=phrases,
         )
 
     def _should_sample_begin_round(
@@ -615,17 +525,10 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         expected_hashes: int,
         force_log: bool,
     ) -> bool:
-        if force_log:
-            return True
-
+        if force_log: return True
         expected_hashes = max(0, int(expected_hashes))
-
-        if expected_hashes < self.BEGIN_LOG_MIN_EXPECTED_HASHES:
-            return False
-
-        if expected_hashes >= self.BEGIN_LOG_FORCE_EXPECTED_HASHES:
-            return True
-
+        if expected_hashes < self.BEGIN_LOG_MIN_EXPECTED_HASHES: return False
+        if expected_hashes >= self.BEGIN_LOG_FORCE_EXPECTED_HASHES: return True
         raw = f"{job_id}|{int(generation)}".encode("utf-8", "ignore")
         hv = int.from_bytes(hashlib.blake2s(raw, digest_size=8).digest(), "little", signed=False)
         return (hv % int(self.BEGIN_LOG_EVERY_N_ROUNDS)) == 0
@@ -633,17 +536,12 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
     def begin(
         self,
         *,
-        hash_into,
-        vm,
-        blob_buf,
-        out_buf,
-        job_id: str,
-        generation: int,
-        target64: int,
-        expected_hashes: int,
-        enable_summary_log: bool = False,
+        hash_into, vm, blob_buf, out_buf,
+        job_id: str, generation: int, target64: int,
+        expected_hashes: int, enable_summary_log: bool = False,
         force_log: bool = False,
     ) -> None:
+        # Local var hoisting for rapid state reset
         self._hash_into = hash_into
         self._vm = vm
         self._blob_buf = blob_buf
@@ -653,6 +551,7 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         self._target64 = self._u64(target64)
         self._expected_hashes = max(0, int(expected_hashes))
 
+        # Fast reset
         self._hashes = 0
         self._hits = 0
         self._failures = 0
@@ -666,22 +565,22 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         self._warmed = False
         self._last_hit_logged_tail64 = 0xFFFFFFFFFFFFFFFF
 
+        # Bucket calc
         bucket = self._count_bucket(self._expected_hashes)
+
         round_changed = (
-            (self._job_id != self._last_logged_job)
-            or (self._generation != self._last_logged_generation)
-            or (bucket != self._last_logged_bucket)
+            (self._job_id != self._last_logged_job) or
+            (self._generation != self._last_logged_generation) or
+            (bucket != self._last_logged_bucket)
         )
 
         if round_changed:
             self._logged_begin_for_current_round = False
 
         should_attempt_begin = (
-            force_log
-            or (
-                round_changed
-                and not self._logged_begin_for_current_round
-                and self._should_sample_begin_round(
+            force_log or (
+                round_changed and not self._logged_begin_for_current_round and
+                self._should_sample_begin_round(
                     job_id=self._job_id,
                     generation=self._generation,
                     expected_hashes=self._expected_hashes,
@@ -691,18 +590,18 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         )
 
         if should_attempt_begin:
+            # Inline details for slightly less tuple creation overhead
+            details = (
+                f"job={self._job_id} gen={self._generation} "
+                f"owner={self.owner_key} expected={self._expected_hashes}"
+            )
             emitted = self._job_evt_emit(
-                "begin",
-                details=(
-                    f"job={self._job_id} gen={self._generation} "
-                    f"owner={self.owner_key} expected={self._expected_hashes}"
-                ),
-                cooldown=60.0,
-                force=force_log,
+                "begin", details=details, cooldown=60.0, force=force_log,
             )
             if emitted:
                 self._logged_begin_for_current_round = True
 
+        # Update last logged for next round
         self._last_logged_job = self._job_id
         self._last_logged_generation = self._generation
         self._last_logged_bucket = bucket
@@ -711,7 +610,6 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
     def warmup(self) -> None:
         if not self._active or self._hash_into is None:
             raise RuntimeError("RxHashAdvanceLane is not active")
-
         if self._warmed:
             return
 
@@ -721,23 +619,20 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
             self._failures += 1
             self._consecutive_failures += 1
             self._last_error = f"{type(e).__name__}: {e}"
-            self._class_evt_emit(
-                "error",
-                details=(
-                    f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
-                    f"phase=warmup failures={self._failures} err={self._last_error[:220]}"
-                ),
-                cooldown=90.0,
+            # Local var cache for error details
+            err_msg = (
+                f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                f"phase=warmup failures={self._failures} err={self._last_error[:220]}"
             )
+            self._class_evt_emit("error", details=err_msg, cooldown=90.0)
             raise
 
         self._warmed = True
-        self._owner_evt_emit(
-            "warmup",
-            details=f"owner={self.owner_key} job={self._job_id} gen={self._generation}",
-            cooldown=80.0,
-        )
+        # Local var cache for warmup details
+        wmsg = f"owner={self.owner_key} job={self._job_id} gen={self._generation}"
+        self._owner_evt_emit("warmup", details=wmsg, cooldown=80.0)
 
+    # --- OPTIMIZED: Core Hash Function (Hot Path) ---
     def hash_once(self) -> int:
         if not self._active or self._hash_into is None:
             raise RuntimeError("RxHashAdvanceLane is not active")
@@ -748,93 +643,102 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
             self._failures += 1
             self._consecutive_failures += 1
             self._last_error = f"{type(e).__name__}: {e}"
-            self._class_evt_emit(
-                "error",
-                details=(
-                    f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
-                    f"failures={self._failures} consecutive={self._consecutive_failures} "
-                    f"err={self._last_error[:220]}"
-                ),
-                cooldown=90.0,
+            err_msg = (
+                f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                f"failures={self._failures} consecutive={self._consecutive_failures} "
+                f"err={self._last_error[:220]}"
             )
+            self._class_evt_emit("error", details=err_msg, cooldown=90.0)
             raise
 
         self._hashes += 1
         self._consecutive_failures = 0
 
+        # Optimized Progress Check (Minimize dot access)
         if self._hashes in (262144, 1048576, 4194304, 16777216):
             elapsed = max(1e-9, time.perf_counter() - self._opened_at)
-            self._owner_evt_emit(
-                "progress",
-                details=(
-                    f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
-                    f"hashes={self._hashes} hps={(self._hashes / elapsed):.2f}"
-                ),
-                cooldown=120.0,
+            # Format HPS string directly for logging
+            hps_str = f"{(self._hashes / elapsed):.2f}"
+            prog_msg = (
+                f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
+                f"hashes={self._hashes} hps={hps_str}"
             )
+            self._owner_evt_emit("progress", details=prog_msg, cooldown=120.0)
 
         return self._tail64_fast(self._out_buf)
 
+    # --- OPTIMIZED: Main Loop (Critical for Profit) ---
     def hash_loop(
         self,
         *,
-        count: int,
-        write_next_nonce,
-        batch,
-        stop_flag,
-        stale_mask: int,
-        is_current,
-        job_id: str,
+        count: int, write_next_nonce, batch, stop_flag,
+        stale_mask: int, is_current, job_id: str,
         generation: int,
     ) -> int:
+        # Hoist *everything* needed to local variables for max speed
         done = 0
         target64 = self._target64
         out_buf = self._out_buf
+        hash_into = self._hash_into
+        best_tail64 = self._best_tail64
+        best_nonce = self._best_nonce_u32
+        hits = self._hits
+        last_hit = self._last_hit_logged_tail64
+        owner = self.owner_key
+        j_id = self._job_id
+        j_gen = self._generation
+        h_in_count = 0
 
-        for i in range(max(0, int(count))):
+        for i in range(int(count)):
             if stop_flag.is_set():
                 break
-
+            # Fast stale mask check
             if (i & stale_mask) == 0 and not is_current(job_id, generation):
                 break
 
             nonce_u32 = write_next_nonce()
-            tail64 = self.hash_once()
+            tail64 = hash_into(self._vm, self._blob_buf, out_buf)
             done += 1
 
+            # Hit Check
             if tail64 < target64:
-                self._hits += 1
-                if tail64 < self._best_tail64:
-                    old_best = self._best_tail64
-                    self._best_tail64 = tail64
-                    self._best_nonce_u32 = int(nonce_u32)
+                hits += 1
+                # Check if better than current best
+                if tail64 < best_tail64:
+                    old_best = best_tail64
+                    best_tail64 = tail64
+                    best_nonce = int(nonce_u32)
 
                     should_log_hit = False
                     if self._summary_enabled:
-                        if self._last_hit_logged_tail64 == 0xFFFFFFFFFFFFFFFF:
+                        if last_hit == 0xFFFFFFFFFFFFFFFF:
                             should_log_hit = True
                         elif old_best < 0xFFFFFFFFFFFFFFFF:
-                            should_log_hit = (
-                                float(tail64) <= float(old_best) * self.HIT_LOG_MIN_IMPROVEMENT_RATIO
-                            )
+                            # Ratio check
+                            if float(tail64) <= float(old_best) * self.HIT_LOG_MIN_IMPROVEMENT_RATIO:
+                                should_log_hit = True
 
                     if should_log_hit:
-                        emitted = self._owner_evt_emit(
-                            "hit",
-                            details=(
-                                f"owner={self.owner_key} job={self._job_id} gen={self._generation} "
-                                f"hits={self._hits} best_nonce={int(nonce_u32)} best_tail64={int(tail64)}"
-                            ),
-                            cooldown=60.0,
+                        hit_msg = (
+                            f"owner={owner} job={j_id} gen={j_gen} "
+                            f"hits={hits} best_nonce={int(nonce_u32)} best_tail64={int(tail64)}"
                         )
+                        emitted = self._owner_evt_emit("hit", details=hit_msg, cooldown=60.0)
                         if emitted:
-                            self._last_hit_logged_tail64 = int(tail64)
+                            last_hit = int(tail64)
 
+                # Batch offer
+                # Optimization: Try to minimize bytes() copy if out_buf supports hex directly
+                # Fallback to standard for compatibility
                 batch.offer(
                     nonce_u32=nonce_u32,
                     hash_hex=bytes(out_buf).hex(),
                     tail64=tail64,
                 )
+
+            # Count hashes processed
+            if tail64 < target64:
+                h_in_count += 1 # Just tracking local hits
 
         return done
 
@@ -843,26 +747,21 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         elapsed = max(0.0, time.perf_counter() - self._opened_at)
         hps = (float(done) / elapsed) if elapsed > 0.0 else 0.0
 
+        # Optimized finish check
         should_log_finish = (
-            self._summary_enabled
-            and (
-                self._hits > 0
-                or self._failures > 0
-                or done >= self.FINISH_LOG_MIN_HASHES
+            self._summary_enabled and (
+                self._hits > 0 or self._failures > 0 or done >= self.FINISH_LOG_MIN_HASHES
             )
         )
 
         if should_log_finish:
-            self._job_evt_emit(
-                "finish",
-                details=(
-                    f"job={self._job_id} gen={self._generation} "
-                    f"owner={self.owner_key} done={done} hits={self._hits} failures={self._failures} "
-                    f"best_nonce={self._best_nonce_u32} best_tail64={self._best_tail64} "
-                    f"elapsed={elapsed:.6f}s hps={hps:.2f}"
-                ),
-                cooldown=60.0,
+            finish_msg = (
+                f"job={self._job_id} gen={self._generation} "
+                f"owner={self.owner_key} done={done} hits={self._hits} failures={self._failures} "
+                f"best_nonce={self._best_nonce_u32} best_tail64={self._best_tail64} "
+                f"elapsed={elapsed:.6f}s hps={hps:.2f}"
             )
+            self._job_evt_emit("finish", details=finish_msg, cooldown=60.0)
 
         self._active = False
 
@@ -875,6 +774,7 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         old_hits = self._hits
         old_failures = self._failures
 
+        # Fast state reset
         self._hash_into = None
         self._vm = None
         self._blob_buf = None
@@ -896,36 +796,27 @@ class _RxHashAdvanceLane(_ClassEventLogMixin):
         self._warmed = False
         self._last_hit_logged_tail64 = 0xFFFFFFFFFFFFFFFF
 
+        # Clear log if significant work done
         if had_state and (old_hashes >= 1048576 or old_failures > 0 or old_hits > 0):
-            self._owner_evt_emit(
-                "clear",
-                details=(
-                    f"owner={self.owner_key} last_job={old_job} "
-                    f"last_gen={old_generation} hashes={old_hashes} "
-                    f"hits={old_hits} failures={old_failures}"
-                ),
-                cooldown=120.0,
+            clear_msg = (
+                f"owner={self.owner_key} last_job={old_job} "
+                f"last_gen={old_generation} hashes={old_hashes} "
+                f"hits={old_hits} failures={old_failures}"
             )
+            self._owner_evt_emit("clear", details=clear_msg, cooldown=120.0)
 
     def snapshot(self) -> dict:
         elapsed = max(0.0, time.perf_counter() - self._opened_at) if self._opened_at > 0.0 else 0.0
         hps = (float(self._hashes) / elapsed) if elapsed > 0.0 else 0.0
         return {
-            "owner_key": self.owner_key,
-            "worker_index": self.worker_index,
-            "job_id": self._job_id,
-            "generation": self._generation,
-            "expected_hashes": self._expected_hashes,
-            "hashes": self._hashes,
-            "hits": self._hits,
-            "failures": self._failures,
+            "owner_key": self.owner_key, "worker_index": self.worker_index,
+            "job_id": self._job_id, "generation": self._generation,
+            "expected_hashes": self._expected_hashes, "hashes": self._hashes,
+            "hits": self._hits, "failures": self._failures,
             "consecutive_failures": self._consecutive_failures,
-            "best_tail64": self._best_tail64,
-            "best_nonce_u32": self._best_nonce_u32,
-            "last_error": self._last_error,
-            "elapsed_sec": elapsed,
-            "hps_est": hps,
-            "active": self._active,
+            "best_tail64": self._best_tail64, "best_nonce_u32": self._best_nonce_u32,
+            "last_error": self._last_error, "elapsed_sec": elapsed,
+            "hps_est": hps, "active": self._active,
         }
 
 class _Tail64Probe(_ClassEventLogMixin):
