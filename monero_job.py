@@ -25,7 +25,7 @@ def parse_target64_from_hex(target_hex: str) -> int:
     # fallback: treat as big integer (rare)
     return int.from_bytes(tb, "little", signed=False) if tb else 0
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class MoneroJob:
     job_id: str
     blob: bytes

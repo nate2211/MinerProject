@@ -26,6 +26,11 @@ from python_usage import PythonUsage
 from randomx_ctypes import RandomX
 import sys
 import heapq
+from monero_hot_hash import (
+    MoneroHashLoopDLL,
+    MoneroHotHashError,
+    HH_CANDIDATE_OVERFLOW,
+)
 class PythonJITError(RuntimeError):
     pass
 
@@ -4103,17 +4108,24 @@ class _ThreadState:
 
 class JITWorker:
     """
-    Safe JITWorker:
-    - keeps the same API used by miner_core.py
-    - tries a very small number of thunk lanes
-    - tries one serialized PythonUsage lane
-    - falls back to direct callback execution when native helper paths fail
-    - centralizes RandomX seed building and per-worker VM reuse
+    Safe JITWorker using MoneroHashLoop.dll.
 
-    No external changes required:
-    - same constructor
-    - same hash_job(...) signature
-    - same stop()
+    Important correction:
+        Do NOT XOR arbitrary blob/seed bytes to create thread-specific VM states.
+
+        For Monero/P2Pool, the share verifier expects the hash of the exact job
+        blob with a valid nonce. Mutating seed bytes or non-nonce blob bytes
+        creates a different proof and will be rejected.
+
+    What this version does instead:
+        - keeps exact constructor/hash_job/stop signatures
+        - keeps native MoneroHashLoop.dll hot loop
+        - keeps RandomX VM pool reuse
+        - keeps candidate ranking/diversity
+        - uses deterministic per-generation lane permutation
+        - guarantees each worker receives a unique nonce lane
+        - avoids duplicate nonce work without corrupting the blob
+        - keeps final dedupe as protection against native/result bugs
     """
 
     def __init__(
@@ -4138,38 +4150,151 @@ class JITWorker:
         self._threads: list[threading.Thread] = []
         self._mu = threading.RLock()
 
+        # Native hot-loop DLL state.
+        self._native_stop_flag = ctypes.c_int(0)
+        self._native_generation = ctypes.c_uint64(0)
+        self._hot_hash = None
+        self._hot_hash_error = ""
+        self._hot_hash_hash_fn_ptr = 0
+
+        # This intentionally stays false. It exists only so logs/snapshots make
+        # it obvious that unsafe blob XOR is not being used.
+        self._unsafe_blob_xor_enabled = False
+
+        try:
+            self._hot_hash = MoneroHashLoopDLL.load_same_dir()
+            self._hot_hash_hash_fn_ptr = self._resolve_native_hash_fn_ptr()
+            self.logger(
+                f"[JITWorker] MoneroHashLoop.dll loaded: "
+                f"path={self._hot_hash.dll_path} "
+                f"prefix={self._hot_hash.prefix} "
+                f"version={self._hot_hash.version()} "
+                f"hash_fn_ptr=0x{self._hot_hash_hash_fn_ptr:x}"
+            )
+        except Exception as e:
+            self._hot_hash = None
+            self._hot_hash_hash_fn_ptr = 0
+            self._hot_hash_error = f"{type(e).__name__}: {e}"
+            self.logger(
+                f"[JITWorker] MoneroHashLoop.dll unavailable, worker will report native errors: "
+                f"{self._hot_hash_error}"
+            )
+
         self._dispatch = _JobDispatchCoordinator(
             hashed_job_start=True,
             logger=self.logger,
         )
-        self._selector = _CandidateSelector(max_keep_default=16, logger=self.logger)
+
+        self._selector = _CandidateSelector(
+            max_keep_default=16,
+            logger=self.logger,
+        )
+
         self._share_diversity = _ShareDiversityCoordinator(
             logger=self.logger,
             ttl_ms=18000.0,
             max_recent=8192,
             stripe_shift=12,
         )
+
         self._exec = _HybridExecutionController(
             threads=self.threads,
             logger=self.logger,
             jit=self.jit,
             python_usage=self.python_usage,
         )
+
         self._dataset_builder = RandomXDatasetBuilder(
             randomx=self.rx,
             logger=self.logger,
         )
+
         self._vm_pool = RandomXVmPool(
             randomx=self.rx,
             dataset_builder=self._dataset_builder,
             logger=self.logger,
         )
+
         self._round_candidate_batch = _CandidateBatch(
             owner_key="round-batch",
             max_keep_default=32,
             logger=self.logger,
         )
+
         self._bootstrap_workers()
+
+    def _resolve_native_hash_fn_ptr(self) -> int:
+        """
+        Resolve native randomx_calculate_hash address from the RandomX wrapper.
+
+        This does not create or own RandomX.
+        It only gets the function pointer for MoneroHashLoop.dll.
+        """
+        if self._hot_hash is None:
+            return 0
+
+        try:
+            ptr = int(self._hot_hash.randomx_hash_function_address(self.rx))
+            if ptr:
+                return ptr
+        except Exception:
+            pass
+
+        candidates = [
+            self.rx,
+            getattr(self.rx, "lib", None),
+            getattr(self.rx, "_lib", None),
+            getattr(self.rx, "dll", None),
+            getattr(self.rx, "_dll", None),
+            getattr(self.rx, "randomx_dll", None),
+        ]
+
+        for obj in candidates:
+            if obj is None:
+                continue
+
+            fn = getattr(obj, "randomx_calculate_hash", None)
+            if fn is None:
+                continue
+
+            try:
+                ptr = int(MoneroHashLoopDLL.address_of_function(fn))
+                if ptr:
+                    return ptr
+            except Exception:
+                continue
+
+        raise RuntimeError(
+            "Could not resolve native randomx_calculate_hash pointer from RandomX wrapper"
+        )
+
+    def _resolve_native_vm_ptr(self, vm) -> int:
+        """
+        Resolve randomx_vm* address from a VM object returned by RandomXVmPool.
+        """
+        if self._hot_hash is None:
+            return 0
+
+        try:
+            ptr = int(self._hot_hash.randomx_vm_address(vm))
+            if ptr:
+                return ptr
+        except Exception:
+            pass
+
+        if vm is None:
+            return 0
+
+        if isinstance(vm, int):
+            return int(vm)
+
+        if isinstance(vm, ctypes.c_void_p):
+            return int(vm.value or 0)
+
+        try:
+            return int(ctypes.cast(vm, ctypes.c_void_p).value or 0)
+        except Exception:
+            return 0
 
     def _effective_count(self, requested_count: int) -> int:
         count = max(0, int(requested_count))
@@ -4198,7 +4323,88 @@ class JITWorker:
             return 15
         return 7
 
-    # --- PATCH: bootstrap one worker-local batch per worker ----------------
+    @staticmethod
+    def _gcd(a: int, b: int) -> int:
+        a = abs(int(a))
+        b = abs(int(b))
+        while b:
+            a, b = b, a % b
+        return a
+
+    def _lane_permutation(self, n: int, generation: int) -> list[int]:
+        """
+        Build a unique lane assignment for this generation.
+
+        Every lane appears exactly once:
+            worker i hashes start + lane[i], then + n, + 2n, ...
+
+        This gives diversity without overlapping nonce work and without changing
+        the RandomX seed/blob.
+        """
+        n = max(1, int(n))
+        if n == 1:
+            return [0]
+
+        gen = int(generation) & 0xFFFFFFFFFFFFFFFF
+
+        # Pick an odd-ish step that is coprime with n.
+        # This rotates which worker owns which residue class each generation.
+        step = int((gen * 0x9E3779B97F4A7C15 + 0xD1B54A32D192ED03) % n)
+        if step <= 0:
+            step = 1
+
+        while self._gcd(step, n) != 1:
+            step = (step + 1) % n
+            if step <= 0:
+                step = 1
+
+        start = int((gen ^ (gen >> 17) ^ 0xA0761D6478BD642F) % n)
+
+        lanes: list[int] = []
+        seen: set[int] = set()
+
+        x = start
+        for _ in range(n):
+            lane = int(x % n)
+            if lane not in seen:
+                lanes.append(lane)
+                seen.add(lane)
+            x += step
+
+        if len(lanes) != n:
+            lanes = list(range(n))
+
+        return lanes
+
+    @staticmethod
+    def _candidate_identity(item: dict) -> tuple:
+        """
+        Stable candidate identity used only for output cleanup.
+
+        The native hot loop should already avoid duplicate nonce work because
+        workers receive distinct lanes. This dedupe is a final safety net.
+        """
+        nonce = int(item.get("nonce_u32", 0)) & 0xFFFFFFFF
+        hash_hex = str(item.get("hash_hex", ""))
+        return nonce, hash_hex
+
+    def _dedupe_candidates(self, candidates: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        seen: set[tuple] = set()
+
+        for item in candidates or []:
+            try:
+                key = self._candidate_identity(item)
+            except Exception:
+                continue
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            out.append(item)
+
+        return out
 
     def _bootstrap_workers(self) -> None:
         jit_version = "unavailable"
@@ -4206,6 +4412,16 @@ class JITWorker:
             jit_version = str(self.jit.version())
         except Exception:
             pass
+
+        hot_hash_status = "unavailable"
+        if self._hot_hash is not None and self._hot_hash_hash_fn_ptr:
+            hot_hash_status = (
+                f"loaded prefix={self._hot_hash.prefix} "
+                f"version={self._hot_hash.version()} "
+                f"hash_fn_ptr=0x{self._hot_hash_hash_fn_ptr:x}"
+            )
+        elif self._hot_hash_error:
+            hot_hash_status = self._hot_hash_error
 
         for i in range(self.threads):
             st = _ThreadState(
@@ -4221,9 +4437,19 @@ class JITWorker:
                     logger=self.logger,
                 ),
             )
+
             st.callback = self._make_callback(st)
             st.thunk = None
             st.exec_mode = self._exec.bind_worker(st)
+
+            # Dynamic fields used by this worker.
+            st.assigned_lane_id = 0
+            st.assigned_stride = 1
+            st.assigned_generation = 0
+            st.assigned_start_nonce = 0
+            st.assigned_count = 0
+            st.assigned_max_results = 0
+            st.assigned_job = None
 
             t = threading.Thread(
                 target=self._thread_main,
@@ -4231,6 +4457,7 @@ class JITWorker:
                 name=f"JITWorker-{i}",
                 daemon=True,
             )
+
             self._states.append(st)
             self._threads.append(t)
             t.start()
@@ -4238,7 +4465,9 @@ class JITWorker:
         self.logger(
             f"[JITWorker] initialized: threads={self.threads} "
             f"batch_size={self.batch_size} jit_version={jit_version} "
-            f"(hybrid mode: capped thunk lanes + single python_usage lane + vm pool + candidate batches)"
+            f"monero_hash_loop={hot_hash_status} "
+            f"unsafe_blob_xor={self._unsafe_blob_xor_enabled} "
+            f"(native hot loop + vm pool + unique nonce lanes + candidate diversity)"
         )
 
     def _make_callback(self, st: _ThreadState):
@@ -4246,6 +4475,7 @@ class JITWorker:
             try:
                 st.error = None
                 st.done_hashes = 0
+
                 if st.found is None:
                     st.found = []
                 else:
@@ -4263,19 +4493,20 @@ class JITWorker:
                 if not self._dispatch.is_current(job_id, my_generation):
                     return 0
 
+                if self._hot_hash is None:
+                    st.error = self._hot_hash_error or "MoneroHashLoop.dll is not loaded"
+                    return -1
+
+                if not self._hot_hash_hash_fn_ptr:
+                    self._hot_hash_hash_fn_ptr = self._resolve_native_hash_fn_ptr()
+
                 self._ensure_thread_resources(st, job)
 
-                rx_hash_into = self.rx.hash_into
                 target64 = int(job.target64) & 0xFFFFFFFFFFFFFFFF
-
                 keep_best = max(1, int(st.assigned_max_results))
                 start_nonce = int(st.assigned_start_nonce) & 0xFFFFFFFF
                 count = max(0, int(st.assigned_count))
                 stride = max(1, int(getattr(st, "assigned_stride", 1)))
-                stop_flag = self._stop
-                blob_buf = st.blob_buf
-                out_buf = st.out_buf
-                is_current = self._dispatch.is_current
                 stale_mask = self._stale_check_mask()
 
                 batch = st.candidate_batch
@@ -4287,93 +4518,83 @@ class JITWorker:
                     )
                     st.candidate_batch = batch
 
-                # worker batch can keep a little extra so final round merge
-                # still has room to choose the strongest overall candidates.
                 batch.reset(
                     job_id=job_id,
                     generation=my_generation,
                     requested_keep=max(8, min(128, keep_best * 2)),
                 )
 
-                nonce_writer = st.nonce_writer
-                if nonce_writer is None:
-                    nonce_writer = _NonceStrideWriter(
-                        worker_index=st.worker_index,
-                        owner_key=f"worker-{st.worker_index}",
-                        logger=self.logger,
-                    )
-                    st.nonce_writer = nonce_writer
+                # Critical:
+                # This must stay an exact copy of job.blob. The native DLL mutates
+                # only the nonce bytes at job.nonce_offset for each hash attempt.
+                #
+                # Do not XOR seed bytes, header bytes, tx merkle bytes, or any
+                # non-nonce blob field here. That creates a different proof that
+                # pool/node verification will reject.
+                native_blob = bytearray(job.blob)
 
-                nonce_writer.bind(
-                    nonce_ptr=st.nonce_ptr,
+                vm_ptr = self._resolve_native_vm_ptr(st.vm)
+                if not vm_ptr:
+                    st.error = "RandomX VM pointer is null"
+                    return -1
+
+                self._native_generation.value = int(my_generation) & 0xFFFFFFFFFFFFFFFF
+
+                if self._stop.is_set():
+                    self._native_stop_flag.value = 1
+
+                native_result = self._hot_hash.run_hot_loop(
+                    hash_fn_ptr=int(self._hot_hash_hash_fn_ptr),
+                    vm_ptr=int(vm_ptr),
+                    blob=native_blob,
+                    nonce_offset=int(job.nonce_offset),
                     start_nonce=start_nonce,
                     stride=stride,
                     count=count,
-                    job_id=job_id,
-                    generation=my_generation,
-                )
-
-                write_next_nonce = nonce_writer.write_next
-
-                tail64_probe = st.tail64_probe
-                if tail64_probe is None:
-                    tail64_probe = _Tail64Probe(
-                        worker_index=st.worker_index,
-                        owner_key=f"worker-{st.worker_index}",
-                        logger=self.logger,
-                    )
-                    st.tail64_probe = tail64_probe
-
-                tail64_probe.begin(
-                    job_id=job_id,
-                    generation=my_generation,
                     target64=target64,
-                    enable_summary_log=True
-                )
-
-                rx_lane = getattr(st, "rx_lane", None)
-                if rx_lane is None:
-                    rx_lane = _RxHashAdvanceLane(
-                        worker_index=st.worker_index,
-                        owner_key=f"worker-{st.worker_index}",
-                        logger=self.logger,
-                    )
-                    st.rx_lane = rx_lane
-
-                rx_lane.begin(
-                    hash_into=rx_hash_into,
-                    vm=st.vm,
-                    blob_buf=blob_buf,
-                    out_buf=out_buf,
-                    job_id=job_id,
+                    stop_flag=self._native_stop_flag,
+                    current_generation=self._native_generation,
                     generation=my_generation,
-                    target64=target64,
-                    expected_hashes=count,
-                    enable_summary_log=True,
-                )
-
-                # optional:
-                # rx_lane.warmup()
-
-                done = rx_lane.hash_loop(
-                    count=count,
-                    write_next_nonce=write_next_nonce,
-                    batch=batch,
-                    stop_flag=stop_flag,
                     stale_mask=stale_mask,
-                    is_current=is_current,
-                    job_id=job_id,
-                    generation=my_generation,
+                    max_candidates=max(8, min(256, keep_best * 4)),
+                    raise_on_error=False,
+                    allow_blob_copy=False,
                 )
 
-                if tail64_probe is not None:
-                    # keep probe in sync only if you still want both systems
-                    # otherwise remove the probe entirely
-                    tail64_probe.finish(done_hashes=done)
-
-                rx_lane.finish(done_hashes=done)
-                st.found = batch.export(keep_best)
+                done = int(native_result.done_hashes or 0)
                 st.done_hashes = done
+
+                if native_result.status < 0 and native_result.status != HH_CANDIDATE_OVERFLOW:
+                    err = self._hot_hash.last_error()
+                    st.error = (
+                        err
+                        or f"MoneroHashLoop native status={native_result.status_name}"
+                    )
+                    return -1
+
+                if native_result.candidates:
+                    batch.merge_items(native_result.candidates)
+
+                st.found = self._dedupe_candidates(batch.export(keep_best))
+
+                try:
+                    if getattr(st, "nonce_writer", None) is not None:
+                        st.nonce_writer.clear()
+                except Exception:
+                    pass
+
+                try:
+                    if getattr(st, "tail64_probe", None) is not None:
+                        st.tail64_probe.finish(done_hashes=done)
+                except Exception:
+                    pass
+
+                try:
+                    if getattr(st, "rx_lane", None) is not None:
+                        st.rx_lane.finish(done_hashes=done)
+                except Exception:
+                    pass
+
                 return done
 
             except Exception as e:
@@ -4393,7 +4614,7 @@ class JITWorker:
             st.vm_epoch = int(epoch)
             st.last_seed = seed_hash
 
-        blob_changed = (st.last_blob != job.blob)
+        blob_changed = st.last_blob != job.blob
 
         if st.blob_buf is None or len(st.blob_buf) != len(job.blob):
             st.blob_buf = (c_ubyte * len(job.blob))()
@@ -4405,7 +4626,7 @@ class JITWorker:
 
         st.nonce_ptr = cast(
             byref(st.blob_buf, int(job.nonce_offset)),
-            POINTER(c_uint32)
+            POINTER(c_uint32),
         )
 
     def _thread_main(self, st: _ThreadState) -> None:
@@ -4418,6 +4639,7 @@ class JITWorker:
 
             st.done_event.clear()
             st.busy = True
+
             try:
                 self._exec.invoke(st)
             except Exception as e:
@@ -4427,12 +4649,12 @@ class JITWorker:
                 st.done_event.set()
 
     def hash_job(
-            self,
-            *,
-            job: "MoneroJob",
-            start_nonce: int,
-            count: int,
-            max_results: int,
+        self,
+        *,
+        job: "MoneroJob",
+        start_nonce: int,
+        count: int,
+        max_results: int,
     ) -> dict:
         count = self._effective_count(count)
         if count <= 0:
@@ -4455,6 +4677,8 @@ class JITWorker:
         except Exception:
             pass
 
+        self._native_generation.value = int(generation) & 0xFFFFFFFFFFFFFFFF
+
         self._share_diversity.begin_round(
             job_id=str(job.job_id),
             generation=int(generation),
@@ -4475,15 +4699,23 @@ class JITWorker:
                 "errors": [f"randomx_prepare {type(e).__name__}: {e}"],
             }
 
-        # interleaved residue-class layout:
-        # worker 0 -> start+0, start+0+threads, ...
-        # worker 1 -> start+1, start+1+threads, ...
+        # Unique lane layout:
+        #
+        # For active thread count N, every worker gets one residue class:
+        #     nonce = actual_start_nonce + lane + k * N
+        #
+        # The lane permutation changes per generation, so workers do not always
+        # own the same residue class. This gives thread-level diversity without
+        # doing duplicate work and without corrupting the blob/seed.
+        lane_ids = self._lane_permutation(threads, int(generation))
+
         per_thread = count // threads
         remainder = count % threads
 
         active_states: list[_ThreadState] = []
 
         for i in range(threads):
+            lane_id = int(lane_ids[i])
             take = per_thread + (1 if i < remainder else 0)
             if take <= 0:
                 continue
@@ -4491,12 +4723,14 @@ class JITWorker:
             st = self._states[i]
             st.assigned_job = job
             st.assigned_generation = int(generation)
-            st.assigned_start_nonce = (int(actual_start_nonce) + i) & 0xFFFFFFFF
+            st.assigned_lane_id = lane_id
+            st.assigned_start_nonce = (int(actual_start_nonce) + lane_id) & 0xFFFFFFFF
             st.assigned_count = take
-            st.assigned_max_results = max_results
-            st.assigned_stride = threads
+            st.assigned_max_results = int(max_results)
+            st.assigned_stride = int(threads)
             st.done_hashes = 0
             st.error = None
+
             if st.found is None:
                 st.found = []
             else:
@@ -4509,12 +4743,14 @@ class JITWorker:
             st = self._states[i]
             st.assigned_job = None
             st.assigned_generation = 0
+            st.assigned_lane_id = 0
             st.assigned_start_nonce = 0
             st.assigned_count = 0
             st.assigned_max_results = 0
             st.assigned_stride = 1
             st.done_hashes = 0
             st.error = None
+
             if st.found is not None:
                 st.found.clear()
 
@@ -4536,27 +4772,36 @@ class JITWorker:
 
         for st in active_states:
             hashes_done += int(st.done_hashes or 0)
+
             if st.found:
                 round_batch.merge_items(st.found)
+
             if st.error:
-                errors.append(f"worker[{st.worker_index}] {st.error}")
+                errors.append(
+                    f"worker[{st.worker_index}] "
+                    f"lane={getattr(st, 'assigned_lane_id', 0)} "
+                    f"{st.error}"
+                )
 
-        # keep a broader pool than before so diversity has room to choose
+        # Keep a broad pool before ranking/diversity.
         pre_rank = round_batch.export(max(max_results * 16, 256))
+        pre_rank = self._dedupe_candidates(pre_rank)
 
-        # first pass: quality
         ranked_pool = self._selector.rank(
             pre_rank,
             max(max_results * 6, 64),
         )
 
-        # second pass: freshness + stripe diversity
+        ranked_pool = self._dedupe_candidates(ranked_pool)
+
         found = self._share_diversity.pick(
             job_id=str(job.job_id),
             generation=int(generation),
             candidates=ranked_pool,
             max_results=max_results,
         )
+
+        found = self._dedupe_candidates(found)
 
         return {
             "job_id": job.job_id,
@@ -4567,7 +4812,28 @@ class JITWorker:
         }
 
     def snapshot_execution(self) -> dict:
-        return self._exec.snapshot()
+        snap = self._exec.snapshot()
+
+        try:
+            snap["monero_hash_loop"] = {
+                "loaded": self._hot_hash is not None,
+                "dll_path": "" if self._hot_hash is None else str(self._hot_hash.dll_path),
+                "prefix": "" if self._hot_hash is None else str(self._hot_hash.prefix),
+                "version": 0 if self._hot_hash is None else int(self._hot_hash.version()),
+                "hash_fn_ptr": int(self._hot_hash_hash_fn_ptr or 0),
+                "error": self._hot_hash_error,
+            }
+
+            snap["nonce_diversity"] = {
+                "mode": "unique_per_generation_lane_permutation",
+                "unsafe_blob_xor_enabled": bool(self._unsafe_blob_xor_enabled),
+                "threads": int(self.threads),
+                "batch_size": int(self.batch_size),
+            }
+        except Exception:
+            pass
+
+        return snap
 
     def snapshot_randomx(self) -> dict:
         return {
@@ -4585,15 +4851,18 @@ class JITWorker:
 
     @staticmethod
     def _candidate_heap_key(item: dict) -> tuple[int, float, int]:
-        # heap root should be the WORST kept candidate
-        # worse = larger tail64, lower diff, larger nonce
         return (
             -int(item["tail64"]),
             float(item["share_diff_est"]),
             -int(item["nonce_u32"]),
         )
 
-    def _keep_local_best(self, heap: list[tuple[tuple[int, float, int], dict]], item: dict, keep: int) -> None:
+    def _keep_local_best(
+        self,
+        heap: list[tuple[tuple[int, float, int], dict]],
+        item: dict,
+        keep: int,
+    ) -> None:
         keep = max(1, int(keep))
         entry = (self._candidate_heap_key(item), item)
 
@@ -4601,12 +4870,12 @@ class JITWorker:
             heapq.heappush(heap, entry)
             return
 
-        # If the new candidate is better than the current worst kept one, replace it.
         if entry[0] > heap[0][0]:
             heapq.heapreplace(heap, entry)
 
     def stop(self) -> None:
         self._stop.set()
+        self._native_stop_flag.value = 1
 
         for st in self._states:
             try:
@@ -4630,6 +4899,12 @@ class JITWorker:
         except Exception:
             pass
 
+        try:
+            if self._hot_hash is not None:
+                self._hot_hash.close()
+        except Exception:
+            pass
+
         for st in self._states:
             st.vm = None
             st.vm_epoch = 0
@@ -4638,9 +4913,42 @@ class JITWorker:
             st.out_buf = None
             st.last_seed = b""
             st.last_blob = b""
-            if st.nonce_writer is not None:
+
+            st.assigned_job = None
+            st.assigned_generation = 0
+            st.assigned_lane_id = 0
+            st.assigned_start_nonce = 0
+            st.assigned_count = 0
+            st.assigned_max_results = 0
+            st.assigned_stride = 1
+
+            if getattr(st, "nonce_writer", None) is not None:
                 try:
                     st.nonce_writer.clear()
                 except Exception:
                     pass
             st.nonce_writer = None
+
+            if getattr(st, "tail64_probe", None) is not None:
+                try:
+                    st.tail64_probe.clear()
+                except Exception:
+                    pass
+            st.tail64_probe = None
+
+            if getattr(st, "rx_lane", None) is not None:
+                try:
+                    st.rx_lane.clear()
+                except Exception:
+                    pass
+            st.rx_lane = None
+
+            if getattr(st, "candidate_batch", None) is not None:
+                try:
+                    st.candidate_batch.reset(
+                        job_id="",
+                        generation=0,
+                        requested_keep=max(8, self.batch_size // 64),
+                    )
+                except Exception:
+                    pass

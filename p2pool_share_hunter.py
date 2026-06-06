@@ -78,6 +78,13 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
 def _safe_str(v: Any) -> str:
     try:
         return str(v or '')
@@ -7922,3 +7929,1900 @@ class P2PoolShareHunterWorker:
             "elapsed_sec": max(0.0, time.perf_counter() - t0),
             "errors": errors,
         }
+
+# =============================================================================
+# HOT HASH / RPC / OBSERVER PATCH LAYER
+# =============================================================================
+# This layer is appended onto the full uploaded module so the resulting file
+# stays structurally close to the original text field while adding:
+#   - Monero RPC / JSON-RPC parsing for getblocktemplate, job, submit, submitblock
+#   - network job state for the hot hash loop
+#   - candidate-share tracking separated from confirmed P2Pool shares
+#   - passive capture parsing on Monero RPC / P2Pool / Stratum ports
+#   - confirmation bridge so only network-accepted shares are counted as real
+# =============================================================================
+
+import copy as _hot_patch_copy
+
+
+_MONERO_RPC_PORTS_PATCH = {18081, 18083, 28081, 38081}
+_STRATUM_PORTS_PATCH = {3333, 4444, 5555, 6666, 7777, 8888, 9999, 14444, 24444}
+_P2POOL_PORTS_PATCH = {37888, 37889, 37890}
+_MONERO_P2P_PORTS_PATCH = {18080, 28080, 38080, 41257}
+
+
+def _hp_safe_json_loads(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _hp_looks_like_json_payload(text: str) -> bool:
+    s = str(text or '').lstrip()
+    return s.startswith('{') or s.startswith('[')
+
+
+def _hp_flatten_rpc_like_dict(obj: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not isinstance(obj, dict):
+        return out
+    out.update(obj)
+    params = obj.get('params')
+    if isinstance(params, dict):
+        out.update(params)
+    result = obj.get('result')
+    if isinstance(result, dict):
+        out.update(result)
+    error = obj.get('error')
+    if isinstance(error, dict):
+        for k, v in error.items():
+            out[f'error_{k}'] = v
+    return out
+
+
+def _hp_first_non_empty(*vals: Any) -> str:
+    for v in vals:
+        s = _safe_str(v).strip()
+        if s:
+            return s
+    return ''
+
+
+def _hp_extract_method(decoded: Dict[str, Any]) -> str:
+    return _hp_first_non_empty(decoded.get('method'), decoded.get('rpc_method'), decoded.get('command')).lower()
+
+
+def _hp_extract_blob_hex(decoded: Dict[str, Any]) -> str:
+    for key in ('blocktemplate_blob', 'blob', 'blocktemplate', 'block_blob', 'template'):
+        val = decoded.get(key)
+        if isinstance(val, str) and len(val.strip()) >= 32:
+            return val.strip()
+    return ''
+
+
+def _hp_extract_seed_hash(decoded: Dict[str, Any]) -> str:
+    return _hp_first_non_empty(decoded.get('seed_hash'), decoded.get('seedhash'), decoded.get('seed'))
+
+
+def _hp_extract_job_id(decoded: Dict[str, Any]) -> str:
+    return _hp_first_non_empty(decoded.get('job_id'), decoded.get('template_id'), decoded.get('id'))
+
+
+def _hp_extract_hash_hex(decoded: Dict[str, Any]) -> str:
+    return _hp_first_non_empty(decoded.get('pow_hash'), decoded.get('result_hash'), decoded.get('hash'))
+
+
+def _hp_extract_status(decoded: Dict[str, Any]) -> str:
+    return _hp_first_non_empty(decoded.get('status'), decoded.get('result_status'), decoded.get('error_message'))
+
+
+def _hp_extract_height(decoded: Dict[str, Any]) -> int:
+    for key in ('height', 'blockchain_height', 'current_blockchain_height', 'current_height', 'sidechain_height', 'top_height'):
+        try:
+            v = decoded.get(key)
+            if v not in (None, ''):
+                return int(v)
+        except Exception:
+            pass
+    return 0
+
+
+def _hp_extract_target64(decoded: Dict[str, Any]) -> int:
+    for key in ('target64', 'target', 'difficulty_target'):
+        v = decoded.get(key)
+        if v in (None, ''):
+            continue
+        try:
+            if isinstance(v, str):
+                s = v.strip().lower()
+                if s.startswith('0x'):
+                    return int(s, 16)
+                if all(ch in '0123456789abcdef' for ch in s) and len(s) <= 16:
+                    return int(s, 16)
+                return int(s)
+            return int(v)
+        except Exception:
+            pass
+    return 0
+
+
+def _hp_extract_diff(decoded: Dict[str, Any]) -> int:
+    for key in ('difficulty', 'diff', 'cumulative_difficulty', 'decoded_cumulative_difficulty_low64', 'difficulty_low64'):
+        try:
+            v = decoded.get(key)
+            if v not in (None, ''):
+                return int(v)
+        except Exception:
+            pass
+    return 0
+
+
+def _hp_extract_nonce(decoded: Dict[str, Any]) -> int:
+    for key in ('nonce', 'nonce_u32', 'reserve_offset'):
+        v = decoded.get(key)
+        if v in (None, ''):
+            continue
+        try:
+            if isinstance(v, str):
+                s = v.strip().lower()
+                return int(s, 16) if s.startswith('0x') else int(s)
+            return int(v)
+        except Exception:
+            pass
+    return 0
+
+
+def _hp_job_key(blob_hex: str, seed_hash_hex: str, target64: int) -> str:
+    h = hashlib.blake2b(digest_size=20)
+    h.update(str(blob_hex or '').encode('utf-8', errors='ignore'))
+    h.update(str(seed_hash_hex or '').encode('utf-8', errors='ignore'))
+    h.update(int(target64 or 0).to_bytes(8, 'little', signed=False))
+    return h.hexdigest()
+
+
+class _HotNetworkJobState:
+    __slots__ = (
+        'job_key',
+        'source',
+        'method',
+        'job_id',
+        'blob_hex',
+        'seed_hash_hex',
+        'target64',
+        'difficulty',
+        'height',
+        'sidechain_height',
+        'mainchain_height',
+        'nonce_offset',
+        'created_ts',
+        'updated_ts',
+        'peer_key',
+        'rpc_port',
+        'extra',
+    )
+
+    def __init__(self, job_key: str) -> None:
+        self.job_key = str(job_key)
+        self.source = ''
+        self.method = ''
+        self.job_id = ''
+        self.blob_hex = ''
+        self.seed_hash_hex = ''
+        self.target64 = 0
+        self.difficulty = 0
+        self.height = 0
+        self.sidechain_height = 0
+        self.mainchain_height = 0
+        self.nonce_offset = 39
+        self.created_ts = time.time()
+        self.updated_ts = self.created_ts
+        self.peer_key = ''
+        self.rpc_port = 0
+        self.extra: Dict[str, Any] = {}
+
+
+class _HotShareCandidateRow:
+    __slots__ = (
+        'share_key',
+        'job_key',
+        'nonce_u32',
+        'value64',
+        'result_hex',
+        'difficulty_estimate',
+        'quality_ratio',
+        'worker_idx',
+        'peer_key',
+        'created_ts',
+        'network_confirmed',
+        'confirmation_reason',
+        'confirmation_ts',
+        'seen_sources',
+    )
+
+    def __init__(
+        self,
+        *,
+        share_key: str,
+        job_key: str,
+        nonce_u32: int,
+        value64: int,
+        result_hex: str,
+        difficulty_estimate: float,
+        quality_ratio: float,
+        worker_idx: int = -1,
+        peer_key: str = '',
+    ) -> None:
+        self.share_key = str(share_key)
+        self.job_key = str(job_key)
+        self.nonce_u32 = int(nonce_u32) & 0xFFFFFFFF
+        self.value64 = int(value64) & 0xFFFFFFFFFFFFFFFF
+        self.result_hex = str(result_hex or '')
+        self.difficulty_estimate = float(difficulty_estimate)
+        self.quality_ratio = float(quality_ratio)
+        self.worker_idx = int(worker_idx)
+        self.peer_key = str(peer_key or '')
+        self.created_ts = time.time()
+        self.network_confirmed = False
+        self.confirmation_reason = ''
+        self.confirmation_ts = 0.0
+        self.seen_sources: Set[str] = set()
+
+
+class _P2PoolObserverBridgePatch:
+    def __init__(self, logger: Optional[Callable[[str], None]] = None) -> None:
+        self.logger = logger or (lambda _s: None)
+        self._mu = threading.RLock()
+        self._rows: Dict[str, _HotShareCandidateRow] = {}
+        self._confirmed_order: Deque[str] = deque(maxlen=2048)
+        self._confirmed_total = 0
+        self._last_confirmed_key = ''
+
+    @staticmethod
+    def make_share_key(job_key: str, nonce_u32: int, result_hex: str) -> str:
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(job_key or '').encode('utf-8', errors='ignore'))
+        h.update(int(nonce_u32).to_bytes(4, 'little', signed=False))
+        h.update(str(result_hex or '')[:64].encode('utf-8', errors='ignore'))
+        return h.hexdigest()
+
+    def note_local_candidate(
+        self,
+        *,
+        job_key: str,
+        nonce_u32: int,
+        value64: int,
+        result_hex: str,
+        difficulty_estimate: float,
+        quality_ratio: float,
+        worker_idx: int = -1,
+        peer_key: str = '',
+        source: str = 'hot_hash_loop',
+    ) -> str:
+        share_key = self.make_share_key(job_key, nonce_u32, result_hex)
+        with self._mu:
+            row = self._rows.get(share_key)
+            if row is None:
+                row = _HotShareCandidateRow(
+                    share_key=share_key,
+                    job_key=job_key,
+                    nonce_u32=nonce_u32,
+                    value64=value64,
+                    result_hex=result_hex,
+                    difficulty_estimate=difficulty_estimate,
+                    quality_ratio=quality_ratio,
+                    worker_idx=worker_idx,
+                    peer_key=peer_key,
+                )
+                self._rows[share_key] = row
+            row.seen_sources.add(str(source or 'hot_hash_loop'))
+            return share_key
+
+    def confirm(
+        self,
+        *,
+        share_key: str = '',
+        job_key: str = '',
+        nonce_u32: Optional[int] = None,
+        result_hex: str = '',
+        reason: str = 'network_echo',
+        source: str = 'network',
+    ) -> Optional[_HotShareCandidateRow]:
+        with self._mu:
+            row: Optional[_HotShareCandidateRow] = None
+            if share_key:
+                row = self._rows.get(str(share_key))
+            if row is None and job_key and nonce_u32 is not None and result_hex:
+                guess = self.make_share_key(job_key, int(nonce_u32), result_hex)
+                row = self._rows.get(guess)
+            if row is None:
+                return None
+            row.network_confirmed = True
+            row.confirmation_reason = str(reason or 'network_echo')
+            row.confirmation_ts = time.time()
+            row.seen_sources.add(str(source or 'network'))
+            self._confirmed_total += 1
+            self._last_confirmed_key = row.share_key
+            self._confirmed_order.append(row.share_key)
+            return row
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._mu:
+            confirmed_rows = [self._rows[k] for k in list(self._confirmed_order) if k in self._rows]
+            return {
+                'confirmed_total': int(self._confirmed_total),
+                'last_confirmed_key': str(self._last_confirmed_key),
+                'recent_confirmed': [
+                    {
+                        'share_key': r.share_key,
+                        'job_key': r.job_key,
+                        'nonce_u32': int(r.nonce_u32),
+                        'value64': int(r.value64),
+                        'result_hex': str(r.result_hex),
+                        'difficulty_estimate': float(r.difficulty_estimate),
+                        'quality_ratio': float(r.quality_ratio),
+                        'worker_idx': int(r.worker_idx),
+                        'peer_key': str(r.peer_key),
+                        'created_ts': float(r.created_ts),
+                        'confirmation_ts': float(r.confirmation_ts),
+                        'confirmation_reason': str(r.confirmation_reason),
+                    }
+                    for r in confirmed_rows[-32:]
+                ],
+            }
+
+
+def _rc_patch_install_hot_state(self) -> None:
+    if getattr(self, '_hot_rpc_patch_ready', False):
+        return
+    self._hot_rpc_patch_ready = True
+    self._hot_job_mu = threading.RLock()
+    self._hot_network_jobs: Dict[str, _HotNetworkJobState] = {}
+    self._hot_latest_job_key = ''
+    self._hot_latest_job_update_ts = 0.0
+    self._hot_last_rpc_method = ''
+    self._hot_last_rpc_job_id = ''
+    self._hot_last_rpc_status = ''
+    self._hot_last_rpc_blob_hex = ''
+    self._hot_last_rpc_seed_hash_hex = ''
+    self._hot_last_rpc_target64 = 0
+    self._hot_last_rpc_height = 0
+    self._hot_last_rpc_peer = ''
+    self._hot_real_share_total = 0
+    self._hot_last_real_share_ts = 0.0
+    self._hot_observer_bridge = _P2PoolObserverBridgePatch(logger=getattr(self, 'logger', None))
+
+
+def _rc_patch_note_network_job(
+    self,
+    decoded: Dict[str, Any],
+    *,
+    source: str,
+    peer_key: str = '',
+    rpc_port: int = 0,
+) -> Optional[_HotNetworkJobState]:
+    _rc_patch_install_hot_state(self)
+    if not isinstance(decoded, dict):
+        return None
+    method = _hp_extract_method(decoded)
+    blob_hex = _hp_extract_blob_hex(decoded)
+    seed_hash_hex = _hp_extract_seed_hash(decoded)
+    target64 = _hp_extract_target64(decoded)
+    height = _hp_extract_height(decoded)
+    difficulty = _hp_extract_diff(decoded)
+    if not blob_hex and method not in {'job', 'getblocktemplate', 'get_block_template'}:
+        return None
+    job_key = _hp_job_key(blob_hex, seed_hash_hex, target64)
+    if not job_key:
+        return None
+    now = time.time()
+    with self._hot_job_mu:
+        row = self._hot_network_jobs.get(job_key)
+        if row is None:
+            row = _HotNetworkJobState(job_key)
+            self._hot_network_jobs[job_key] = row
+        row.updated_ts = now
+        row.source = str(source or 'network')
+        row.method = str(method)
+        row.job_id = _hp_extract_job_id(decoded)
+        row.blob_hex = str(blob_hex)
+        row.seed_hash_hex = str(seed_hash_hex)
+        row.target64 = int(target64)
+        row.difficulty = int(difficulty)
+        row.height = int(height)
+        row.mainchain_height = int(decoded.get('current_blockchain_height') or decoded.get('height') or height or 0)
+        row.sidechain_height = int(decoded.get('current_height') or decoded.get('sidechain_height') or 0)
+        row.peer_key = str(peer_key or row.peer_key)
+        row.rpc_port = int(rpc_port or row.rpc_port)
+        row.extra.update(dict(decoded))
+        self._hot_latest_job_key = row.job_key
+        self._hot_latest_job_update_ts = now
+        self._hot_last_rpc_method = str(method)
+        self._hot_last_rpc_job_id = str(row.job_id)
+        self._hot_last_rpc_blob_hex = str(row.blob_hex)
+        self._hot_last_rpc_seed_hash_hex = str(row.seed_hash_hex)
+        self._hot_last_rpc_target64 = int(row.target64)
+        self._hot_last_rpc_height = int(row.height)
+        self._hot_last_rpc_peer = str(row.peer_key)
+        return row
+
+
+def _rc_patch_note_local_share_candidate(
+    self,
+    *,
+    job_key: str,
+    nonce_u32: int,
+    value64: int,
+    result_hex: str,
+    difficulty_estimate: float,
+    quality_ratio: float,
+    worker_idx: int = -1,
+    peer_key: str = '',
+    source: str = 'hot_hash_loop',
+) -> str:
+    _rc_patch_install_hot_state(self)
+    return self._hot_observer_bridge.note_local_candidate(
+        job_key=job_key,
+        nonce_u32=nonce_u32,
+        value64=value64,
+        result_hex=result_hex,
+        difficulty_estimate=difficulty_estimate,
+        quality_ratio=quality_ratio,
+        worker_idx=worker_idx,
+        peer_key=peer_key,
+        source=source,
+    )
+
+
+def _rc_patch_confirm_real_share(
+    self,
+    *,
+    share_key: str = '',
+    job_key: str = '',
+    nonce_u32: Optional[int] = None,
+    result_hex: str = '',
+    reason: str = 'network_echo',
+    source: str = 'network',
+) -> bool:
+    _rc_patch_install_hot_state(self)
+    row = self._hot_observer_bridge.confirm(
+        share_key=share_key,
+        job_key=job_key,
+        nonce_u32=nonce_u32,
+        result_hex=result_hex,
+        reason=reason,
+        source=source,
+    )
+    if row is None:
+        return False
+    with self._hot_job_mu:
+        self._hot_real_share_total += 1
+        self._hot_last_real_share_ts = time.time()
+    return True
+
+
+def _rc_patch_get_hot_hash_job_snapshot(self) -> Dict[str, Any]:
+    _rc_patch_install_hot_state(self)
+    with self._hot_job_mu:
+        if not self._hot_latest_job_key:
+            return {}
+        row = self._hot_network_jobs.get(self._hot_latest_job_key)
+        if row is None:
+            return {}
+        return {
+            'job_key': str(row.job_key),
+            'method': str(row.method),
+            'job_id': str(row.job_id),
+            'blob_hex': str(row.blob_hex),
+            'seed_hash_hex': str(row.seed_hash_hex),
+            'target64': int(row.target64),
+            'difficulty': int(row.difficulty),
+            'height': int(row.height),
+            'sidechain_height': int(row.sidechain_height),
+            'mainchain_height': int(row.mainchain_height),
+            'peer_key': str(row.peer_key),
+            'rpc_port': int(row.rpc_port),
+            'updated_ts': float(row.updated_ts),
+            'source': str(row.source),
+        }
+
+
+def _rc_patch_observer_snapshot(self) -> Dict[str, Any]:
+    _rc_patch_install_hot_state(self)
+    base = self._hot_observer_bridge.snapshot()
+    with self._hot_job_mu:
+        base.update(
+            {
+                'latest_job_key': str(self._hot_latest_job_key),
+                'latest_job_update_ts': float(self._hot_latest_job_update_ts),
+                'last_rpc_method': str(self._hot_last_rpc_method),
+                'last_rpc_job_id': str(self._hot_last_rpc_job_id),
+                'last_rpc_height': int(self._hot_last_rpc_height),
+                'real_share_total': int(self._hot_real_share_total),
+                'last_real_share_ts': float(self._hot_last_real_share_ts),
+            }
+        )
+    return base
+
+
+def _rc_patch_extract_rpc_payload_locked(
+    self,
+    payload: bytes | str,
+    *,
+    service: Optional[int] = None,
+    source: str = '',
+    peer_key: str = '',
+    rpc_port: int = 0,
+) -> None:
+    _rc_patch_install_hot_state(self)
+    if payload is None:
+        return
+    text = payload if isinstance(payload, str) else bytes(payload).decode('utf-8', errors='ignore')
+    text = _safe_str(text).strip()
+    if not text:
+        return
+    if not _hp_looks_like_json_payload(text):
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in reversed(lines):
+            if _hp_looks_like_json_payload(ln):
+                text = ln
+                break
+    obj = _hp_safe_json_loads(text)
+    if obj is None:
+        return
+    items: List[Dict[str, Any]] = []
+    if isinstance(obj, dict):
+        items.append(_hp_flatten_rpc_like_dict(obj))
+    elif isinstance(obj, list):
+        for entry in obj:
+            if isinstance(entry, dict):
+                items.append(_hp_flatten_rpc_like_dict(entry))
+    if not items:
+        return
+    for flat in items:
+        method = _hp_extract_method(flat)
+        status = _hp_extract_status(flat)
+        if status:
+            self._hot_last_rpc_status = str(status)
+        if method:
+            self._hot_last_rpc_method = str(method)
+        try:
+            self._apply_decoded_fields_locked(flat, service=service, source=source or 'json_rpc')
+        except Exception:
+            pass
+        if method in {'getblocktemplate', 'get_block_template', 'job', 'login', 'submit', 'submitblock', 'submit_block'} or _hp_extract_blob_hex(flat):
+            try:
+                self.note_network_job(flat, source=source or method or 'json_rpc', peer_key=peer_key, rpc_port=rpc_port)
+            except Exception:
+                pass
+        is_accept = False
+        if method in {'submit', 'submitblock', 'submit_block'}:
+            status_l = _safe_str(status).lower()
+            if status_l in {'ok', 'accepted', 'success'}:
+                is_accept = True
+            if flat.get('accepted') is True:
+                is_accept = True
+            if flat.get('error') in (None, '', 0) and (flat.get('status') or flat.get('accepted') is True):
+                is_accept = True
+        if is_accept:
+            blob_hex = _hp_extract_blob_hex(flat)
+            seed_hash_hex = _hp_extract_seed_hash(flat)
+            target64 = _hp_extract_target64(flat)
+            job_key = _hp_job_key(blob_hex, seed_hash_hex, target64)
+            nonce_u32 = _hp_extract_nonce(flat)
+            result_hex = _hp_extract_hash_hex(flat)
+            if job_key and result_hex:
+                try:
+                    self.confirm_real_share(
+                        job_key=job_key,
+                        nonce_u32=nonce_u32,
+                        result_hex=result_hex,
+                        reason='rpc_accept',
+                        source=source or method or 'json_rpc',
+                    )
+                except Exception:
+                    pass
+
+
+def _rc_patch_try_parse_json_payload(
+    self,
+    payload: bytes,
+    *,
+    source: str,
+    peer_key: str = '',
+    src_port: int = 0,
+    dst_port: int = 0,
+    service_kind: int = 0,
+) -> None:
+    if not payload:
+        return
+    sport = int(src_port or 0)
+    dport = int(dst_port or 0)
+    likely_json = bool(
+        sport in _MONERO_RPC_PORTS_PATCH
+        or dport in _MONERO_RPC_PORTS_PATCH
+        or sport in _STRATUM_PORTS_PATCH
+        or dport in _STRATUM_PORTS_PATCH
+        or sport in _P2POOL_PORTS_PATCH
+        or dport in _P2POOL_PORTS_PATCH
+    )
+    if not likely_json:
+        try:
+            preview = bytes(payload[:1]).decode('utf-8', errors='ignore')
+        except Exception:
+            preview = ''
+        likely_json = preview in {'{', '['}
+    if not likely_json:
+        return
+    try:
+        self._extract_rpc_payload_locked(
+            payload,
+            service=service_kind,
+            source=source,
+            peer_key=peer_key,
+            rpc_port=(dport if dport in _MONERO_RPC_PORTS_PATCH else sport if sport in _MONERO_RPC_PORTS_PATCH else 0),
+        )
+    except Exception:
+        pass
+
+
+if not getattr(RemoteConnection, '_hot_rpc_patch_applied', False):
+    RemoteConnection._hot_rpc_patch_applied = True
+
+    _rc_patch_orig_init = RemoteConnection.__init__
+
+    def _rc_patch_init_wrapper(self, *args, **kwargs):
+        _rc_patch_orig_init(self, *args, **kwargs)
+        _rc_patch_install_hot_state(self)
+
+    RemoteConnection.__init__ = _rc_patch_init_wrapper
+    RemoteConnection.note_network_job = _rc_patch_note_network_job
+    RemoteConnection.note_local_share_candidate = _rc_patch_note_local_share_candidate
+    RemoteConnection.confirm_real_share = _rc_patch_confirm_real_share
+    RemoteConnection.get_hot_hash_job_snapshot = _rc_patch_get_hot_hash_job_snapshot
+    RemoteConnection.observer_snapshot = _rc_patch_observer_snapshot
+    RemoteConnection._extract_rpc_payload_locked = _rc_patch_extract_rpc_payload_locked
+    RemoteConnection._try_parse_json_payload = _rc_patch_try_parse_json_payload
+
+    _rc_patch_orig_feed_stream_bytes = RemoteConnection.feed_stream_bytes
+
+    def _rc_patch_feed_stream_bytes_wrapper(self, stream_id, peer, direction, data, *, service=RemoteConnectionDll.RC_SERVICE_UNKNOWN, timestamp_ms=None):
+        rc = _rc_patch_orig_feed_stream_bytes(self, stream_id, peer, direction, data, service=service, timestamp_ms=timestamp_ms)
+        peer_key = str(peer or '')
+        host, _, port_text = peer_key.rpartition(':')
+        try:
+            peer_port = int(port_text)
+        except Exception:
+            peer_port = 0
+        try:
+            self._try_parse_json_payload(
+                bytes(data or b''),
+                source='feed_stream_rpc_payload',
+                peer_key=peer_key,
+                src_port=(0 if int(direction) == RemoteConnectionDll.RC_DIR_OUTBOUND else peer_port),
+                dst_port=(peer_port if int(direction) == RemoteConnectionDll.RC_DIR_OUTBOUND else 0),
+                service_kind=int(service),
+            )
+        except Exception:
+            pass
+        return rc
+
+    RemoteConnection.feed_stream_bytes = _rc_patch_feed_stream_bytes_wrapper
+
+    _rc_patch_orig_ingest_router_packet = RemoteConnection.ingest_router_packet
+
+    def _rc_patch_ingest_router_packet_wrapper(self, packet):
+        ok = _rc_patch_orig_ingest_router_packet(self, packet)
+        try:
+            blob = packet.to_bytes() if packet is not None else b''
+            if blob:
+                self._try_parse_json_payload(
+                    blob,
+                    source='router_packet_rpc_payload',
+                    peer_key=(packet.peer_key() if packet is not None else ''),
+                    src_port=int(getattr(packet, 'src_port', 0) or 0),
+                    dst_port=int(getattr(packet, 'dst_port', 0) or 0),
+                    service_kind=int(packet.service_guess() if packet is not None else 0),
+                )
+        except Exception:
+            pass
+        return ok
+
+    RemoteConnection.ingest_router_packet = _rc_patch_ingest_router_packet_wrapper
+
+
+if not getattr(MinerInterface, '_hot_rpc_patch_applied', False):
+    MinerInterface._hot_rpc_patch_applied = True
+    _mi_patch_orig_on_capture_packet = MinerInterface._on_capture_packet
+
+    def _mi_patch_on_capture_packet_wrapper(self, packet: Dict[str, Any]) -> None:
+        _mi_patch_orig_on_capture_packet(self, packet)
+        try:
+            if not isinstance(packet, dict):
+                return
+            if packet.get('kind') == 'capture_error':
+                return
+            service_kind = self._capture_service_kind(packet)
+            peer_key = self._capture_peer_key(packet, service_kind)
+            topic = _safe_str(packet.get('topic')).lower()
+            sport = _safe_int(packet.get('sport'), 0)
+            dport = _safe_int(packet.get('dport'), 0)
+            is_json_lane = bool(
+                topic in {'monero', 'p2pool', 'stratum', 'http', 'https'}
+                or sport in (_MONERO_RPC_PORTS_PATCH | _STRATUM_PORTS_PATCH | _P2POOL_PORTS_PATCH)
+                or dport in (_MONERO_RPC_PORTS_PATCH | _STRATUM_PORTS_PATCH | _P2POOL_PORTS_PATCH)
+            )
+            if not is_json_lane:
+                return
+            router_pkt = RouterPacket.from_capture_dict(
+                packet,
+                iface=self.IFACE_NAME,
+                source='minerinterface:capture',
+                capture_quality='miner_injected',
+            )
+            blob = router_pkt.to_bytes()
+            if not blob:
+                return
+            try:
+                payload, _meta = self.remote_connection._payload_from_maybe_packet(blob)
+            except Exception:
+                payload = blob
+            if payload:
+                self.remote_connection._extract_rpc_payload_locked(
+                    payload,
+                    service=service_kind,
+                    source='capture_json_payload',
+                    peer_key=peer_key,
+                    rpc_port=(dport if dport in _MONERO_RPC_PORTS_PATCH else sport if sport in _MONERO_RPC_PORTS_PATCH else 0),
+                )
+        except Exception:
+            pass
+
+    MinerInterface._on_capture_packet = _mi_patch_on_capture_packet_wrapper
+
+
+def _ph_patch_refresh_job_from_network(self, job: MoneroJob) -> MoneroJob:
+    rc = getattr(self, 'remote_connection', None)
+    if rc is None:
+        return job
+    try:
+        snap = rc.get_hot_hash_job_snapshot()
+    except Exception:
+        return job
+    if not snap:
+        return job
+    blob_hex = _safe_str(snap.get('blob_hex'))
+    if not blob_hex:
+        return job
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except Exception:
+        return job
+    seed_hash_hex = _safe_str(snap.get('seed_hash_hex'))
+    try:
+        seed_hash = bytes.fromhex(seed_hash_hex) if seed_hash_hex else bytes(getattr(job, 'seed_hash', b''))
+    except Exception:
+        seed_hash = bytes(getattr(job, 'seed_hash', b''))
+    target64 = _safe_int(snap.get('target64'), int(getattr(job, 'target64', 0) or 0))
+    try:
+        new_job = _hot_patch_copy.copy(job)
+        try:
+            new_job.blob = blob
+        except Exception:
+            pass
+        try:
+            new_job.seed_hash = seed_hash
+        except Exception:
+            pass
+        try:
+            new_job.target64 = int(target64)
+        except Exception:
+            pass
+        try:
+            new_job.height = _safe_int(snap.get('height'), _safe_int(getattr(job, 'height', 0), 0))
+        except Exception:
+            pass
+        try:
+            if snap.get('job_id'):
+                new_job.job_id = str(snap.get('job_id'))
+        except Exception:
+            pass
+        return new_job
+    except Exception:
+        return job
+
+
+def _ph_patch_note_found_candidates(self, result: Dict[str, Any], job: MoneroJob, worker_idx: Optional[int]) -> None:
+    rc = getattr(self, 'remote_connection', None)
+    if rc is None:
+        return
+    found = list((result or {}).get('found') or [])
+    if not found:
+        return
+    try:
+        job_key = self._stable_job_template_key(job)
+    except Exception:
+        return
+    peer_key = ''
+    try:
+        snap = rc.snapshot()
+        for k, st in (snap.get('peers') or {}).items():  # unlikely dict, fallback below
+            if st.get('connected'):
+                peer_key = str(k)
+                break
+    except Exception:
+        pass
+    if not peer_key:
+        try:
+            peers = list((rc.snapshot().get('peers') or []))
+            for st in peers:
+                if st.get('connected'):
+                    host = _safe_str(st.get('host'))
+                    port = _safe_int(st.get('port'), 0)
+                    if host and port > 0:
+                        peer_key = f'{host}:{port}'
+                        break
+        except Exception:
+            pass
+    for row in found:
+        try:
+            nonce_u32 = _safe_int(row.get('nonce_u32'), 0)
+            value64 = _safe_int(row.get('value64'), 0)
+            result_hex = _safe_str(row.get('hash_hex'))
+            diff_est = _safe_float(row.get('share_difficulty'), 0.0)
+            quality = _safe_float(row.get('quality_ratio'), 0.0)
+            if result_hex:
+                rc.note_local_share_candidate(
+                    job_key=job_key,
+                    nonce_u32=nonce_u32,
+                    value64=value64,
+                    result_hex=result_hex,
+                    difficulty_estimate=diff_est,
+                    quality_ratio=quality,
+                    worker_idx=(-1 if worker_idx is None else int(worker_idx)),
+                    peer_key=peer_key,
+                    source='hot_hash_loop',
+                )
+        except Exception:
+            pass
+
+
+if not getattr(P2PoolShareHunterWorker, '_hot_rpc_patch_applied', False):
+    P2PoolShareHunterWorker._hot_rpc_patch_applied = True
+    P2PoolShareHunterWorker._refresh_job_from_network = _ph_patch_refresh_job_from_network
+    P2PoolShareHunterWorker._note_found_candidates = _ph_patch_note_found_candidates
+
+    _ph_patch_orig_hash_job = P2PoolShareHunterWorker.hash_job
+
+    def _ph_patch_hash_job_wrapper(
+        self,
+        *,
+        job: MoneroJob,
+        generation: int,
+        start_nonce: int,
+        count: Optional[int] = None,
+        max_results: Optional[int] = None,
+        stop_flag: Any = None,
+        poll_interval: Optional[int] = None,
+        stale_poll_interval: Optional[int] = None,
+        is_current: Optional[Callable[[], bool]] = None,
+        submit_candidate: Optional[Callable[[int, int, bytes], None]] = None,
+        worker_idx: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        patched_job = self._refresh_job_from_network(job)
+        result = _ph_patch_orig_hash_job(
+            self,
+            job=patched_job,
+            generation=generation,
+            start_nonce=start_nonce,
+            count=count,
+            max_results=max_results,
+            stop_flag=stop_flag,
+            poll_interval=poll_interval,
+            stale_poll_interval=stale_poll_interval,
+            is_current=is_current,
+            submit_candidate=submit_candidate,
+            worker_idx=worker_idx,
+        )
+        try:
+            self._note_found_candidates(result, patched_job, worker_idx)
+        except Exception:
+            pass
+        try:
+            rc = getattr(self, 'remote_connection', None)
+            if rc is not None:
+                result['observer_snapshot'] = rc.observer_snapshot()
+                result['hot_hash_job_snapshot'] = rc.get_hot_hash_job_snapshot()
+        except Exception:
+            pass
+        return result
+
+    P2PoolShareHunterWorker.hash_job = _ph_patch_hash_job_wrapper
+
+# =============================================================================
+# END HOT HASH / RPC / OBSERVER PATCH LAYER
+# =============================================================================
+
+
+# =============================================================================
+# ULTRA SHARE FAST PATH REWRITE LAYER
+# =============================================================================
+#
+# This second-stage rewrite layer intentionally keeps the full original module
+# above intact and then replaces the hot hunter path with a more aggressive
+# low-pressure strategy.
+#
+# Main goals of this layer:
+#   1) find real P2Pool shares quickly when the network is active or jobs churn
+#   2) when the system is under lower pressure, stretch the post-hit window so
+#      more unique share rows can be harvested in a single run
+#   3) keep all of the original public signatures in place so the surrounding
+#      project can continue to call the same methods
+#   4) preserve the existing observer / RPC patch behavior instead of fighting it
+#
+# The original file already has:
+#   - per-template nonce guards
+#   - submit guards
+#   - lane workers
+#   - RemoteConnection network hinting
+#   - hot-job refresh hooks
+#
+# This layer leans into those primitives and changes the economics of the hot
+# loop instead of changing your external API surface. In practice that means:
+#   - larger leased search windows when pressure is low
+#   - softer submit cadence when pressure is low
+#   - bigger near-miss envelope when you explicitly have room to hunt
+#   - extra sprint budget after the first valid hit in a burst
+#   - more internal rows retained before the final result cap is applied
+#
+# The end result is meant to be more "share streak hungry" while still snapping
+# back to a cautious / fresh mode when jobs are churning or the remote network
+# layer is hot.
+# =============================================================================
+
+
+@dataclass
+class _UltraPressureModel:
+    raw_pressure: float = 0.0
+    decode_confidence: float = 0.0
+    urgency: float = 0.0
+    connected_peers: int = 0
+    hot_peers: int = 0
+    rx_pps: float = 0.0
+    dll_ready: bool = False
+    real_data_fresh: bool = False
+    low_effort_mode: bool = False
+    sprint_bias: float = 0.0
+    batch_scale: float = 1.0
+    near_miss_ratio: float = 1.0
+    near_miss_ratio_secondary: float = 1.0
+    hash_chunk_cap: int = 24
+    submit_immediately: bool = False
+    live_poll: int = 64
+    stale_poll: int = 32
+    harvest_floor: int = 512
+    harvest_multiplier: int = 8
+    batch_submit_target: int = 4
+    chain_gap_limit: int = 64
+    burst_merge_limit: int = 8
+    share_sprint_hashes: int = 0
+    result_keep_scale: int = 1
+    best_keep_scale: int = 1
+    unique_multiplier: float = 1.0
+
+
+@dataclass
+class _UltraLaneBurstState:
+    burst_commits: int = 0
+    sprint_extensions: int = 0
+    extra_budget_total: int = 0
+    secondary_best_rows: int = 0
+
+
+def _ultra_clamp(v: Any, lo: float, hi: float) -> float:
+    try:
+        x = float(v)
+    except Exception:
+        x = float(lo)
+    if x < lo:
+        return float(lo)
+    if x > hi:
+        return float(hi)
+    return float(x)
+
+
+def _ultra_bool(v: Any) -> bool:
+    try:
+        return bool(v)
+    except Exception:
+        return False
+
+
+def _ultra_pressure_model(
+    self,
+    *,
+    network_hint: Optional[Dict[str, Any]],
+    remote_snapshot: Optional[Dict[str, Any]],
+    job_timing: Optional[Dict[str, Any]],
+    live_poll: int,
+    stale_poll: int,
+) -> _UltraPressureModel:
+    hint = dict(network_hint or {})
+    snap = dict(remote_snapshot or {})
+    timing = dict(job_timing or {})
+
+    raw_pressure = _ultra_clamp(hint.get('pressure', 0.0), 0.0, 1.0)
+    decode_confidence = _ultra_clamp(
+        hint.get('decode_confidence', snap.get('decode_confidence', 0.0)),
+        0.0,
+        1.0,
+    )
+    urgency = _ultra_clamp(timing.get('urgency', 0.0), 0.0, 1.0)
+    connected_peers = max(0, _safe_int(snap.get('connected_peers'), 0))
+    hot_peers = max(0, _safe_int(snap.get('hot_peers'), 0))
+    rx_pps = max(0.0, _safe_float(snap.get('rx_pps'), 0.0))
+    dll_ready = _ultra_bool(snap.get('dll_ready'))
+    real_data_fresh = _ultra_bool(snap.get('real_data_fresh'))
+
+    rx_load = _ultra_clamp(rx_pps / 512.0, 0.0, 1.0)
+    peer_load = _ultra_clamp((connected_peers + hot_peers) / 8.0, 0.0, 1.0)
+
+    # Base pressure is a blend of what the network hint says, how fresh the job
+    # churn looks, and whether packet activity says we should favor freshness.
+    composite_pressure = _ultra_clamp(
+        (raw_pressure * 0.42) + (urgency * 0.38) + (rx_load * 0.12) + (peer_load * 0.08),
+        0.0,
+        1.0,
+    )
+
+    stability_bonus = 0.0
+    if dll_ready:
+        stability_bonus += 0.10
+    if real_data_fresh:
+        stability_bonus += 0.08
+    if decode_confidence >= 0.60:
+        stability_bonus += 0.08
+    if connected_peers <= 1:
+        stability_bonus += 0.05
+    if hot_peers <= 1:
+        stability_bonus += 0.04
+
+    low_effort_score = _ultra_clamp((1.0 - composite_pressure) + stability_bonus, 0.0, 1.0)
+    low_effort_mode = bool(low_effort_score >= 0.60 and urgency <= 0.45)
+
+    if urgency >= 0.92:
+        return _UltraPressureModel(
+            raw_pressure=raw_pressure,
+            decode_confidence=decode_confidence,
+            urgency=urgency,
+            connected_peers=connected_peers,
+            hot_peers=hot_peers,
+            rx_pps=rx_pps,
+            dll_ready=dll_ready,
+            real_data_fresh=real_data_fresh,
+            low_effort_mode=False,
+            sprint_bias=0.0,
+            batch_scale=0.20,
+            near_miss_ratio=max(1.03, min(float(getattr(self, 'near_miss_ratio', 1.75) or 1.75), 1.10)),
+            near_miss_ratio_secondary=max(1.05, min(float(getattr(self, 'near_miss_ratio', 1.75) or 1.75), 1.12)),
+            hash_chunk_cap=2,
+            submit_immediately=True,
+            live_poll=1,
+            stale_poll=1,
+            harvest_floor=64,
+            harvest_multiplier=1,
+            batch_submit_target=1,
+            chain_gap_limit=24,
+            burst_merge_limit=2,
+            share_sprint_hashes=0,
+            result_keep_scale=1,
+            best_keep_scale=1,
+            unique_multiplier=1.0,
+        )
+
+    sprint_bias = _ultra_clamp(low_effort_score if low_effort_mode else (low_effort_score * 0.35), 0.0, 1.0)
+    base_near = max(1.0, float(getattr(self, 'near_miss_ratio', 1.75) or 1.75))
+
+    if low_effort_mode:
+        batch_scale = 1.20 + (2.80 * sprint_bias)
+        near_ratio = max(base_near, base_near * (1.00 + (0.55 * sprint_bias)))
+        near_ratio_secondary = max(near_ratio, base_near * (1.28 + (0.95 * sprint_bias)))
+        hash_chunk_cap = int(max(16, min(256, round(24 + (72 * sprint_bias)))))
+        batch_submit_target = int(max(6, min(96, round(8 + (40 * sprint_bias)))))
+        harvest_floor = int(max(768, min(32768, round(2048 + (16384 * sprint_bias)))))
+        harvest_multiplier = int(max(12, min(64, round(18 + (26 * sprint_bias)))))
+        chain_gap_limit = int(max(64, min(512, round(96 + (192 * sprint_bias)))))
+        burst_merge_limit = int(max(8, min(128, round(16 + (48 * sprint_bias)))))
+        share_sprint_hashes = int(max(512, min(65536, round(2048 + (24576 * sprint_bias)))))
+        live_cap = int(max(live_poll, round(live_poll * (1.30 + (1.30 * sprint_bias)))))
+        stale_cap = int(max(stale_poll, round(stale_poll * (1.25 + (1.10 * sprint_bias)))))
+        result_keep_scale = int(max(2, min(10, round(2 + (5 * sprint_bias)))))
+        best_keep_scale = int(max(3, min(16, round(4 + (8 * sprint_bias)))))
+        unique_multiplier = 1.10 + (1.90 * sprint_bias)
+        submit_immediately = False
+    else:
+        batch_scale = 0.85 + (0.50 * sprint_bias)
+        near_ratio = max(1.01, min(base_near, base_near * (0.92 + (0.18 * sprint_bias))))
+        near_ratio_secondary = max(near_ratio, near_ratio * 1.03)
+        hash_chunk_cap = int(max(6, min(64, round(8 + (24 * sprint_bias)))))
+        batch_submit_target = int(max(2, min(24, round(2 + (8 * sprint_bias)))))
+        harvest_floor = int(max(256, min(4096, round(512 + (2048 * sprint_bias)))))
+        harvest_multiplier = int(max(4, min(16, round(6 + (8 * sprint_bias)))))
+        chain_gap_limit = int(max(32, min(128, round(48 + (32 * sprint_bias)))))
+        burst_merge_limit = int(max(4, min(24, round(6 + (10 * sprint_bias)))))
+        share_sprint_hashes = int(max(64, min(4096, round(192 + (1024 * sprint_bias)))))
+        live_cap = int(max(1, min(live_poll, round(max(1, live_poll * (0.75 + (0.15 * sprint_bias)))))))
+        stale_cap = int(max(1, min(stale_poll, round(max(1, stale_poll * (0.70 + (0.15 * sprint_bias)))))))
+        result_keep_scale = 1
+        best_keep_scale = int(max(1, min(4, round(1 + (2 * sprint_bias)))))
+        unique_multiplier = 1.0 + (0.35 * sprint_bias)
+        submit_immediately = bool(urgency >= 0.70 or raw_pressure >= 0.68)
+
+    return _UltraPressureModel(
+        raw_pressure=raw_pressure,
+        decode_confidence=decode_confidence,
+        urgency=urgency,
+        connected_peers=connected_peers,
+        hot_peers=hot_peers,
+        rx_pps=rx_pps,
+        dll_ready=dll_ready,
+        real_data_fresh=real_data_fresh,
+        low_effort_mode=low_effort_mode,
+        sprint_bias=sprint_bias,
+        batch_scale=float(batch_scale),
+        near_miss_ratio=float(near_ratio),
+        near_miss_ratio_secondary=float(near_ratio_secondary),
+        hash_chunk_cap=int(hash_chunk_cap),
+        submit_immediately=bool(submit_immediately),
+        live_poll=max(1, int(live_cap)),
+        stale_poll=max(1, int(stale_cap)),
+        harvest_floor=max(64, int(harvest_floor)),
+        harvest_multiplier=max(1, int(harvest_multiplier)),
+        batch_submit_target=max(1, int(batch_submit_target)),
+        chain_gap_limit=max(8, int(chain_gap_limit)),
+        burst_merge_limit=max(2, int(burst_merge_limit)),
+        share_sprint_hashes=max(0, int(share_sprint_hashes)),
+        result_keep_scale=max(1, int(result_keep_scale)),
+        best_keep_scale=max(1, int(best_keep_scale)),
+        unique_multiplier=float(unique_multiplier),
+    )
+
+
+def _ultra_run_lane(self, st: _WorkerLane) -> None:
+    job = st.assigned_job
+    if job is None or st.assigned_count <= 0:
+        return
+
+    self._ensure_lane_vm(st, job)
+    if st.vm is None or st.blob_buf is None or st.nonce_ptr is None:
+        raise RuntimeError('lane state is not initialized')
+
+    hash_into = self.randomx.hash_into
+    nonce_ptr = st.nonce_ptr
+    out_buf = st.out_buf
+    value64_view = st.value64_view
+    read_tail64 = st.probe.read_tail64
+    use_view = sys.byteorder == 'little'
+
+    target64 = int(job.target64) & 0xFFFFFFFFFFFFFFFF
+    near_cutoff = int(st.assigned_near_cutoff) & 0xFFFFFFFFFFFFFFFF
+    near_cutoff_secondary = int(getattr(st, 'assigned_near_cutoff_secondary', near_cutoff) or near_cutoff) & 0xFFFFFFFFFFFFFFFF
+    result_cap = max(1, int(st.assigned_result_cap))
+    best_cap = max(1, int(st.assigned_best_cap))
+    nonce_u32 = int(st.assigned_start_nonce) & 0xFFFFFFFF
+    remaining = int(st.assigned_count)
+    stride = max(1, int(st.assigned_stride))
+    poll_interval = max(1, int(st.assigned_poll_interval))
+    stale_poll_interval = max(1, int(st.assigned_stale_poll_interval))
+    external_stop_is_set = getattr(st.assigned_stop_flag, 'is_set', None)
+    is_current = st.assigned_is_current
+    submit_candidate = st.assigned_submit_candidate
+    job_key = str(st.assigned_job_key or '')
+    submit_immediately = bool(st.assigned_submit_immediately)
+    hash_chunk_cap = max(1, int(st.assigned_hash_chunk_cap or 24))
+
+    low_effort_mode = bool(getattr(st, 'assigned_low_effort_mode', False))
+    sprint_bias = _ultra_clamp(getattr(st, 'assigned_sprint_bias', 0.0), 0.0, 1.0)
+    harvest_floor = max(64, int(getattr(st, 'assigned_harvest_floor', getattr(self, '_post_hit_harvest_floor', 512)) or 512))
+    harvest_multiplier = max(1, int(getattr(st, 'assigned_harvest_multiplier', getattr(self, '_post_hit_harvest_multiplier', 8)) or 8))
+    batch_submit_target = max(1, int(getattr(st, 'assigned_batch_submit_target', max(self._min_unique_flush, 2)) or 1))
+    chain_gap_limit = max(8, int(getattr(st, 'assigned_chain_gap_limit', getattr(self, '_chain_gap_limit', 64)) or 64))
+    burst_merge_limit = max(2, int(getattr(st, 'assigned_burst_merge_limit', max(4, result_cap)) or max(4, result_cap)))
+    share_sprint_hashes = max(0, int(getattr(st, 'assigned_share_sprint_hashes', 0) or 0))
+
+    found_pool = _UniqueNonceCandidatePool(limit=max(64, result_cap * 16))
+    best_pool = _UniqueNonceCandidatePool(limit=max(64, best_cap * 16))
+    pending_submit_pool = _UniqueNonceCandidatePool(limit=max(self._pending_submit_limit, result_cap * 16))
+    burst_pool = _UniqueNonceCandidatePool(limit=max(32, result_cap * 8))
+
+    burst_state = _UltraLaneBurstState()
+    last_burst_nonce: Optional[int] = None
+    local_step_counter = 0
+    streak_len = 0
+    harvest_budget_left = 0
+    share_sprint_budget_left = 0
+    stale_triggered = False
+    next_live_check = 0
+    next_stale_check = 0
+    pending_direct_notes = 0
+
+    if submit_immediately:
+        batch_submit_target = 1
+
+    def _flush_direct_notes() -> None:
+        nonlocal pending_direct_notes
+        if pending_direct_notes <= 0:
+            return
+        controller = self.python_usage_controller
+        if controller is not None:
+            try:
+                controller.note_direct_hashes(st.worker_index, pending_direct_notes)
+            except Exception:
+                pass
+        pending_direct_notes = 0
+
+    def _should_abort_current_local(step_index: int, local_live_check: int, local_stale_check: int) -> Tuple[bool, int, int]:
+        if is_current is None:
+            return False, local_live_check, local_stale_check
+
+        should_check = False
+        if step_index >= local_stale_check:
+            local_stale_check = step_index + stale_poll_interval
+            should_check = True
+        if step_index >= local_live_check:
+            local_live_check = step_index + poll_interval
+            should_check = True
+
+        if not should_check:
+            return False, local_live_check, local_stale_check
+
+        try:
+            if not bool(is_current()):
+                return True, local_live_check, local_stale_check
+        except Exception:
+            pass
+        return False, local_live_check, local_stale_check
+
+    def _reset_burst() -> None:
+        nonlocal burst_pool, last_burst_nonce, streak_len
+        burst_pool = _UniqueNonceCandidatePool(limit=max(32, result_cap * 8))
+        last_burst_nonce = None
+        streak_len = 0
+
+    def _arm_harvest_budget(*, bonus: int = 0) -> None:
+        nonlocal harvest_budget_left, share_sprint_budget_left
+        if submit_immediately:
+            harvest_budget_left = 0
+            share_sprint_budget_left = 0
+            return
+        base_budget = max(
+            harvest_floor,
+            min(131072, int(max(1, remaining) * max(1, harvest_multiplier))),
+        )
+        if bonus > 0:
+            base_budget = min(262144, int(base_budget + bonus))
+        if low_effort_mode:
+            share_sprint_budget_left = max(share_sprint_budget_left, share_sprint_hashes)
+        harvest_budget_left = max(harvest_budget_left, base_budget)
+        burst_state.extra_budget_total += int(base_budget)
+
+    def _commit_burst() -> int:
+        committed = 0
+        if len(burst_pool) <= 0:
+            return 0
+        for row in burst_pool.rows_sorted():
+            if found_pool.add(row):
+                pending_submit_pool.add(row)
+                committed += 1
+        if committed > 0:
+            burst_state.burst_commits += 1
+        return committed
+
+    def _flush_pending(force: bool = False) -> int:
+        nonlocal harvest_budget_left
+        if submit_candidate is None or len(pending_submit_pool) <= 0:
+            return 0
+
+        pending_n = len(pending_submit_pool)
+        should_flush = False
+        if force:
+            should_flush = True
+        elif pending_n >= batch_submit_target:
+            should_flush = True
+        elif pending_n >= self._min_unique_flush and harvest_budget_left <= 0:
+            should_flush = True
+        elif pending_n >= (pending_submit_pool.limit - 1):
+            should_flush = True
+
+        if not should_flush:
+            return 0
+
+        rows = pending_submit_pool.rows_sorted()
+        pending_submit_pool.clear()
+        harvest_budget_left = 0
+        return int(self._flush_candidates(job_key=job_key, rows=rows, submit_candidate=submit_candidate))
+
+    def _post_hash_progress(hashes_advanced: int) -> None:
+        nonlocal harvest_budget_left, share_sprint_budget_left
+        step_n = max(0, int(hashes_advanced))
+        if step_n > 0 and harvest_budget_left > 0:
+            harvest_budget_left = max(0, int(harvest_budget_left) - step_n)
+        if step_n > 0 and share_sprint_budget_left > 0:
+            share_sprint_budget_left = max(0, int(share_sprint_budget_left) - step_n)
+
+        if len(burst_pool) > 0 and harvest_budget_left <= 0:
+            if low_effort_mode and share_sprint_budget_left > 0:
+                extension = max(64, min(32768, int(share_sprint_budget_left)))
+                harvest_budget_left = extension
+                share_sprint_budget_left = 0
+                burst_state.sprint_extensions += 1
+            else:
+                committed_now = _commit_burst()
+                if committed_now > 0:
+                    st.submitted_hits += _flush_pending(force=False)
+                _reset_burst()
+
+        if len(pending_submit_pool) > 0:
+            st.submitted_hits += _flush_pending(force=False)
+
+    def _consume_candidate_result(row_nonce_u32: int, row_value64: int, row_result32: bytes) -> None:
+        nonlocal last_burst_nonce, streak_len
+        row = (int(row_nonce_u32), int(row_value64), bytes(row_result32))
+
+        if row_value64 < target64:
+            st.chain_hits += 1
+            nonce_key = int(row_nonce_u32) & 0xFFFFFFFF
+
+            if last_burst_nonce is None:
+                st.streak_groups += 1
+                streak_len = 1
+            else:
+                gap = ((nonce_key - last_burst_nonce) & 0xFFFFFFFF)
+                if gap <= chain_gap_limit:
+                    streak_len += 1
+                else:
+                    if len(burst_pool) > 0:
+                        committed_now = _commit_burst()
+                        if committed_now > 0:
+                            _arm_harvest_budget()
+                            st.submitted_hits += _flush_pending(force=False)
+                        _reset_burst()
+                    st.streak_groups += 1
+                    streak_len = 1
+
+            st.max_streak_len = max(st.max_streak_len, streak_len)
+
+            if self._template_nonce_guard.claim(job_key, nonce_key):
+                burst_pool.add(row)
+                last_burst_nonce = nonce_key
+                if len(burst_pool) == 1:
+                    _arm_harvest_budget()
+                elif low_effort_mode:
+                    bonus = max(32, min(4096, int(64 + (row_value64 < target64 and (256 * max(0.0, sprint_bias))))))
+                    _arm_harvest_budget(bonus=bonus)
+                if len(burst_pool) >= burst_merge_limit:
+                    committed_now = _commit_burst()
+                    if committed_now > 0:
+                        st.submitted_hits += _flush_pending(force=False)
+                    _reset_burst()
+                elif submit_immediately and len(burst_pool) > 0:
+                    committed_now = _commit_burst()
+                    if committed_now > 0:
+                        st.submitted_hits += _flush_pending(force=True)
+                    _reset_burst()
+
+        elif row_value64 < near_cutoff_secondary:
+            best_pool.add(row)
+            burst_state.secondary_best_rows += 1
+
+    def _run_usage_hash_chunk(chunk_n: int) -> Dict[str, Any]:
+        local_rows: List[Tuple[int, int, bytes]] = []
+        local_nonce = int(nonce_u32) & 0xFFFFFFFF
+        local_remaining = int(remaining)
+        local_steps = int(local_step_counter)
+        local_live_check = int(next_live_check)
+        local_stale_check = int(next_stale_check)
+        local_hashes_done = 0
+        local_stale_abort = False
+
+        for _ in range(max(1, int(chunk_n))):
+            if local_remaining <= 0:
+                break
+            if self._stop.is_set() or (external_stop_is_set is not None and external_stop_is_set()):
+                break
+
+            should_abort, local_live_check, local_stale_check = _should_abort_current_local(local_steps, local_live_check, local_stale_check)
+            if should_abort:
+                local_stale_abort = True
+                break
+
+            nonce_ptr[0] = local_nonce
+            hash_into(st.vm, st.blob_buf, out_buf)
+            value64 = int(value64_view.value) if use_view else int(read_tail64(out_buf))
+            if value64 < near_cutoff_secondary:
+                local_rows.append((int(local_nonce), int(value64), bytes(out_buf)))
+
+            local_hashes_done += 1
+            local_steps += 1
+            local_nonce = (local_nonce + stride) & 0xFFFFFFFF
+            local_remaining -= 1
+
+        return {
+            'rows': local_rows,
+            'hashes_done': int(local_hashes_done),
+            'nonce_after': int(local_nonce) & 0xFFFFFFFF,
+            'remaining_after': int(local_remaining),
+            'steps_after': int(local_steps),
+            'next_live_check_after': int(local_live_check),
+            'next_stale_check_after': int(local_stale_check),
+            'stale_abort': bool(local_stale_abort),
+        }
+
+    while remaining > 0:
+        if self._stop.is_set() or (external_stop_is_set is not None and external_stop_is_set()):
+            break
+
+        used_usage = False
+        usage_controller = self.python_usage_controller
+        effective_chunk_cap = 1 if submit_immediately else hash_chunk_cap
+
+        if usage_controller is not None and usage_controller.should_run(st.worker_index):
+            chunk_n = min(max(1, int(effective_chunk_cap)), max(1, int(usage_controller.suggested_chunk_hashes(remaining))))
+            used_usage, usage_result = usage_controller.invoke_chunk(st.worker_index, _run_usage_hash_chunk, chunk_n)
+            if used_usage and isinstance(usage_result, dict):
+                rows = list(usage_result.get('rows') or [])
+                chunk_hashes_done = max(0, int(usage_result.get('hashes_done', len(rows))))
+
+                for row_nonce_u32, row_value64, row_result32 in rows:
+                    _consume_candidate_result(int(row_nonce_u32), int(row_value64), bytes(row_result32))
+
+                st.hashes_done += chunk_hashes_done
+                _post_hash_progress(chunk_hashes_done)
+
+                nonce_u32 = int(usage_result.get('nonce_after', nonce_u32)) & 0xFFFFFFFF
+                remaining = max(0, int(usage_result.get('remaining_after', remaining)))
+                local_step_counter = max(local_step_counter, int(usage_result.get('steps_after', local_step_counter)))
+                next_live_check = max(next_live_check, int(usage_result.get('next_live_check_after', next_live_check)))
+                next_stale_check = max(next_stale_check, int(usage_result.get('next_stale_check_after', next_stale_check)))
+
+                if bool(usage_result.get('stale_abort', False)):
+                    st.stale_aborts += 1
+                    stale_triggered = True
+                    break
+                continue
+
+        chunk_n = min(max(1, int(effective_chunk_cap)), remaining)
+        chunk_hashed = 0
+
+        for _ in range(chunk_n):
+            if self._stop.is_set() or (external_stop_is_set is not None and external_stop_is_set()):
+                break
+
+            should_abort, next_live_check, next_stale_check = _should_abort_current_local(local_step_counter, next_live_check, next_stale_check)
+            if should_abort:
+                st.stale_aborts += 1
+                stale_triggered = True
+                break
+
+            nonce_ptr[0] = nonce_u32
+            hash_into(st.vm, st.blob_buf, out_buf)
+            value64 = int(value64_view.value) if use_view else int(read_tail64(out_buf))
+
+            st.hashes_done += 1
+            local_step_counter += 1
+            chunk_hashed += 1
+            pending_direct_notes += 1
+
+            if value64 < near_cutoff_secondary:
+                _consume_candidate_result(int(nonce_u32), int(value64), bytes(out_buf))
+
+            nonce_u32 = (nonce_u32 + stride) & 0xFFFFFFFF
+            remaining -= 1
+            if remaining <= 0:
+                break
+
+        _post_hash_progress(chunk_hashed)
+        _flush_direct_notes()
+        if stale_triggered:
+            break
+
+    _flush_direct_notes()
+
+    if len(burst_pool) > 0:
+        _commit_burst()
+        _reset_burst()
+
+    if len(pending_submit_pool) > 0:
+        st.submitted_hits += _flush_pending(force=True)
+
+    st.found = found_pool.rows_sorted(result_cap)
+    st.best = best_pool.rows_sorted(best_cap)
+
+    # Persist extra stats on the lane for diagnostics. The caller does not depend
+    # on these fields, but they are useful when reading the object from your own
+    # debugger or when you decide to surface them later.
+    st.ultra_burst_commits = int(burst_state.burst_commits)
+    st.ultra_sprint_extensions = int(burst_state.sprint_extensions)
+    st.ultra_secondary_best_rows = int(burst_state.secondary_best_rows)
+    st.ultra_extra_budget_total = int(burst_state.extra_budget_total)
+
+
+
+def _ultra_hash_job(
+    self,
+    *,
+    job: MoneroJob,
+    generation: int,
+    start_nonce: int,
+    count: Optional[int] = None,
+    max_results: Optional[int] = None,
+    stop_flag: Any = None,
+    poll_interval: Optional[int] = None,
+    stale_poll_interval: Optional[int] = None,
+    is_current: Optional[Callable[[], bool]] = None,
+    submit_candidate: Optional[Callable[[int, int, bytes], None]] = None,
+    worker_idx: Optional[int] = None,
+) -> Dict[str, Any]:
+    if self._stop.is_set() or self._closed.is_set():
+        return self._stopped_hash_result(worker_idx, errors=['stopped'])
+
+    if hasattr(self, '_refresh_job_from_network'):
+        try:
+            job = self._refresh_job_from_network(job)
+        except Exception:
+            pass
+
+    t0 = time.perf_counter()
+    batch_n = max(1, int(count if count is not None else self.batch_size))
+    result_cap = max(1, int(max_results if max_results is not None else self.keep_best))
+    best_cap = max(1, int(self.keep_best))
+    live_poll = max(1, int(self.poll_interval if poll_interval is None else poll_interval))
+    stale_poll = max(1, int(self.stale_poll_interval if stale_poll_interval is None else stale_poll_interval))
+
+    network_hint: Optional[Dict[str, Any]] = None
+    remote_snapshot: Optional[Dict[str, Any]] = None
+    if self.remote_connection is not None:
+        try:
+            network_hint = self.remote_connection.get_hint()
+            remote_snapshot = self.remote_connection.snapshot()
+            live_poll = min(live_poll, max(1, int(network_hint.get('suggested_live_poll', live_poll))))
+            stale_poll = min(stale_poll, max(1, int(network_hint.get('suggested_stale_poll', stale_poll))))
+            chunk_scale = float(network_hint.get('suggested_chunk_scale', 1.0))
+            chunk_scale = max(0.25, min(2.00, chunk_scale))
+            batch_n = max(1, int(round(float(batch_n) * chunk_scale)))
+        except Exception as e:
+            self.logger(f'[P2PoolHunter] remote hint warning: {e}')
+
+    lane_count = max(1, self._live_lane_count())
+    job_timing = self._note_job_dispatch(job, generation)
+    base_adjust = self._apply_job_urgency(
+        batch_n=batch_n,
+        live_poll=live_poll,
+        stale_poll=stale_poll,
+        urgency=float(job_timing.get('urgency', 0.0) or 0.0),
+        lane_count=lane_count,
+    )
+
+    pressure_model = _ultra_pressure_model(
+        self,
+        network_hint=network_hint,
+        remote_snapshot=remote_snapshot,
+        job_timing=job_timing,
+        live_poll=int(base_adjust['live_poll']),
+        stale_poll=int(base_adjust['stale_poll']),
+    )
+
+    if pressure_model.low_effort_mode:
+        batch_cap = max(batch_n, lane_count * 8192)
+        live_poll = max(int(base_adjust['live_poll']), int(pressure_model.live_poll))
+        stale_poll = max(int(base_adjust['stale_poll']), int(pressure_model.stale_poll))
+    else:
+        batch_cap = max(64, lane_count * 512)
+        live_poll = min(int(base_adjust['live_poll']), int(pressure_model.live_poll))
+        stale_poll = min(int(base_adjust['stale_poll']), int(pressure_model.stale_poll))
+
+    batch_n = max(1, min(int(batch_cap), int(round(float(base_adjust['batch_n']) * float(pressure_model.batch_scale)))))
+    hash_chunk_cap = max(1, int(max(int(base_adjust['hash_chunk_cap']), int(pressure_model.hash_chunk_cap)) if pressure_model.low_effort_mode else min(int(base_adjust['hash_chunk_cap']), int(pressure_model.hash_chunk_cap))))
+    submit_immediately = bool(base_adjust['submit_immediately'] or pressure_model.submit_immediately)
+    job_urgency = float(job_timing.get('urgency', 0.0) or 0.0)
+
+    target64 = int(job.target64) & 0xFFFFFFFFFFFFFFFF
+    if target64 <= 0:
+        raise RuntimeError('job target is empty or invalid')
+
+    near_cutoff = min(0xFFFFFFFFFFFFFFFF, max(target64 + 1, int(float(target64) * float(pressure_model.near_miss_ratio))))
+    near_cutoff_secondary = min(0xFFFFFFFFFFFFFFFF, max(near_cutoff, int(float(target64) * float(pressure_model.near_miss_ratio_secondary))))
+
+    job_key = self._stable_job_template_key(job)
+    session = self._job_sessions.get_or_create(job_key=job_key, start_nonce=int(start_nonce))
+    lease_start = session.lease(batch_n)
+
+    active: List[_WorkerLane] = []
+    normalized_worker_idx = self._normalize_worker_idx(worker_idx)
+
+    def _assign_lane(st: _WorkerLane, *, idx: int, take: int, stride: int, start_nonce_value: int) -> None:
+        st.assigned_job = job
+        st.assigned_job_key = job_key
+        st.assigned_generation = int(generation)
+        st.assigned_start_nonce = int(start_nonce_value) & 0xFFFFFFFF
+        st.assigned_count = int(take)
+        st.assigned_stride = max(1, int(stride))
+        st.assigned_result_cap = max(result_cap, 16) * max(1, int(pressure_model.result_keep_scale))
+        st.assigned_best_cap = max(best_cap, 16) * max(1, int(pressure_model.best_keep_scale))
+        st.assigned_near_cutoff = int(near_cutoff)
+        st.assigned_near_cutoff_secondary = int(near_cutoff_secondary)
+        st.assigned_poll_interval = int(live_poll)
+        st.assigned_stale_poll_interval = int(stale_poll)
+        st.assigned_is_current = is_current
+        st.assigned_stop_flag = stop_flag
+        st.assigned_submit_candidate = submit_candidate
+        st.assigned_job_urgency = job_urgency
+        st.assigned_submit_immediately = bool(submit_immediately)
+        st.assigned_hash_chunk_cap = int(hash_chunk_cap)
+        st.assigned_low_effort_mode = bool(pressure_model.low_effort_mode)
+        st.assigned_sprint_bias = float(pressure_model.sprint_bias)
+        st.assigned_harvest_floor = int(pressure_model.harvest_floor)
+        st.assigned_harvest_multiplier = int(pressure_model.harvest_multiplier)
+        st.assigned_batch_submit_target = int(pressure_model.batch_submit_target)
+        st.assigned_chain_gap_limit = int(pressure_model.chain_gap_limit)
+        st.assigned_burst_merge_limit = int(pressure_model.burst_merge_limit)
+        st.assigned_share_sprint_hashes = int(pressure_model.share_sprint_hashes)
+        st.assigned_unique_multiplier = float(pressure_model.unique_multiplier)
+        st.hashes_done = 0
+        st.stale_aborts = 0
+        st.chain_hits = 0
+        st.submitted_hits = 0
+        st.streak_groups = 0
+        st.max_streak_len = 0
+        st.found = []
+        st.best = []
+        st.error = None
+        st.done_event.clear()
+
+    if normalized_worker_idx is not None:
+        if normalized_worker_idx >= len(self._lane_call_locks):
+            return self._stopped_hash_result(worker_idx, errors=['worker lanes unavailable'])
+        lane_lock = self._lane_call_locks[normalized_worker_idx]
+        lane_lock.acquire()
+        try:
+            st = self._safe_lane_state(normalized_worker_idx)
+            if st is None:
+                return self._stopped_hash_result(worker_idx, errors=['worker lane missing'])
+            _assign_lane(st, idx=normalized_worker_idx, take=int(batch_n), stride=1, start_nonce_value=int(lease_start))
+            st.start_event.set()
+            self._wait_lane_done(st)
+
+            if self._stop.is_set() and not st.done_event.is_set():
+                errors = [f'worker[{st.worker_index}] stopped']
+                found_items = []
+                best_items = []
+                hashes_done = int(st.hashes_done)
+                stale_aborts = int(st.stale_aborts)
+                chain_hits = int(st.chain_hits)
+                submitted_hits = int(st.submitted_hits)
+                streak_groups = int(st.streak_groups)
+                max_streak_len = int(st.max_streak_len)
+            else:
+                hashes_done = int(st.hashes_done)
+                stale_aborts = int(st.stale_aborts)
+                chain_hits = int(st.chain_hits)
+                submitted_hits = int(st.submitted_hits)
+                streak_groups = int(st.streak_groups)
+                max_streak_len = int(st.max_streak_len)
+                errors = [f'worker[{st.worker_index}] {st.error}'] if st.error else []
+                found_items = list(st.found or [])
+                best_items = list(st.best or [])
+        finally:
+            lane_lock.release()
+    else:
+        with self._dispatch_lock:
+            available_lanes = self._live_lane_count()
+            if available_lanes <= 0:
+                return self._stopped_hash_result(worker_idx, errors=['no live worker lanes'])
+            splits = self._distribute_count(batch_n)[:available_lanes]
+            active_threads = len(splits)
+            used_lane_indices = [i for i, take in enumerate(splits) if take > 0 and i < available_lanes]
+
+            for idx in used_lane_indices:
+                self._lane_call_locks[idx].acquire()
+            try:
+                for i, take in enumerate(splits):
+                    if take <= 0:
+                        continue
+                    st = self._states[i]
+                    _assign_lane(
+                        st,
+                        idx=i,
+                        take=int(take),
+                        stride=max(1, active_threads),
+                        start_nonce_value=(int(lease_start) + i),
+                    )
+                    active.append(st)
+
+                for st in active:
+                    st.start_event.set()
+                for st in active:
+                    self._wait_lane_done(st)
+
+                hashes_done = 0
+                stale_aborts = 0
+                chain_hits = 0
+                submitted_hits = 0
+                streak_groups = 0
+                max_streak_len = 0
+                errors: List[str] = []
+                found_items: List[Tuple[int, int, bytes]] = []
+                best_items: List[Tuple[int, int, bytes]] = []
+
+                if self._stop.is_set():
+                    errors.append('stopped')
+
+                for st in active:
+                    hashes_done += int(st.hashes_done)
+                    stale_aborts += int(st.stale_aborts)
+                    chain_hits += int(st.chain_hits)
+                    submitted_hits += int(st.submitted_hits)
+                    streak_groups += int(st.streak_groups)
+                    max_streak_len = max(max_streak_len, int(st.max_streak_len))
+                    if st.found:
+                        found_items.extend(st.found)
+                    if st.best:
+                        best_items.extend(st.best)
+                    if st.error:
+                        errors.append(f'worker[{st.worker_index}] {st.error}')
+            finally:
+                for idx in reversed(used_lane_indices):
+                    self._lane_call_locks[idx].release()
+
+    found_pool = _UniqueNonceCandidatePool(limit=max(64, result_cap * 16 * max(1, int(pressure_model.result_keep_scale))))
+    best_pool = _UniqueNonceCandidatePool(limit=max(64, best_cap * 16 * max(1, int(pressure_model.best_keep_scale))))
+    found_pool.extend(found_items)
+    best_pool.extend(best_items)
+
+    dedup_found = found_pool.rows_sorted(result_cap)
+    dedup_best = best_pool.rows_sorted(best_cap)
+
+    submitted_found = [
+        row for row in dedup_found
+        if self._template_submit_guard.contains(job_key, int(row[0]) & 0xFFFFFFFF)
+    ]
+    if submit_candidate is not None:
+        dedup_found = [
+            row for row in dedup_found
+            if not self._template_submit_guard.contains(job_key, int(row[0]) & 0xFFFFFFFF)
+        ]
+
+    self._note_worker_perf(
+        worker_idx=worker_idx,
+        hashes_done=hashes_done,
+        hits_found=chain_hits,
+        stale_aborts=stale_aborts,
+        streak_groups=streak_groups,
+    )
+
+    if self.remote_connection is not None:
+        try:
+            network_hint = self.remote_connection.get_hint()
+            remote_snapshot = self.remote_connection.snapshot()
+        except Exception as e:
+            self.logger(f'[P2PoolHunter] remote snapshot refresh warning: {e}')
+
+    self._emit_consolidated_status(
+        worker_idx=worker_idx,
+        job=job,
+        hashes_done=hashes_done,
+        chain_hits=chain_hits,
+        stale_aborts=stale_aborts,
+        submitted_hits=submitted_hits,
+        remote_snapshot=remote_snapshot,
+        network_hint=network_hint,
+        force=bool(chain_hits > 0),
+    )
+
+    found_rows = [
+        {
+            'nonce_u32': int(nonce_u32),
+            'value64': int(value64),
+            'quality_ratio': self._quality_ratio(value64, target64),
+            'share_difficulty': self._share_difficulty_from_value(value64),
+            'hash_hex': bytes(result32).hex(),
+        }
+        for nonce_u32, value64, result32 in dedup_found
+    ]
+    best_rows = [
+        {
+            'nonce_u32': int(nonce_u32),
+            'value64': int(value64),
+            'quality_ratio': self._quality_ratio(value64, target64),
+            'share_difficulty': self._share_difficulty_from_value(value64),
+            'hash_hex': bytes(result32).hex(),
+        }
+        for nonce_u32, value64, result32 in dedup_best
+    ]
+
+    result = {
+        'job_id': job.job_id,
+        'generation': int(generation),
+        'hashes_done': int(hashes_done),
+        'found': found_rows,
+        'best': best_rows,
+        'stale_aborts': int(stale_aborts),
+        'chain_hits': int(chain_hits),
+        'submitted_hits': int(submitted_hits),
+        'submitted_found_count': int(len(submitted_found)),
+        'streak_groups': int(streak_groups),
+        'max_streak_len': int(max_streak_len),
+        'worker_idx': normalized_worker_idx,
+        'remote_hint': network_hint,
+        'job_timing': job_timing,
+        'ultra_pressure_model': {
+            'raw_pressure': float(pressure_model.raw_pressure),
+            'decode_confidence': float(pressure_model.decode_confidence),
+            'urgency': float(pressure_model.urgency),
+            'connected_peers': int(pressure_model.connected_peers),
+            'hot_peers': int(pressure_model.hot_peers),
+            'rx_pps': float(pressure_model.rx_pps),
+            'dll_ready': bool(pressure_model.dll_ready),
+            'real_data_fresh': bool(pressure_model.real_data_fresh),
+            'low_effort_mode': bool(pressure_model.low_effort_mode),
+            'sprint_bias': float(pressure_model.sprint_bias),
+            'batch_scale': float(pressure_model.batch_scale),
+            'near_miss_ratio': float(pressure_model.near_miss_ratio),
+            'near_miss_ratio_secondary': float(pressure_model.near_miss_ratio_secondary),
+            'hash_chunk_cap': int(pressure_model.hash_chunk_cap),
+            'submit_immediately': bool(pressure_model.submit_immediately),
+            'live_poll': int(pressure_model.live_poll),
+            'stale_poll': int(pressure_model.stale_poll),
+            'harvest_floor': int(pressure_model.harvest_floor),
+            'harvest_multiplier': int(pressure_model.harvest_multiplier),
+            'batch_submit_target': int(pressure_model.batch_submit_target),
+            'chain_gap_limit': int(pressure_model.chain_gap_limit),
+            'burst_merge_limit': int(pressure_model.burst_merge_limit),
+            'share_sprint_hashes': int(pressure_model.share_sprint_hashes),
+            'result_keep_scale': int(pressure_model.result_keep_scale),
+            'best_keep_scale': int(pressure_model.best_keep_scale),
+            'unique_multiplier': float(pressure_model.unique_multiplier),
+        },
+        'rx_pps': None if remote_snapshot is None else float(remote_snapshot.get('rx_pps', 0.0) or 0.0),
+        'socket_rx_pps': None if remote_snapshot is None else float(remote_snapshot.get('socket_rx_pps', 0.0) or 0.0),
+        'router_rx_pps': None if remote_snapshot is None else float(remote_snapshot.get('router_rx_pps', 0.0) or 0.0),
+        'raw_packet_rx_pps': None if remote_snapshot is None else float(remote_snapshot.get('raw_packet_rx_pps', 0.0) or 0.0),
+        'dll_rx_fps': None if remote_snapshot is None else float(remote_snapshot.get('dll_rx_fps', 0.0) or 0.0),
+        'dll_ready': None if remote_snapshot is None else bool(remote_snapshot.get('dll_ready')),
+        'sidechain_height': None if remote_snapshot is None else remote_snapshot.get('sidechain_height'),
+        'mainchain_height': None if remote_snapshot is None else remote_snapshot.get('mainchain_height'),
+        'difficulty': None if remote_snapshot is None else remote_snapshot.get('difficulty'),
+        'last_top_id_hex': None if remote_snapshot is None else remote_snapshot.get('last_top_id_hex'),
+        'last_top_version': None if remote_snapshot is None else remote_snapshot.get('last_top_version'),
+        'last_rpc_port_hint': None if remote_snapshot is None else remote_snapshot.get('last_rpc_port_hint'),
+        'peer_count_hint': None if remote_snapshot is None else remote_snapshot.get('peer_count_hint'),
+        'elapsed_sec': max(0.0, time.perf_counter() - t0),
+        'errors': errors,
+    }
+
+    if hasattr(self, '_note_found_candidates'):
+        try:
+            self._note_found_candidates(result, job, worker_idx)
+        except Exception:
+            pass
+
+    try:
+        rc = getattr(self, 'remote_connection', None)
+        if rc is not None:
+            result['observer_snapshot'] = rc.observer_snapshot()
+            result['hot_hash_job_snapshot'] = rc.get_hot_hash_job_snapshot()
+    except Exception:
+        pass
+
+    return result
+
+
+if not getattr(P2PoolShareHunterWorker, '_ultra_share_patch_applied', False):
+    P2PoolShareHunterWorker._ultra_share_patch_applied = True
+    P2PoolShareHunterWorker._ultra_pressure_model = _ultra_pressure_model
+    P2PoolShareHunterWorker._run_lane = _ultra_run_lane
+    P2PoolShareHunterWorker.hash_job = _ultra_hash_job
+
+# =============================================================================
+# END ULTRA SHARE FAST PATH REWRITE LAYER
+# =============================================================================
