@@ -19,6 +19,7 @@ hidden_imports = [
     'python_usage.py'
     'python_jit.py',
     'p2pool_share_hunter.py',
+    'monero_hot_hash.py'
 ]
 
 a = Analysis(
@@ -32,6 +33,7 @@ a = Analysis(
         ('PythonUsage.dll', '.'),
         ('PythonJIT.dll', '.'),
         ('RemoteConnection.dll', '.'),
+        ('MoneroHashLoop.dll', '.')
     ],
     datas=[
         ('virtualasic_monero_scan.cl', '.'),

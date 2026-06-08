@@ -848,25 +848,20 @@ class _Tail64Probe(_ClassEventLogMixin):
     """
     Hot-path-safe tail64 reader for RandomX output buffers.
 
-    Design goals:
-    - take tail64 extraction out of the callback body
-    - do not blow up logs
-    - avoid bytes(out_buf[24:32]) allocation in the hot loop
-    - keep logging limited to rare anomalies / rare summaries
-    - preserve a clean per-worker object model like the other helpers
-
-    Intended usage:
+    Keeps old public usage working:
         probe.begin(job_id=..., generation=..., target64=...)
-        read_tail64 = probe.read_tail64
-
-        for ...:
-            rx_hash_into(...)
-            tail64 = read_tail64(out_buf)
-            if tail64 < target64:
-                probe.note_hit(nonce_u32=nonce_u32, tail64=tail64)
-                ...
-
+        tail64 = probe.read_tail64(out_buf)
+        probe.note_hit(nonce_u32=nonce_u32, tail64=tail64)
         probe.finish(done_hashes=done)
+
+    New patch behavior:
+        - tracks best share per worker/generation
+        - tracks duplicate nonce/share candidates
+        - validates generation-scoped nonce windows
+        - preserves worker/lane metadata for callback-layer debugging
+        - can annotate native candidates with worker/generation/lane metadata
+        - provides round-robin candidate distribution helper
+        - lower tail64 is treated as better
     """
 
     __slots__ = (
@@ -883,6 +878,22 @@ class _Tail64Probe(_ClassEventLogMixin):
         "_best_logged_tail64",
         "_summary_enabled",
         "_active",
+        "_thread_id",
+        "_lane_id",
+        "_start_nonce",
+        "_stride",
+        "_count",
+        "_window_enabled",
+        "_window_checked",
+        "_window_bad",
+        "_duplicate_nonce_hits",
+        "_duplicate_candidate_hits",
+        "_seen_nonces",
+        "_seen_candidates",
+        "_thread_winners",
+        "_best_candidate",
+        "_last_round_robin",
+        "_last_snapshot",
     )
 
     _GLOBAL_EVT_MU = threading.RLock()
@@ -915,6 +926,34 @@ class _Tail64Probe(_ClassEventLogMixin):
         self._summary_enabled = False
         self._active = False
 
+        self._thread_id = -1 if self.worker_index is None else int(self.worker_index)
+        self._lane_id = -1
+        self._start_nonce = 0
+        self._stride = 1
+        self._count = 0
+        self._window_enabled = False
+        self._window_checked = 0
+        self._window_bad = 0
+
+        self._duplicate_nonce_hits = 0
+        self._duplicate_candidate_hits = 0
+        self._seen_nonces: set[int] = set()
+        self._seen_candidates: set[tuple[int, int]] = set()
+
+        # {(generation, worker_id): best_record}
+        self._thread_winners: dict[tuple[int, int], dict] = {}
+        self._best_candidate: Optional[dict] = None
+
+        self._last_round_robin: dict = {
+            "input": 0,
+            "output": 0,
+            "threads": 1,
+            "source_thread_counts": {},
+            "assigned_thread_counts": {},
+        }
+
+        self._last_snapshot: dict = {}
+
         self._evt_init(
             class_prefix="Tail64Probe",
             logger=logger,
@@ -923,6 +962,10 @@ class _Tail64Probe(_ClassEventLogMixin):
                 "best_hit": 30.0,
                 "summary": 60.0,
                 "clear": 120.0,
+                "window_bad": 60.0,
+                "duplicate": 90.0,
+                "thread_winner": 60.0,
+                "round_robin": 75.0,
             },
             phrases={
                 "bad_read": [
@@ -949,6 +992,30 @@ class _Tail64Probe(_ClassEventLogMixin):
                     "the active tail reader stood down",
                     "tail64 state went quiet again",
                 ],
+                "window_bad": [
+                    "a nonce landed outside its expected lane window",
+                    "the tail probe caught a lane-window mismatch",
+                    "nonce-window validation found an unexpected value",
+                    "a worker candidate did not match its generation window",
+                ],
+                "duplicate": [
+                    "a repeated nonce candidate was seen on this lane",
+                    "the tail probe noticed a duplicate candidate echo",
+                    "duplicate share metadata appeared in this worker slice",
+                    "a repeated candidate was safely counted and ignored",
+                ],
+                "thread_winner": [
+                    "a worker held onto its best generation candidate",
+                    "one worker's strongest share was tracked",
+                    "a per-thread winner was recorded",
+                    "the tail probe marked a worker's best nonce",
+                ],
+                "round_robin": [
+                    "tail candidates were interleaved across worker lanes",
+                    "candidate winners were distributed by source thread",
+                    "the tail probe balanced winners for parallel submission",
+                    "unique share candidates were spread across submit lanes",
+                ],
             },
         )
 
@@ -959,6 +1026,51 @@ class _Tail64Probe(_ClassEventLogMixin):
     @staticmethod
     def _u64(v: int) -> int:
         return int(v) & 0xFFFFFFFFFFFFFFFF
+
+    @staticmethod
+    def _share_diff_est(tail64: int) -> float:
+        tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
+        if tail64 <= 0:
+            return float("inf")
+        return float((1 << 64) / tail64)
+
+    @staticmethod
+    def _tail64_from_hash_hex(hash_hex: str) -> int:
+        try:
+            h = bytes.fromhex(str(hash_hex).strip())
+            if len(h) < 32:
+                return 0xFFFFFFFFFFFFFFFF
+            return int.from_bytes(h[24:32], "little", signed=False)
+        except Exception:
+            return 0xFFFFFFFFFFFFFFFF
+
+    @staticmethod
+    def _sort_key_candidate(c: dict) -> tuple[int, int]:
+        return (
+            int(c.get("tail64", c.get("_tail64", 0xFFFFFFFFFFFFFFFF))) & 0xFFFFFFFFFFFFFFFF,
+            int(c.get("nonce_u32", c.get("_nonce", 0))) & 0xFFFFFFFF,
+        )
+
+    @staticmethod
+    def _clean_candidate(c: dict) -> dict:
+        out = {
+            "nonce_u32": int(c["nonce_u32"]) & 0xFFFFFFFF,
+            "hash_hex": str(c.get("hash_hex", "")),
+            "tail64": int(c["tail64"]) & 0xFFFFFFFFFFFFFFFF,
+            "share_diff_est": float(
+                c.get(
+                    "share_diff_est",
+                    _Tail64Probe._share_diff_est(int(c["tail64"])),
+                )
+            ),
+        }
+
+        # If no hash exists, keep the old code from failing by returning only
+        # fields that actually exist.
+        if not out["hash_hex"]:
+            out.pop("hash_hex", None)
+
+        return out
 
     def _global_evt_emit(
         self,
@@ -980,11 +1092,12 @@ class _Tail64Probe(_ClassEventLogMixin):
             )
         )
 
-        suppressed = 0
         with self._GLOBAL_EVT_MU:
             next_at = float(self._GLOBAL_EVT_NEXT_AT.get(gate, 0.0))
             if not force and now < next_at:
-                self._GLOBAL_EVT_SUPPRESSED[gate] = int(self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)) + 1
+                self._GLOBAL_EVT_SUPPRESSED[gate] = int(
+                    self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)
+                ) + 1
                 return
 
             suppressed = int(self._GLOBAL_EVT_SUPPRESSED.pop(gate, 0))
@@ -992,6 +1105,7 @@ class _Tail64Probe(_ClassEventLogMixin):
 
         phrase = self._evt_pick(key, phrases)
         extra = f" suppressed={suppressed}" if suppressed > 0 else ""
+
         if details:
             self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}{extra}")
         else:
@@ -1004,7 +1118,22 @@ class _Tail64Probe(_ClassEventLogMixin):
         generation: int,
         target64: int,
         enable_summary_log: bool = False,
+        start_nonce: Optional[int] = None,
+        stride: Optional[int] = None,
+        count: Optional[int] = None,
+        lane_id: Optional[int] = None,
+        thread_id: Optional[int] = None,
     ) -> None:
+        """
+        Backwards-compatible begin().
+
+        New optional args allow generation-scoped nonce-window validation:
+            start_nonce = assigned_start_nonce for this worker
+            stride      = active thread count
+            count       = assigned hash attempts for this worker
+            lane_id     = residue lane id
+            thread_id   = worker index
+        """
         self._job_id = str(job_id)
         self._generation = int(generation)
         self._target64 = self._u64(target64)
@@ -1017,13 +1146,81 @@ class _Tail64Probe(_ClassEventLogMixin):
         self._summary_enabled = bool(enable_summary_log)
         self._active = True
 
+        self._thread_id = (
+            int(thread_id)
+            if thread_id is not None
+            else (-1 if self.worker_index is None else int(self.worker_index))
+        )
+        self._lane_id = int(lane_id) if lane_id is not None else self._lane_id
+
+        self._duplicate_nonce_hits = 0
+        self._duplicate_candidate_hits = 0
+        self._seen_nonces.clear()
+        self._seen_candidates.clear()
+        self._best_candidate = None
+
+        self._window_checked = 0
+        self._window_bad = 0
+
+        if start_nonce is not None and stride is not None and count is not None:
+            self.set_nonce_window(
+                start_nonce=start_nonce,
+                stride=stride,
+                count=count,
+                lane_id=lane_id,
+                thread_id=thread_id,
+            )
+        else:
+            self._window_enabled = False
+            self._start_nonce = 0
+            self._stride = 1
+            self._count = 0
+
+    def set_nonce_window(
+        self,
+        *,
+        start_nonce: int,
+        stride: int,
+        count: int,
+        lane_id: Optional[int] = None,
+        thread_id: Optional[int] = None,
+    ) -> None:
+        """
+        Configure this worker's expected nonce lane.
+
+        Expected sequence:
+            nonce = start_nonce + k * stride, for 0 <= k < count
+
+        uint32 wrap is handled by unsigned delta.
+        """
+        self._start_nonce = self._u32(start_nonce)
+        self._stride = max(1, int(stride))
+        self._count = max(0, int(count))
+        self._window_enabled = self._count > 0
+
+        if lane_id is not None:
+            self._lane_id = int(lane_id)
+
+        if thread_id is not None:
+            self._thread_id = int(thread_id)
+
+    def _nonce_in_window(self, nonce_u32: int) -> bool:
+        if not self._window_enabled:
+            return True
+
+        nonce_u32 = self._u32(nonce_u32)
+        delta = (nonce_u32 - self._start_nonce) & 0xFFFFFFFF
+
+        if delta % self._stride != 0:
+            return False
+
+        index = delta // self._stride
+        return 0 <= index < self._count
+
     @staticmethod
     def _read_tail64_fast(out_buf) -> int:
         """
         Read bytes 24..31 little-endian without allocating bytes(...).
-
-        Safe assumption here:
-        - out_buf is the 32-byte RandomX hash output buffer already used in the worker.
         """
         return (
             int(out_buf[24])
@@ -1063,14 +1260,156 @@ class _Tail64Probe(_ClassEventLogMixin):
 
         return int(tail64)
 
+    def _track_candidate_identity(self, *, nonce_u32: int, tail64: int) -> None:
+        nonce_u32 = self._u32(nonce_u32)
+        tail64 = self._u64(tail64)
+
+        if nonce_u32 in self._seen_nonces:
+            self._duplicate_nonce_hits += 1
+
+        self._seen_nonces.add(nonce_u32)
+
+        key = (nonce_u32, tail64)
+        if key in self._seen_candidates:
+            self._duplicate_candidate_hits += 1
+
+        self._seen_candidates.add(key)
+
+        if (
+            self._duplicate_nonce_hits in (1, 2, 4, 8)
+            or self._duplicate_candidate_hits in (1, 2, 4, 8)
+        ):
+            self._global_evt_emit(
+                "duplicate",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} dup_nonce={self._duplicate_nonce_hits} "
+                    f"dup_candidate={self._duplicate_candidate_hits}"
+                ),
+                global_scope="owner",
+            )
+
+        if len(self._seen_nonces) > 65536:
+            self._seen_nonces = set(list(self._seen_nonces)[-8192:])
+
+        if len(self._seen_candidates) > 65536:
+            self._seen_candidates = set(list(self._seen_candidates)[-8192:])
+
+    def _validate_hit_window(self, *, nonce_u32: int) -> None:
+        if not self._window_enabled:
+            return
+
+        self._window_checked += 1
+
+        if self._nonce_in_window(nonce_u32):
+            return
+
+        self._window_bad += 1
+
+        if self._window_bad in (1, 2, 4, 8):
+            end_hint = self._u32(self._start_nonce + max(0, self._count - 1) * self._stride)
+            self._global_evt_emit(
+                "window_bad",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} worker={self._thread_id} lane={self._lane_id} "
+                    f"start={self._start_nonce} stride={self._stride} count={self._count} "
+                    f"end_hint={end_hint} got={self._u32(nonce_u32)} "
+                    f"window_bad={self._window_bad}"
+                ),
+                global_scope="owner",
+            )
+
+    def _track_thread_winner(self, candidate: dict) -> None:
+        """
+        Track best candidate per generation/worker.
+
+        Lower tail64 is better.
+        """
+        try:
+            gen = int(candidate.get("_generation", self._generation) or self._generation)
+            worker_id = int(candidate.get("_found_by_thread", self._thread_id) or self._thread_id)
+            lane_id = int(candidate.get("_lane_id", self._lane_id) or self._lane_id)
+            tail64 = self._u64(candidate.get("tail64", candidate.get("_tail64", 0xFFFFFFFFFFFFFFFF)))
+            nonce_u32 = self._u32(candidate.get("nonce_u32", candidate.get("_nonce", 0)))
+
+            key = (gen, worker_id)
+            prior = self._thread_winners.get(key)
+
+            replace = False
+            if prior is None:
+                replace = True
+            else:
+                old_tail64 = self._u64(prior.get("tail64", 0xFFFFFFFFFFFFFFFF))
+                old_nonce = self._u32(prior.get("nonce", 0xFFFFFFFF))
+
+                if tail64 < old_tail64:
+                    replace = True
+                elif tail64 == old_tail64 and nonce_u32 < old_nonce:
+                    replace = True
+
+            if replace:
+                self._thread_winners[key] = {
+                    "candidate": dict(candidate),
+                    "tail64": tail64,
+                    "nonce": nonce_u32,
+                    "lane_id": lane_id,
+                    "worker_id": worker_id,
+                    "generation": gen,
+                }
+
+                if tail64 < self._best_tail64:
+                    self._best_tail64 = tail64
+                    self._best_nonce_u32 = nonce_u32
+
+                self._best_candidate = dict(candidate)
+
+                if len(self._thread_winners) in (1, 2, 4, 8, 16):
+                    self._global_evt_emit(
+                        "thread_winner",
+                        details=(
+                            f"owner={self.owner_key} job={self._job_id} "
+                            f"gen={gen} worker={worker_id} lane={lane_id} "
+                            f"nonce={nonce_u32} tail64={tail64}"
+                        ),
+                        global_scope="owner",
+                    )
+
+            if len(self._thread_winners) > 8192:
+                keys = sorted(self._thread_winners.keys(), key=lambda x: (x[0], x[1]))
+                keep_keys = keys[-4096:]
+                keep = {k: self._thread_winners[k] for k in keep_keys}
+                self._thread_winners.clear()
+                self._thread_winners.update(keep)
+
+        except Exception:
+            pass
+
     def note_hit(self, *, nonce_u32: int, tail64: int) -> None:
         """
-        Call only on actual hits, not on every hash.
+        Call only on actual hits, not every hash.
         This keeps logging off the normal hot path.
         """
         self._hits += 1
+
         nonce_u32 = self._u32(nonce_u32)
         tail64 = self._u64(tail64)
+
+        self._track_candidate_identity(nonce_u32=nonce_u32, tail64=tail64)
+        self._validate_hit_window(nonce_u32=nonce_u32)
+
+        candidate = {
+            "nonce_u32": nonce_u32,
+            "tail64": tail64,
+            "share_diff_est": self._share_diff_est(tail64),
+            "_found_by_thread": int(self._thread_id),
+            "_generation": int(self._generation),
+            "_lane_id": int(self._lane_id),
+            "_tail64": tail64,
+            "_nonce": nonce_u32,
+        }
+
+        self._track_thread_winner(candidate)
 
         if tail64 < self._best_tail64:
             self._best_tail64 = tail64
@@ -1081,30 +1420,239 @@ class _Tail64Probe(_ClassEventLogMixin):
         if not self._summary_enabled:
             return
 
-        # only log rare, real improvements
         if tail64 < self._best_logged_tail64:
             self._best_logged_tail64 = tail64
             self._global_evt_emit(
                 "best_hit",
                 details=(
                     f"owner={self.owner_key} job={self._job_id} "
-                    f"gen={self._generation} hits={self._hits} "
-                    f"best_nonce={nonce_u32} best_tail64={tail64}"
+                    f"gen={self._generation} worker={self._thread_id} lane={self._lane_id} "
+                    f"hits={self._hits} best_nonce={nonce_u32} best_tail64={tail64}"
                 ),
                 global_scope="owner",
             )
 
+    def note_candidate(
+        self,
+        candidate: dict,
+        *,
+        found_by_thread: Optional[int] = None,
+        lane_id: Optional[int] = None,
+        generation: Optional[int] = None,
+    ) -> Optional[dict]:
+        """
+        Track a full candidate dict returned by native hot loop.
+
+        Returns an annotated copy that can be passed into _CandidateBatch or
+        _CandidateSelector.
+
+        This is useful in JITWorker callback:
+
+            annotated = probe.note_candidate(c)
+            if annotated:
+                batch.merge_items([annotated])
+        """
+        try:
+            if candidate is None:
+                return None
+
+            c = dict(candidate)
+
+            nonce_u32 = self._u32(c.get("nonce_u32", c.get("_nonce", 0)))
+
+            tail64 = c.get("tail64", c.get("_tail64", None))
+            if tail64 is None:
+                tail64 = self._tail64_from_hash_hex(str(c.get("hash_hex", "")))
+            tail64 = self._u64(tail64)
+
+            gen = int(generation if generation is not None else c.get("_generation", self._generation))
+            worker_id = int(
+                found_by_thread
+                if found_by_thread is not None
+                else c.get("_found_by_thread", self._thread_id)
+            )
+            lane = int(lane_id if lane_id is not None else c.get("_lane_id", self._lane_id))
+
+            hash_hex = str(c.get("hash_hex", "") or "").strip().lower()
+
+            out = {
+                "nonce_u32": nonce_u32,
+                "tail64": tail64,
+                "share_diff_est": float(c.get("share_diff_est", self._share_diff_est(tail64))),
+                "_found_by_thread": worker_id,
+                "_generation": gen,
+                "_lane_id": lane,
+                "_tail64": tail64,
+                "_nonce": nonce_u32,
+            }
+
+            if hash_hex:
+                out["hash_hex"] = hash_hex
+
+            self._track_candidate_identity(nonce_u32=nonce_u32, tail64=tail64)
+            self._validate_hit_window(nonce_u32=nonce_u32)
+            self._track_thread_winner(out)
+
+            if tail64 < self._best_tail64:
+                self._best_tail64 = tail64
+                self._best_nonce_u32 = nonce_u32
+
+            return out
+
+        except Exception:
+            return None
+
+    def annotate_candidates(
+        self,
+        candidates: list[dict],
+        *,
+        found_by_thread: Optional[int] = None,
+        lane_id: Optional[int] = None,
+        generation: Optional[int] = None,
+    ) -> list[dict]:
+        out: list[dict] = []
+
+        for c in candidates or []:
+            annotated = self.note_candidate(
+                c,
+                found_by_thread=found_by_thread,
+                lane_id=lane_id,
+                generation=generation,
+            )
+            if annotated is not None:
+                out.append(annotated)
+
+        return out
+
+    @staticmethod
+    def round_robin_candidates(
+        candidates: list[dict],
+        *,
+        threads: int,
+        keep: Optional[int] = None,
+        strip_debug: bool = False,
+    ) -> list[dict]:
+        """
+        Distribute unique candidates across source threads.
+
+        Lower tail64 is better.
+
+        This helper is intentionally static so JITWorker can use it after
+        collecting all worker candidates.
+        """
+        threads = max(1, int(threads))
+        keep = max(1, int(keep if keep is not None else len(candidates or [])))
+
+        best_by_nonce: dict[int, dict] = {}
+
+        for raw in candidates or []:
+            try:
+                c = dict(raw)
+
+                nonce_u32 = int(c.get("nonce_u32", c.get("_nonce", 0))) & 0xFFFFFFFF
+                tail64 = int(c.get("tail64", c.get("_tail64", 0xFFFFFFFFFFFFFFFF))) & 0xFFFFFFFFFFFFFFFF
+
+                c["nonce_u32"] = nonce_u32
+                c["tail64"] = tail64
+                c.setdefault("share_diff_est", _Tail64Probe._share_diff_est(tail64))
+                c.setdefault("_nonce", nonce_u32)
+                c.setdefault("_tail64", tail64)
+
+                prior = best_by_nonce.get(nonce_u32)
+                if prior is None:
+                    best_by_nonce[nonce_u32] = c
+                    continue
+
+                prior_key = _Tail64Probe._sort_key_candidate(prior)
+                new_key = _Tail64Probe._sort_key_candidate(c)
+
+                if new_key < prior_key:
+                    best_by_nonce[nonce_u32] = c
+
+            except Exception:
+                continue
+
+        winners = list(best_by_nonce.values())
+        if not winners:
+            return []
+
+        queues: dict[int, list[dict]] = {}
+
+        for c in winners:
+            try:
+                source_thread = int(
+                    c.get(
+                        "_found_by_thread",
+                        c.get("_worker_index", c.get("_thread_id", c.get("_lane_id", 0))),
+                    )
+                ) % threads
+            except Exception:
+                source_thread = int(c.get("nonce_u32", 0)) % threads
+
+            queues.setdefault(source_thread, []).append(c)
+
+        for q in queues.values():
+            q.sort(key=_Tail64Probe._sort_key_candidate)
+
+        source_order = sorted(
+            queues.keys(),
+            key=lambda tid: (
+                _Tail64Probe._sort_key_candidate(queues[tid][0])
+                if queues.get(tid)
+                else (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF),
+                tid,
+            ),
+        )
+
+        out: list[dict] = []
+        made_progress = True
+        guard = 0
+
+        while made_progress and len(out) < keep:
+            made_progress = False
+
+            for source_thread in source_order:
+                q = queues.get(source_thread)
+                if not q:
+                    continue
+
+                c = q.pop(0)
+                c["_assigned_submit_thread"] = len(out) % threads
+                out.append(c)
+                made_progress = True
+
+                if len(out) >= keep:
+                    break
+
+            guard += 1
+            if guard > keep + threads + 4:
+                break
+
+        if strip_debug:
+            return [_Tail64Probe._clean_candidate(c) for c in out]
+
+        return out
+
     def finish(self, *, done_hashes: int) -> None:
         done_hashes = max(0, int(done_hashes))
 
-        if self._summary_enabled and (self._hits > 0 or self._bad_reads > 0):
+        if self._summary_enabled and (
+            self._hits > 0
+            or self._bad_reads > 0
+            or self._window_bad > 0
+            or self._duplicate_nonce_hits > 0
+        ):
             self._global_evt_emit(
                 "summary",
                 details=(
                     f"owner={self.owner_key} job={self._job_id} "
-                    f"gen={self._generation} reads={self._reads} "
-                    f"done={done_hashes} hits={self._hits} "
+                    f"gen={self._generation} worker={self._thread_id} lane={self._lane_id} "
+                    f"reads={self._reads} done={done_hashes} hits={self._hits} "
                     f"bad_reads={self._bad_reads} "
+                    f"dup_nonce={self._duplicate_nonce_hits} "
+                    f"dup_candidate={self._duplicate_candidate_hits} "
+                    f"window_checked={self._window_checked} "
+                    f"window_bad={self._window_bad} "
                     f"best_nonce={self._best_nonce_u32} "
                     f"best_tail64={self._best_tail64}"
                 ),
@@ -1112,14 +1660,23 @@ class _Tail64Probe(_ClassEventLogMixin):
             )
 
         self._active = False
+        self._last_snapshot = self.snapshot()
 
     def clear(self) -> None:
-        had_state = self._active or self._reads > 0 or self._hits > 0 or self._bad_reads > 0
+        had_state = (
+            self._active
+            or self._reads > 0
+            or self._hits > 0
+            or self._bad_reads > 0
+            or self._window_bad > 0
+            or self._duplicate_nonce_hits > 0
+        )
 
         old_job = self._job_id
         old_generation = self._generation
         old_reads = self._reads
         old_hits = self._hits
+        old_window_bad = self._window_bad
 
         self._job_id = ""
         self._generation = 0
@@ -1133,20 +1690,62 @@ class _Tail64Probe(_ClassEventLogMixin):
         self._summary_enabled = False
         self._active = False
 
-        if had_state and (old_hits > 0 or old_reads >= 1048576):
+        self._lane_id = -1
+        self._start_nonce = 0
+        self._stride = 1
+        self._count = 0
+        self._window_enabled = False
+        self._window_checked = 0
+        self._window_bad = 0
+
+        self._duplicate_nonce_hits = 0
+        self._duplicate_candidate_hits = 0
+        self._seen_nonces.clear()
+        self._seen_candidates.clear()
+        self._thread_winners.clear()
+        self._best_candidate = None
+
+        self._last_round_robin = {
+            "input": 0,
+            "output": 0,
+            "threads": 1,
+            "source_thread_counts": {},
+            "assigned_thread_counts": {},
+        }
+
+        if had_state and (old_hits > 0 or old_reads >= 1048576 or old_window_bad > 0):
             self._global_evt_emit(
                 "clear",
                 details=(
                     f"owner={self.owner_key} last_job={old_job} "
-                    f"last_gen={old_generation} reads={old_reads} hits={old_hits}"
+                    f"last_gen={old_generation} reads={old_reads} "
+                    f"hits={old_hits} window_bad={old_window_bad}"
                 ),
                 global_scope="owner",
             )
 
     def snapshot(self) -> dict:
+        winners: dict[str, dict] = {}
+
+        for key, value in list(self._thread_winners.items())[-32:]:
+            try:
+                gen, worker_id = key
+                winners[f"worker_{int(worker_id)}_gen_{int(gen)}"] = {
+                    "nonce": int(value.get("nonce", 0)) & 0xFFFFFFFF,
+                    "tail64": int(value.get("tail64", 0)) & 0xFFFFFFFFFFFFFFFF,
+                    "tail64_hex": f"0x{int(value.get('tail64', 0)) & 0xFFFFFFFFFFFFFFFF:016X}",
+                    "lane_id": int(value.get("lane_id", 0)),
+                    "worker_id": int(worker_id),
+                    "generation": int(gen),
+                }
+            except Exception:
+                pass
+
         return {
             "owner_key": self.owner_key,
             "worker_index": self.worker_index,
+            "thread_id": self._thread_id,
+            "lane_id": self._lane_id,
             "job_id": self._job_id,
             "generation": self._generation,
             "target64": self._target64,
@@ -1154,8 +1753,26 @@ class _Tail64Probe(_ClassEventLogMixin):
             "hits": self._hits,
             "bad_reads": self._bad_reads,
             "best_tail64": self._best_tail64,
+            "best_tail64_hex": f"0x{int(self._best_tail64) & 0xFFFFFFFFFFFFFFFF:016X}",
             "best_nonce_u32": self._best_nonce_u32,
             "active": self._active,
+            "nonce_window": {
+                "enabled": bool(self._window_enabled),
+                "start_nonce": int(self._start_nonce),
+                "stride": int(self._stride),
+                "count": int(self._count),
+                "checked": int(self._window_checked),
+                "bad": int(self._window_bad),
+            },
+            "duplicates": {
+                "nonce_hits": int(self._duplicate_nonce_hits),
+                "candidate_hits": int(self._duplicate_candidate_hits),
+                "seen_nonces": int(len(self._seen_nonces)),
+                "seen_candidates": int(len(self._seen_candidates)),
+            },
+            "thread_winners_tracked": int(len(self._thread_winners)),
+            "thread_winners": winners,
+            "last_round_robin": dict(self._last_round_robin),
         }
 
 class _NonceStrideWriter(_ClassEventLogMixin):
@@ -1807,17 +2424,13 @@ class _CandidateBatch(_ClassEventLogMixin):
     - merge_exported(...)
     - export(...)
 
-    Logging policy:
-    - no logging on every hit
-    - no logging on every merge item
-    - logs only on meaningful transitions:
-        * batch_open
-        * burst
-        * replace
-        * merge
-        * trim
-        * flush
-    - global owner/event throttle prevents flood across recreated batches
+    New patch behavior:
+    - keeps best candidate per nonce
+    - preserves worker/thread/lane metadata internally
+    - tracks per-thread winners per generation
+    - exports unique nonce winners in round-robin worker order
+    - keeps debug snapshot data for nonce/share validation
+    - does not mutate blob, seed, RandomX state, or candidate hashes
     """
 
     __slots__ = (
@@ -1838,6 +2451,14 @@ class _CandidateBatch(_ClassEventLogMixin):
         "_cached_out",
         "_opened_logged",
         "_last_export_sig",
+        "_owner_thread_id",
+        "_thread_winners",
+        "_source_thread_counts",
+        "_assigned_thread_counts",
+        "_duplicate_candidate_count",
+        "_duplicate_tail64_count",
+        "_last_threads_inferred",
+        "_last_snapshot",
     )
 
     _GLOBAL_EVT_MU = threading.RLock()
@@ -1858,8 +2479,20 @@ class _CandidateBatch(_ClassEventLogMixin):
         self._generation: int = 0
         self._requested_keep: int = self.max_keep_default
 
-        # nonce_u32 -> (tail64, hash_hex)
-        self._best_by_nonce: dict[int, tuple[int, str]] = {}
+        # nonce_u32 -> normalized candidate dict.
+        #
+        # Candidate dict keeps:
+        #   nonce_u32
+        #   hash_hex
+        #   tail64
+        #   share_diff_est
+        #
+        # Plus optional debug metadata:
+        #   _found_by_thread
+        #   _generation
+        #   _lane_id
+        #   _assigned_submit_thread
+        self._best_by_nonce: dict[int, dict] = {}
 
         self._incoming = 0
         self._accepted = 0
@@ -1875,6 +2508,36 @@ class _CandidateBatch(_ClassEventLogMixin):
         self._opened_logged = False
         self._last_export_sig: Optional[tuple] = None
 
+        self._owner_thread_id = self._parse_owner_thread_id(self.owner_key)
+
+        # {(generation, worker_id): best_candidate_record}
+        self._thread_winners: dict[tuple[int, int], dict] = {}
+
+        self._source_thread_counts: dict[int, int] = {}
+        self._assigned_thread_counts: dict[int, int] = {}
+        self._duplicate_candidate_count = 0
+        self._duplicate_tail64_count = 0
+        self._last_threads_inferred = 1
+        self._last_snapshot: dict = {
+            "owner": self.owner_key,
+            "job_id": "",
+            "generation": 0,
+            "incoming": 0,
+            "accepted": 0,
+            "rejected_same_or_worse": 0,
+            "replaced": 0,
+            "bad": 0,
+            "merge_calls": 0,
+            "unique_nonce_winners": 0,
+            "exported": 0,
+            "threads_inferred": 1,
+            "source_thread_counts": {},
+            "assigned_thread_counts": {},
+            "duplicate_candidate_count": 0,
+            "duplicate_tail64_count": 0,
+            "thread_winners_tracked": 0,
+        }
+
         self._evt_init(
             class_prefix="CandidateBatch",
             logger=logger,
@@ -1883,6 +2546,8 @@ class _CandidateBatch(_ClassEventLogMixin):
                 "burst": 60.0,
                 "replace": 75.0,
                 "merge": 60.0,
+                "round_robin": 75.0,
+                "thread_winner": 75.0,
                 "trim": 75.0,
                 "flush": 60.0,
                 "bad": 90.0,
@@ -1912,6 +2577,18 @@ class _CandidateBatch(_ClassEventLogMixin):
                     "candidate lanes merged into one stronger view",
                     "multiple hit streams were gathered into one batch",
                 ],
+                "round_robin": [
+                    "unique nonce winners were spread across worker lanes",
+                    "candidate winners were balanced by source thread",
+                    "the batch interleaved workers before export",
+                    "ranked candidates were distributed across active lanes",
+                ],
+                "thread_winner": [
+                    "a worker held onto its best generation candidate",
+                    "one worker's strongest share was tracked",
+                    "a per-thread winner was recorded",
+                    "the batch marked a worker's best nonce",
+                ],
                 "trim": [
                     "the batch trimmed itself to the sharpest edges",
                     "weaker candidates were left behind at the boundary",
@@ -1934,6 +2611,28 @@ class _CandidateBatch(_ClassEventLogMixin):
         )
 
     @staticmethod
+    def _parse_owner_thread_id(owner_key: str) -> int:
+        """
+        Extract worker id from names like:
+            worker-batch-0
+            worker-batch-7
+            JITWorker-3
+
+        Returns -1 when not found.
+        """
+        try:
+            text = str(owner_key or "").strip()
+            parts = text.replace("_", "-").split("-")
+
+            for part in reversed(parts):
+                if part.isdigit():
+                    return int(part)
+
+            return -1
+        except Exception:
+            return -1
+
+    @staticmethod
     def _share_diff_est(tail64: int) -> float:
         if tail64 <= 0:
             return float("inf")
@@ -1951,12 +2650,60 @@ class _CandidateBatch(_ClassEventLogMixin):
 
     @staticmethod
     def _heap_key(nonce_u32: int, tail64: int) -> tuple[int, int]:
+        """
+        Heap stores the current worst kept entry at index 0.
+        More positive is better for replacement testing.
+        """
         return (-int(tail64), -int(nonce_u32))
 
     @staticmethod
-    def _sort_key(item: tuple[int, tuple[int, str]]) -> tuple[int, int]:
-        nonce_u32, (tail64, _hash_hex) = item
-        return int(tail64), int(nonce_u32)
+    def _sort_key_dict(c: dict) -> tuple[int, int]:
+        return int(c["tail64"]), int(c["nonce_u32"])
+
+    @staticmethod
+    def _is_better(a: dict, b: dict) -> bool:
+        """
+        Lower tail64 is better.
+        Lower nonce is stable tie-break.
+        """
+        at = int(a["tail64"])
+        bt = int(b["tail64"])
+        if at != bt:
+            return at < bt
+        return int(a["nonce_u32"]) < int(b["nonce_u32"])
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _read_env_threads(default: int = 1) -> int:
+        try:
+            import os
+
+            for name in (
+                "JITWORKER_SELECTOR_THREADS",
+                "MONERO_SELECTOR_THREADS",
+                "JITWORKER_THREADS",
+                "MONERO_THREADS",
+            ):
+                raw = os.getenv(name)
+                if raw is None:
+                    continue
+
+                try:
+                    value = int(str(raw).strip())
+                    if value > 0:
+                        return value
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return max(1, int(default))
 
     def _mark_dirty(self) -> None:
         self._dirty = True
@@ -1984,11 +2731,12 @@ class _CandidateBatch(_ClassEventLogMixin):
             )
         )
 
-        suppressed = 0
         with self._GLOBAL_EVT_MU:
             next_at = float(self._GLOBAL_EVT_NEXT_AT.get(gate, 0.0))
             if not force and now < next_at:
-                self._GLOBAL_EVT_SUPPRESSED[gate] = int(self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)) + 1
+                self._GLOBAL_EVT_SUPPRESSED[gate] = int(
+                    self._GLOBAL_EVT_SUPPRESSED.get(gate, 0)
+                ) + 1
                 return
 
             suppressed = int(self._GLOBAL_EVT_SUPPRESSED.pop(gate, 0))
@@ -1996,10 +2744,409 @@ class _CandidateBatch(_ClassEventLogMixin):
 
         phrase = self._evt_pick(key, phrases)
         extra = f" suppressed={suppressed}" if suppressed > 0 else ""
+
         if details:
             self._evt_write(f"[{self._evt_prefix}] {phrase} | {details}{extra}")
         else:
             self._evt_write(f"[{self._evt_prefix}] {phrase}{extra}")
+
+    def _normalize_candidate(self, raw: dict) -> Optional[dict]:
+        """
+        Normalize one candidate and preserve worker/lane/generation metadata.
+        """
+        try:
+            if raw is None:
+                return None
+
+            nonce_u32 = int(raw.get("nonce_u32", 0)) & 0xFFFFFFFF
+
+            hash_hex = str(raw.get("hash_hex", "") or "").strip().lower()
+            if not hash_hex:
+                return None
+
+            tail64 = raw.get("tail64", None)
+            if tail64 is None:
+                tail64 = raw.get("_tail64", None)
+            if tail64 is None:
+                tail64 = self._tail64_from_hash_hex(hash_hex)
+            tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
+
+            share_diff_est = raw.get("share_diff_est", None)
+            if share_diff_est is None:
+                share_diff_est = self._share_diff_est(tail64)
+            share_diff_est = float(share_diff_est)
+
+            out = {
+                "nonce_u32": nonce_u32,
+                "hash_hex": hash_hex,
+                "tail64": tail64,
+                "share_diff_est": share_diff_est,
+            }
+
+            # Preserve metadata for thread-aware export.
+            for key in (
+                "_found_by_thread",
+                "_worker_index",
+                "_thread_id",
+                "_generation",
+                "_lane_id",
+                "_assigned_submit_thread",
+                "_tail64",
+                "_nonce",
+                "worker_index",
+                "thread_id",
+                "lane_id",
+                "generation",
+            ):
+                if key in raw:
+                    out[key] = raw.get(key)
+
+            # Fill metadata defaults.
+            if "_generation" not in out:
+                out["_generation"] = int(self._generation)
+
+            if "_found_by_thread" not in out:
+                if self._owner_thread_id >= 0:
+                    out["_found_by_thread"] = int(self._owner_thread_id)
+                elif "worker_index" in out:
+                    out["_found_by_thread"] = self._safe_int(out.get("worker_index"), 0)
+                elif "thread_id" in out:
+                    out["_found_by_thread"] = self._safe_int(out.get("thread_id"), 0)
+
+            if "_lane_id" not in out:
+                if "lane_id" in out:
+                    out["_lane_id"] = self._safe_int(out.get("lane_id"), 0)
+                elif "_found_by_thread" in out:
+                    out["_lane_id"] = self._safe_int(out.get("_found_by_thread"), 0)
+
+            out["_tail64"] = tail64
+            out["_nonce"] = nonce_u32
+
+            return out
+        except Exception:
+            return None
+
+    def _candidate_source_thread(self, cand: dict, threads: int) -> int:
+        threads = max(1, int(threads))
+
+        for key in (
+            "_found_by_thread",
+            "_worker_index",
+            "_thread_id",
+            "worker_index",
+            "thread_id",
+            "_lane_id",
+            "lane_id",
+        ):
+            if key not in cand:
+                continue
+
+            try:
+                value = int(cand.get(key))
+                if value >= 0:
+                    return value % threads
+            except Exception:
+                continue
+
+        if self._owner_thread_id >= 0:
+            return int(self._owner_thread_id) % threads
+
+        try:
+            return int(cand["nonce_u32"]) % threads
+        except Exception:
+            return 0
+
+    def _infer_thread_count(self, winners: list[dict]) -> int:
+        max_seen = -1
+
+        for cand in winners or []:
+            for key in (
+                "_found_by_thread",
+                "_worker_index",
+                "_thread_id",
+                "worker_index",
+                "thread_id",
+                "_lane_id",
+                "lane_id",
+            ):
+                if key not in cand:
+                    continue
+
+                try:
+                    value = int(cand.get(key))
+                    if value >= 0:
+                        max_seen = max(max_seen, value)
+                except Exception:
+                    pass
+
+        if max_seen >= 0:
+            return max(1, max_seen + 1)
+
+        env_threads = self._read_env_threads(default=1)
+        return max(1, int(env_threads))
+
+    def _track_thread_winner(self, cand: dict) -> None:
+        """
+        Keep the best candidate per generation/worker.
+        """
+        try:
+            gen = int(cand.get("_generation", self._generation) or self._generation)
+            worker_id = self._candidate_source_thread(cand, self._last_threads_inferred)
+
+            key = (gen, worker_id)
+            prior = self._thread_winners.get(key)
+
+            if prior is None or self._is_better(cand, prior["candidate"]):
+                self._thread_winners[key] = {
+                    "candidate": dict(cand),
+                    "tail64": int(cand["tail64"]) & 0xFFFFFFFFFFFFFFFF,
+                    "nonce": int(cand["nonce_u32"]) & 0xFFFFFFFF,
+                    "lane_id": int(cand.get("_lane_id", worker_id) or 0),
+                    "worker_id": int(worker_id),
+                    "generation": int(gen),
+                }
+
+                if len(self._thread_winners) in (1, 2, 4, 8, 16):
+                    self._global_evt_emit(
+                        "thread_winner",
+                        details=(
+                            f"owner={self.owner_key} job={self._job_id} "
+                            f"gen={gen} worker={worker_id} "
+                            f"nonce={int(cand['nonce_u32'])} "
+                            f"tail64={int(cand['tail64'])}"
+                        ),
+                    )
+
+            # Bound memory to recent generations.
+            if len(self._thread_winners) > 8192:
+                keys = sorted(self._thread_winners.keys(), key=lambda x: (x[0], x[1]))
+                keep_keys = keys[-4096:]
+                keep = {k: self._thread_winners[k] for k in keep_keys}
+                self._thread_winners.clear()
+                self._thread_winners.update(keep)
+
+        except Exception:
+            pass
+
+    def _insert_candidate(self, cand: dict) -> bool:
+        """
+        Insert candidate into best-by-nonce table.
+
+        Returns True if accepted/replaced.
+        """
+        nonce_u32 = int(cand["nonce_u32"]) & 0xFFFFFFFF
+
+        prior = self._best_by_nonce.get(nonce_u32)
+        if prior is None:
+            self._best_by_nonce[nonce_u32] = cand
+            self._accepted += 1
+            self._mark_dirty()
+
+            kept = len(self._best_by_nonce)
+            if kept in (2, 4, 8, 16, 32, 64):
+                self._global_evt_emit(
+                    "burst",
+                    details=(
+                        f"owner={self.owner_key} job={self._job_id} "
+                        f"gen={self._generation} unique_nonce_winners={kept}"
+                    ),
+                )
+
+            self._track_thread_winner(cand)
+            return True
+
+        if self._is_better(cand, prior):
+            self._best_by_nonce[nonce_u32] = cand
+            self._replaced += 1
+            self._mark_dirty()
+
+            if self._replaced in (1, 3, 8):
+                self._global_evt_emit(
+                    "replace",
+                    details=(
+                        f"owner={self.owner_key} job={self._job_id} "
+                        f"gen={self._generation} replaced={self._replaced}"
+                    ),
+                )
+
+            self._track_thread_winner(cand)
+            return True
+
+        self._rejected_same_or_worse += 1
+        self._track_thread_winner(cand)
+        return False
+
+    def _bounded_best(self, winners: list[dict], keep: int) -> list[dict]:
+        keep = max(1, int(keep))
+
+        if len(winners) <= keep:
+            out = list(winners)
+            out.sort(key=self._sort_key_dict)
+            return out
+
+        heap: list[tuple[tuple[int, int], dict]] = []
+        push = heapq.heappush
+        replace = heapq.heapreplace
+
+        for cand in winners:
+            nonce_u32 = int(cand["nonce_u32"])
+            tail64 = int(cand["tail64"])
+
+            entry = (self._heap_key(nonce_u32, tail64), cand)
+
+            if len(heap) < keep:
+                push(heap, entry)
+            elif entry[0] > heap[0][0]:
+                replace(heap, entry)
+
+        out = [cand for _, cand in heap]
+        out.sort(key=self._sort_key_dict)
+        return out
+
+    def _round_robin_winners(
+        self,
+        winners: list[dict],
+        *,
+        keep: int,
+        threads: int,
+    ) -> list[dict]:
+        """
+        Export unique nonce winners in source-thread round-robin order.
+
+        Lower tail64 is better.
+        """
+        keep = max(1, int(keep))
+        threads = max(1, int(threads))
+
+        self._source_thread_counts = {}
+        self._assigned_thread_counts = {}
+        self._duplicate_candidate_count = 0
+        self._duplicate_tail64_count = 0
+
+        if not winners:
+            return []
+
+        queues: dict[int, list[dict]] = {}
+        seen_identity: set[tuple[int, str]] = set()
+        seen_tail64: set[tuple[int, int]] = set()
+
+        for cand in winners:
+            try:
+                nonce_u32 = int(cand["nonce_u32"]) & 0xFFFFFFFF
+                hash_hex = str(cand["hash_hex"])
+                tail64 = int(cand["tail64"]) & 0xFFFFFFFFFFFFFFFF
+                gen = int(cand.get("_generation", self._generation) or self._generation)
+            except Exception:
+                self._bad += 1
+                continue
+
+            identity = (nonce_u32, hash_hex)
+            if identity in seen_identity:
+                self._duplicate_candidate_count += 1
+                continue
+            seen_identity.add(identity)
+
+            tail_key = (gen, tail64)
+            if tail_key in seen_tail64:
+                self._duplicate_tail64_count += 1
+            else:
+                seen_tail64.add(tail_key)
+
+            source_thread = self._candidate_source_thread(cand, threads)
+            queues.setdefault(source_thread, []).append(cand)
+            self._source_thread_counts[source_thread] = (
+                self._source_thread_counts.get(source_thread, 0) + 1
+            )
+
+        for q in queues.values():
+            q.sort(key=self._sort_key_dict)
+
+        source_order = sorted(
+            queues.keys(),
+            key=lambda tid: (
+                self._sort_key_dict(queues[tid][0])
+                if queues.get(tid)
+                else (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF),
+                tid,
+            ),
+        )
+
+        out: list[dict] = []
+        made_progress = True
+        guard = 0
+
+        while made_progress and len(out) < keep:
+            made_progress = False
+
+            for source_thread in source_order:
+                q = queues.get(source_thread)
+                if not q:
+                    continue
+
+                cand = q.pop(0)
+                assigned_thread = len(out) % threads
+                cand["_assigned_submit_thread"] = assigned_thread
+
+                out.append(cand)
+                self._assigned_thread_counts[assigned_thread] = (
+                    self._assigned_thread_counts.get(assigned_thread, 0) + 1
+                )
+
+                made_progress = True
+
+                if len(out) >= keep:
+                    break
+
+            guard += 1
+            if guard > keep + threads + 4:
+                break
+
+        return out
+
+    def _update_snapshot(self, exported: list[dict], threads: int) -> None:
+        self._last_snapshot = {
+            "owner": self.owner_key,
+            "job_id": self._job_id,
+            "generation": int(self._generation),
+            "incoming": int(self._incoming),
+            "accepted": int(self._accepted),
+            "rejected_same_or_worse": int(self._rejected_same_or_worse),
+            "replaced": int(self._replaced),
+            "bad": int(self._bad),
+            "merge_calls": int(self._merge_calls),
+            "unique_nonce_winners": int(len(self._best_by_nonce)),
+            "exported": int(len(exported or [])),
+            "threads_inferred": int(threads),
+            "source_thread_counts": {
+                int(k): int(v) for k, v in self._source_thread_counts.items()
+            },
+            "assigned_thread_counts": {
+                int(k): int(v) for k, v in self._assigned_thread_counts.items()
+            },
+            "duplicate_candidate_count": int(self._duplicate_candidate_count),
+            "duplicate_tail64_count": int(self._duplicate_tail64_count),
+            "thread_winners_tracked": int(len(self._thread_winners)),
+        }
+
+        for key, winner in list(self._thread_winners.items())[-32:]:
+            try:
+                gen, worker_id = key
+                self._last_snapshot[f"worker_{int(worker_id)}_best_gen_{int(gen)}"] = {
+                    "nonce": int(winner.get("nonce", 0)) & 0xFFFFFFFF,
+                    "tail64": int(winner.get("tail64", 0)) & 0xFFFFFFFFFFFFFFFF,
+                    "tail64_hex": f"0x{int(winner.get('tail64', 0)) & 0xFFFFFFFFFFFFFFFF:016X}",
+                    "lane_id": int(winner.get("lane_id", 0)),
+                    "generation": int(gen),
+                    "worker_id": int(worker_id),
+                }
+            except Exception:
+                pass
+
+    def snapshot(self) -> dict:
+        """
+        Optional diagnostics. Does not affect the public API.
+        """
+        return dict(self._last_snapshot)
 
     def reset(
         self,
@@ -2027,6 +3174,33 @@ class _CandidateBatch(_ClassEventLogMixin):
         self._opened_logged = False
         self._last_export_sig = None
 
+        self._thread_winners.clear()
+        self._source_thread_counts = {}
+        self._assigned_thread_counts = {}
+        self._duplicate_candidate_count = 0
+        self._duplicate_tail64_count = 0
+        self._last_threads_inferred = 1
+
+        self._last_snapshot = {
+            "owner": self.owner_key,
+            "job_id": self._job_id,
+            "generation": int(self._generation),
+            "incoming": 0,
+            "accepted": 0,
+            "rejected_same_or_worse": 0,
+            "replaced": 0,
+            "bad": 0,
+            "merge_calls": 0,
+            "unique_nonce_winners": 0,
+            "exported": 0,
+            "threads_inferred": 1,
+            "source_thread_counts": {},
+            "assigned_thread_counts": {},
+            "duplicate_candidate_count": 0,
+            "duplicate_tail64_count": 0,
+            "thread_winners_tracked": 0,
+        }
+
     def offer(
         self,
         *,
@@ -2034,15 +3208,19 @@ class _CandidateBatch(_ClassEventLogMixin):
         hash_hex: str,
         tail64: int,
     ) -> bool:
-        try:
-            nonce_u32 = int(nonce_u32) & 0xFFFFFFFF
-            tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
-            hash_hex = str(hash_hex).strip().lower()
-        except Exception:
-            self._bad += 1
-            return False
+        raw = {
+            "nonce_u32": nonce_u32,
+            "hash_hex": hash_hex,
+            "tail64": tail64,
+            "_generation": int(self._generation),
+        }
 
-        if not hash_hex:
+        if self._owner_thread_id >= 0:
+            raw["_found_by_thread"] = int(self._owner_thread_id)
+            raw["_lane_id"] = int(self._owner_thread_id)
+
+        cand = self._normalize_candidate(raw)
+        if cand is None:
             self._bad += 1
             return False
 
@@ -2058,42 +3236,7 @@ class _CandidateBatch(_ClassEventLogMixin):
                 ),
             )
 
-        prior = self._best_by_nonce.get(nonce_u32)
-        if prior is None:
-            self._best_by_nonce[nonce_u32] = (tail64, hash_hex)
-            self._accepted += 1
-            self._mark_dirty()
-
-            kept = len(self._best_by_nonce)
-            # only milestone logs, not every new winner
-            if kept in (2, 4, 8, 16, 32, 64):
-                self._global_evt_emit(
-                    "burst",
-                    details=(
-                        f"owner={self.owner_key} job={self._job_id} "
-                        f"gen={self._generation} unique_nonce_winners={kept}"
-                    ),
-                )
-            return True
-
-        prior_tail64 = int(prior[0])
-        if tail64 < prior_tail64:
-            self._best_by_nonce[nonce_u32] = (tail64, hash_hex)
-            self._replaced += 1
-            self._mark_dirty()
-
-            if self._replaced in (1, 3, 8):
-                self._global_evt_emit(
-                    "replace",
-                    details=(
-                        f"owner={self.owner_key} job={self._job_id} "
-                        f"gen={self._generation} replaced={self._replaced}"
-                    ),
-                )
-            return True
-
-        self._rejected_same_or_worse += 1
-        return False
+        return self._insert_candidate(cand)
 
     def offer_hit(
         self,
@@ -2113,34 +3256,18 @@ class _CandidateBatch(_ClassEventLogMixin):
             return
 
         self._merge_calls += 1
-        best_by_nonce = self._best_by_nonce
         changed = False
 
         for item in items:
-            try:
-                nonce_u32 = int(item["nonce_u32"]) & 0xFFFFFFFF
-                tail64 = int(item["tail64"]) & 0xFFFFFFFFFFFFFFFF
-                hash_hex = str(item["hash_hex"]).strip().lower()
-            except Exception:
+            cand = self._normalize_candidate(item)
+            if cand is None:
                 self._bad += 1
                 continue
 
             self._incoming += 1
 
-            prior = best_by_nonce.get(nonce_u32)
-            if prior is None:
-                best_by_nonce[nonce_u32] = (tail64, hash_hex)
-                self._accepted += 1
+            if self._insert_candidate(cand):
                 changed = True
-                continue
-
-            prior_tail64 = int(prior[0])
-            if tail64 < prior_tail64:
-                best_by_nonce[nonce_u32] = (tail64, hash_hex)
-                self._replaced += 1
-                changed = True
-            else:
-                self._rejected_same_or_worse += 1
 
         if changed:
             self._mark_dirty()
@@ -2164,54 +3291,70 @@ class _CandidateBatch(_ClassEventLogMixin):
         if not self._dirty and self._cached_keep == keep:
             return self._cached_out
 
-        winners = self._best_by_nonce
+        winners = list(self._best_by_nonce.values())
+
         if not winners:
             self._cached_keep = keep
             self._cached_out = []
             self._dirty = False
+            self._update_snapshot([], 1)
             return self._cached_out
 
-        trimmed = max(0, len(winners) - keep)
+        threads = self._infer_thread_count(winners)
+        self._last_threads_inferred = int(threads)
 
-        if len(winners) <= keep:
-            ordered = sorted(winners.items(), key=self._sort_key)
-            out = [
-                {
-                    "nonce_u32": int(nonce_u32),
-                    "hash_hex": hash_hex,
-                    "tail64": int(tail64),
-                    "share_diff_est": self._share_diff_est(int(tail64)),
-                }
-                for nonce_u32, (tail64, hash_hex) in ordered
-            ]
+        # Keep a wider pool briefly so round-robin has enough candidates to
+        # spread by worker/lane, then trim to requested keep.
+        pre_keep = max(keep, min(len(winners), keep * max(1, min(threads, 16))))
+        best_pre = self._bounded_best(winners, pre_keep)
+
+        if threads > 1 and len(best_pre) > 1:
+            out = self._round_robin_winners(
+                best_pre,
+                keep=keep,
+                threads=threads,
+            )
+
+            self._global_evt_emit(
+                "round_robin",
+                details=(
+                    f"owner={self.owner_key} job={self._job_id} "
+                    f"gen={self._generation} threads={threads} "
+                    f"exported={len(out)} source_threads={self._source_thread_counts} "
+                    f"assigned_threads={self._assigned_thread_counts}"
+                ),
+            )
         else:
-            heap: list[tuple[tuple[int, int], tuple[int, int, str]]] = []
-            push = heapq.heappush
-            replace = heapq.heapreplace
+            out = self._bounded_best(winners, keep)
+            self._source_thread_counts = {}
+            self._assigned_thread_counts = {0: len(out)} if out else {}
+            self._duplicate_candidate_count = 0
+            self._duplicate_tail64_count = 0
 
-            for nonce_u32, (tail64, hash_hex) in winners.items():
-                entry = (self._heap_key(nonce_u32, tail64), (nonce_u32, tail64, hash_hex))
-                if len(heap) < keep:
-                    push(heap, entry)
-                elif entry[0] > heap[0][0]:
-                    replace(heap, entry)
+        trimmed = max(0, len(winners) - len(out))
 
-            out_raw = [payload for _, payload in heap]
-            out_raw.sort(key=lambda x: (int(x[1]), int(x[0])))
-
-            out = [
-                {
-                    "nonce_u32": int(nonce_u32),
-                    "hash_hex": hash_hex,
-                    "tail64": int(tail64),
-                    "share_diff_est": self._share_diff_est(int(tail64)),
-                }
-                for nonce_u32, tail64, hash_hex in out_raw
-            ]
+        # Return candidates with metadata preserved.
+        #
+        # JITWorker/CandidateSelector can use:
+        #   _found_by_thread
+        #   _generation
+        #   _lane_id
+        #   _assigned_submit_thread
+        #
+        # Strip these only at the final submit boundary if your submitter
+        # requires the old 4-field shape.
+        exported: list[dict] = []
+        for cand in out:
+            try:
+                exported.append(dict(cand))
+            except Exception:
+                self._bad += 1
 
         self._cached_keep = keep
-        self._cached_out = out
+        self._cached_out = exported
         self._dirty = False
+
+        self._update_snapshot(exported, threads)
 
         if self._bad > 0:
             self._global_evt_emit(
@@ -2227,12 +3370,13 @@ class _CandidateBatch(_ClassEventLogMixin):
                 "trim",
                 details=(
                     f"owner={self.owner_key} job={self._job_id} "
-                    f"gen={self._generation} trimmed={trimmed} kept={len(out)} requested={keep}"
+                    f"gen={self._generation} trimmed={trimmed} "
+                    f"kept={len(exported)} requested={keep}"
                 ),
             )
 
-        if out:
-            best = out[0]
+        if exported:
+            best = min(exported, key=self._sort_key_dict)
             sig = (
                 self._job_id,
                 self._generation,
@@ -2242,10 +3386,11 @@ class _CandidateBatch(_ClassEventLogMixin):
                 self._replaced,
                 self._bad,
                 self._merge_calls,
-                len(out),
+                len(exported),
                 trimmed,
                 int(best["nonce_u32"]),
                 int(best["tail64"]),
+                tuple(sorted(self._assigned_thread_counts.items())),
             )
 
             if sig != self._last_export_sig:
@@ -2257,12 +3402,13 @@ class _CandidateBatch(_ClassEventLogMixin):
                         f"gen={self._generation} incoming={self._incoming} "
                         f"accepted={self._accepted} rejected={self._rejected_same_or_worse} "
                         f"replaced={self._replaced} merges={self._merge_calls} "
-                        f"exported={len(out)} best_nonce={int(best['nonce_u32'])} "
-                        f"best_tail64={int(best['tail64'])}"
+                        f"exported={len(exported)} best_nonce={int(best['nonce_u32'])} "
+                        f"best_tail64={int(best['tail64'])} "
+                        f"assigned_threads={self._assigned_thread_counts}"
                     ),
                 )
 
-        return out
+        return exported
 
 class _NonceLease(_ClassEventLogMixin):
     """
@@ -2832,6 +3978,23 @@ class _CandidateSelector(_ClassEventLogMixin):
     - collapse repeated nonces to the strongest candidate
     - avoid redundant ranking math
     - preserve logging through the mixin
+    - preserve worker/lane metadata internally
+    - order winners round-robin by source thread/lane
+    - return clean candidate dicts with debug fields stripped
+
+    Expected candidate input fields:
+        nonce_u32
+        hash_hex
+        tail64 optional
+        share_diff_est optional
+
+    Optional debug metadata preserved internally:
+        _found_by_thread
+        _worker_index
+        _thread_id
+        _generation
+        _lane_id
+        _assigned_submit_thread
     """
 
     def __init__(
@@ -2841,6 +4004,23 @@ class _CandidateSelector(_ClassEventLogMixin):
         logger: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.max_keep_default = max(1, int(max_keep_default))
+
+        self._last_snapshot: dict = {
+            "incoming": 0,
+            "kept": 0,
+            "exact_duplicates_removed": 0,
+            "same_nonce_reduced": 0,
+            "bad_candidates": 0,
+            "unique_nonce_winners": 0,
+            "threads_inferred": 1,
+            "round_robin_enabled": False,
+            "source_thread_counts": {},
+            "assigned_thread_counts": {},
+            "best_nonce": 0,
+            "best_tail64": 0,
+            "best_share_diff": 0.0,
+        }
+
         self._evt_init(
             class_prefix="CandidateSelector",
             logger=logger,
@@ -2848,6 +4028,7 @@ class _CandidateSelector(_ClassEventLogMixin):
                 "kept_candidates": 75.0,
                 "dedup": 90.0,
                 "nonce_collapse": 90.0,
+                "round_robin": 75.0,
                 "bad": 90.0,
             },
             phrases={
@@ -2868,6 +4049,12 @@ class _CandidateSelector(_ClassEventLogMixin):
                     "the selector kept only the sharpest nonce echoes",
                     "weaker results on repeated nonces were set aside",
                     "nonce collisions were reduced to their strongest form",
+                ],
+                "round_robin": [
+                    "unique nonce winners were spread across worker lanes",
+                    "candidate winners were balanced by source thread",
+                    "the selector interleaved winners for parallel submission",
+                    "ranked candidates were distributed across active lanes",
                 ],
                 "bad": [
                     "some malformed candidates were ignored",
@@ -2896,7 +4083,16 @@ class _CandidateSelector(_ClassEventLogMixin):
 
     @staticmethod
     def _normalize(raw: dict) -> Optional[dict]:
+        """
+        Normalize a candidate while preserving internal debug metadata.
+
+        Important:
+            Lower tail64 is better.
+        """
         try:
+            if raw is None:
+                return None
+
             nonce_u32 = int(raw.get("nonce_u32", 0)) & 0xFFFFFFFF
             hash_hex = str(raw.get("hash_hex", "") or "").strip().lower()
             if not hash_hex:
@@ -2904,22 +4100,48 @@ class _CandidateSelector(_ClassEventLogMixin):
 
             tail64 = raw.get("tail64", None)
             if tail64 is None:
+                tail64 = raw.get("_tail64", None)
+            if tail64 is None:
                 tail64 = _CandidateSelector._tail64_from_hash_hex(hash_hex)
             tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
 
-            # keep share_diff_est in the output shape, but do not use it
-            # as a primary ranking field because it is monotonic with tail64.
             share_diff_est = raw.get("share_diff_est", None)
             if share_diff_est is None:
                 share_diff_est = _CandidateSelector._share_diff_est(tail64)
             share_diff_est = float(share_diff_est)
 
-            return {
+            out = {
                 "nonce_u32": nonce_u32,
                 "hash_hex": hash_hex,
                 "tail64": tail64,
                 "share_diff_est": share_diff_est,
             }
+
+            # Preserve debug/internal metadata for ranking and round-robin ordering.
+            # These are stripped before rank() returns.
+            for key in (
+                "_found_by_thread",
+                "_worker_index",
+                "_thread_id",
+                "_generation",
+                "_lane_id",
+                "_assigned_submit_thread",
+                "_tail64",
+                "_nonce",
+                "worker_index",
+                "thread_id",
+                "lane_id",
+                "generation",
+            ):
+                if key in raw:
+                    out[key] = raw.get(key)
+
+            if "_tail64" not in out:
+                out["_tail64"] = tail64
+            if "_nonce" not in out:
+                out["_nonce"] = nonce_u32
+
+            return out
         except Exception:
             return None
 
@@ -2953,6 +4175,280 @@ class _CandidateSelector(_ClassEventLogMixin):
             -int(x["nonce_u32"]),
         )
 
+    @staticmethod
+    def _clean_candidate(c: dict) -> dict:
+        """
+        Strip debug fields before returning candidates to caller/submission path.
+        """
+        return {
+            "nonce_u32": int(c["nonce_u32"]) & 0xFFFFFFFF,
+            "hash_hex": str(c["hash_hex"]),
+            "tail64": int(c["tail64"]) & 0xFFFFFFFFFFFFFFFF,
+            "share_diff_est": float(c["share_diff_est"]),
+        }
+
+    @staticmethod
+    def _read_env_threads(default: int = 1) -> int:
+        try:
+            import os
+
+            for name in (
+                "JITWORKER_SELECTOR_THREADS",
+                "MONERO_SELECTOR_THREADS",
+                "JITWORKER_THREADS",
+                "MONERO_THREADS",
+            ):
+                raw = os.getenv(name)
+                if raw is None:
+                    continue
+
+                try:
+                    value = int(str(raw).strip())
+                    if value > 0:
+                        return value
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return max(1, int(default))
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _candidate_source_thread(self, cand: dict, threads: int) -> int:
+        """
+        Infer the source worker/thread for round-robin ordering.
+
+        Preferred metadata:
+            _found_by_thread
+            _worker_index
+            _thread_id
+            worker_index
+            thread_id
+            _lane_id
+            lane_id
+
+        Fallback:
+            nonce % threads
+        """
+        threads = max(1, int(threads))
+
+        for key in (
+            "_found_by_thread",
+            "_worker_index",
+            "_thread_id",
+            "worker_index",
+            "thread_id",
+            "_lane_id",
+            "lane_id",
+        ):
+            if key not in cand:
+                continue
+
+            try:
+                value = int(cand.get(key))
+                if value >= 0:
+                    return value % threads
+            except Exception:
+                continue
+
+        try:
+            return int(cand["nonce_u32"]) % threads
+        except Exception:
+            return 0
+
+    def _infer_thread_count(self, candidates: list[dict]) -> int:
+        """
+        Infer active thread count from preserved metadata.
+
+        If no metadata exists, uses env fallback. If no env exists, returns 1.
+        """
+        max_seen = -1
+
+        for cand in candidates or []:
+            for key in (
+                "_found_by_thread",
+                "_worker_index",
+                "_thread_id",
+                "worker_index",
+                "thread_id",
+                "_lane_id",
+                "lane_id",
+            ):
+                if key not in cand:
+                    continue
+
+                try:
+                    value = int(cand.get(key))
+                    if value >= 0:
+                        max_seen = max(max_seen, value)
+                except Exception:
+                    pass
+
+        if max_seen >= 0:
+            return max(1, max_seen + 1)
+
+        return self._read_env_threads(default=1)
+
+    def _bounded_best(self, winners: list[dict], keep: int) -> list[dict]:
+        """
+        Keep the best K winners.
+
+        For small candidate sets, direct sort is faster and simpler.
+        For larger sets, use bounded heap.
+        """
+        keep = max(1, int(keep))
+
+        if len(winners) <= keep:
+            out = list(winners)
+            out.sort(key=self._sort_key)
+            return out
+
+        heap: list[tuple[tuple[int, int], dict]] = []
+
+        for cand in winners:
+            entry = (self._heap_key(cand), cand)
+
+            if len(heap) < keep:
+                heapq.heappush(heap, entry)
+                continue
+
+            if entry[0] > heap[0][0]:
+                heapq.heapreplace(heap, entry)
+
+        out = [cand for _, cand in heap]
+        out.sort(key=self._sort_key)
+        return out
+
+    def _round_robin_winners(
+        self,
+        winners: list[dict],
+        *,
+        keep: int,
+        threads: int,
+    ) -> tuple[list[dict], dict[int, int], dict[int, int]]:
+        """
+        Thread-aware winner distribution.
+
+        Input must already be deduped by nonce.
+
+        Lower tail64 is better. Each source thread/lane queue is sorted by quality,
+        then the result is interleaved one candidate per thread per round.
+
+        Returns:
+            ordered candidates with debug metadata still attached
+            source_thread_counts
+            assigned_thread_counts
+        """
+        keep = max(1, int(keep))
+        threads = max(1, int(threads))
+
+        if not winners:
+            return [], {}, {}
+
+        queues: dict[int, list[dict]] = {}
+        source_counts: dict[int, int] = {}
+
+        for cand in winners:
+            source_thread = self._candidate_source_thread(cand, threads)
+            queues.setdefault(source_thread, []).append(cand)
+            source_counts[source_thread] = source_counts.get(source_thread, 0) + 1
+
+        for q in queues.values():
+            q.sort(key=self._sort_key)
+
+        # Start with the source thread whose best candidate is strongest.
+        source_order = sorted(
+            queues.keys(),
+            key=lambda tid: (
+                self._sort_key(queues[tid][0]) if queues.get(tid) else (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF),
+                tid,
+            ),
+        )
+
+        out: list[dict] = []
+        assigned_counts: dict[int, int] = {}
+
+        made_progress = True
+        round_index = 0
+
+        while made_progress and len(out) < keep:
+            made_progress = False
+
+            for source_thread in source_order:
+                q = queues.get(source_thread)
+                if not q:
+                    continue
+
+                cand = q.pop(0)
+                assigned_thread = len(out) % threads
+
+                cand["_assigned_submit_thread"] = assigned_thread
+                out.append(cand)
+
+                assigned_counts[assigned_thread] = assigned_counts.get(assigned_thread, 0) + 1
+                made_progress = True
+
+                if len(out) >= keep:
+                    break
+
+            round_index += 1
+            if round_index > keep + threads + 4:
+                break
+
+        return out, source_counts, assigned_counts
+
+    def _update_snapshot(
+        self,
+        *,
+        incoming: int,
+        kept: int,
+        exact_dupes: int,
+        bad_items: int,
+        weaker_same_nonce: int,
+        unique_nonce_winners: int,
+        threads: int,
+        round_robin_enabled: bool,
+        source_thread_counts: dict[int, int],
+        assigned_thread_counts: dict[int, int],
+        out: list[dict],
+    ) -> None:
+        best = out[0] if out else None
+
+        self._last_snapshot = {
+            "incoming": int(incoming),
+            "kept": int(kept),
+            "exact_duplicates_removed": int(exact_dupes),
+            "same_nonce_reduced": int(weaker_same_nonce),
+            "bad_candidates": int(bad_items),
+            "unique_nonce_winners": int(unique_nonce_winners),
+            "threads_inferred": int(threads),
+            "round_robin_enabled": bool(round_robin_enabled),
+            "source_thread_counts": {
+                int(k): int(v) for k, v in (source_thread_counts or {}).items()
+            },
+            "assigned_thread_counts": {
+                int(k): int(v) for k, v in (assigned_thread_counts or {}).items()
+            },
+            "best_nonce": 0 if best is None else int(best["nonce_u32"]),
+            "best_tail64": 0 if best is None else int(best["tail64"]),
+            "best_tail64_hex": "0x0000000000000000"
+            if best is None
+            else f"0x{int(best['tail64']) & 0xFFFFFFFFFFFFFFFF:016X}",
+            "best_share_diff": 0.0 if best is None else float(best["share_diff_est"]),
+        }
+
+    def snapshot(self) -> dict:
+        """
+        Optional diagnostics. Does not affect the public rank() API.
+        """
+        return dict(self._last_snapshot)
+
     def rank(self, candidates: list[dict], max_results: int) -> list[dict]:
         keep = max(1, int(max_results or self.max_keep_default))
 
@@ -2960,14 +4456,16 @@ class _CandidateSelector(_ClassEventLogMixin):
         bad_items = 0
         weaker_same_nonce = 0
 
-        # pass 1:
+        # Pass 1:
         # - normalize candidates
         # - remove exact duplicates
         # - keep strongest candidate for each nonce
         seen_exact: set[tuple[int, str]] = set()
         best_by_nonce: dict[int, dict] = {}
 
-        for raw in candidates:
+        incoming_count = len(candidates or [])
+
+        for raw in candidates or []:
             cand = self._normalize(raw)
             if cand is None:
                 bad_items += 1
@@ -2980,42 +4478,55 @@ class _CandidateSelector(_ClassEventLogMixin):
             if exact_key in seen_exact:
                 exact_dupes += 1
                 continue
+
             seen_exact.add(exact_key)
 
             prior = best_by_nonce.get(nonce_u32)
             if prior is None:
                 best_by_nonce[nonce_u32] = cand
-            else:
-                if self._is_better(cand, prior):
-                    best_by_nonce[nonce_u32] = cand
-                weaker_same_nonce += 1
+                continue
 
-        # fast path: if there are only a few unique nonce winners,
-        # just sort them directly.
+            if self._is_better(cand, prior):
+                best_by_nonce[nonce_u32] = cand
+
+            weaker_same_nonce += 1
+
         winners = list(best_by_nonce.values())
-        if len(winners) <= keep:
-            winners.sort(key=self._sort_key)
-            out = winners
-        else:
-            # bounded heap path for larger bursts
-            heap: list[tuple[tuple[int, int], dict]] = []
-            for cand in winners:
-                entry = (self._heap_key(cand), cand)
-                if len(heap) < keep:
-                    heapq.heappush(heap, entry)
-                else:
-                    if entry[0] > heap[0][0]:
-                        heapq.heapreplace(heap, entry)
+        threads = self._infer_thread_count(winners)
 
-            out = [cand for _, cand in heap]
-            out.sort(key=self._sort_key)
+        # Keep more than requested briefly so round-robin has room to balance.
+        # Final output is still limited to keep.
+        pre_keep = max(keep, min(len(winners), keep * max(1, min(threads, 16))))
+
+        best_pre = self._bounded_best(winners, pre_keep)
+
+        round_robin_enabled = threads > 1 and len(best_pre) > 1
+
+        if round_robin_enabled:
+            ordered, source_thread_counts, assigned_thread_counts = self._round_robin_winners(
+                best_pre,
+                keep=keep,
+                threads=threads,
+            )
+        else:
+            ordered = self._bounded_best(winners, keep)
+            source_thread_counts = {}
+            assigned_thread_counts = {0: len(ordered)} if ordered else {}
+
+        # Final quality sanity pass inside the selected set:
+        # - still deduped by nonce
+        # - already balanced by thread
+        # - limited to keep
+        ordered = ordered[:keep]
+
+        out = [self._clean_candidate(c) for c in ordered]
 
         if exact_dupes > 0:
             self._evt_emit(
                 "dedup",
                 details=(
                     f"exact_duplicates_removed={exact_dupes} "
-                    f"incoming={len(candidates)}"
+                    f"incoming={incoming_count}"
                 ),
             )
 
@@ -3028,12 +4539,24 @@ class _CandidateSelector(_ClassEventLogMixin):
                 ),
             )
 
+        if round_robin_enabled:
+            self._evt_emit(
+                "round_robin",
+                details=(
+                    f"threads={threads} "
+                    f"kept={len(out)} "
+                    f"unique_nonce_winners={len(best_by_nonce)} "
+                    f"source_threads={source_thread_counts} "
+                    f"assigned_threads={assigned_thread_counts}"
+                ),
+            )
+
         if bad_items > 0:
             self._evt_emit(
                 "bad",
                 details=(
                     f"bad_candidates={bad_items} "
-                    f"incoming={len(candidates)}"
+                    f"incoming={incoming_count}"
                 ),
             )
 
@@ -3048,6 +4571,20 @@ class _CandidateSelector(_ClassEventLogMixin):
                     f"best_share_diff={float(best['share_diff_est']):,.2f}"
                 ),
             )
+
+        self._update_snapshot(
+            incoming=incoming_count,
+            kept=len(out),
+            exact_dupes=exact_dupes,
+            bad_items=bad_items,
+            weaker_same_nonce=weaker_same_nonce,
+            unique_nonce_winners=len(best_by_nonce),
+            threads=threads,
+            round_robin_enabled=round_robin_enabled,
+            source_thread_counts=source_thread_counts,
+            assigned_thread_counts=assigned_thread_counts,
+            out=out,
+        )
 
         return out
 
@@ -3735,6 +5272,17 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
     """
     Centralizes RandomX seed changes so only one thread pays the full
     dataset/cache rebuild cost per seed.
+
+    Patch behavior:
+    - safe same-seed epoch batching/coalescing
+    - generation/worker epoch history
+    - no unsafe dataset reuse across different seed_hash values
+    - optional hint warming when the caller has a real next seed hash
+    - richer snapshot/debug stats
+
+    Important:
+        RandomX datasets are seed-bound. Never reuse an epoch for a different
+        seed_hash. This class only batches repeated requests for the same seed.
     """
 
     def __init__(
@@ -3754,12 +5302,27 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
         self._building_seed: Optional[bytes] = None
         self._build_error: Optional[BaseException] = None
 
+        self._last_seed: bytes = b""
+        self._last_epoch: int = 0
+        self._same_seed_hits: int = 0
+
+        # generation -> compact history
+        self.epoch_history: dict[int, dict[str, Any]] = {}
+
+        # seed_hex16 -> compact history
+        self._seed_epoch_history: dict[str, dict[str, Any]] = {}
+
         self._stats = {
             "build_requests": 0,
             "build_starts": 0,
             "build_waits": 0,
             "build_success": 0,
             "build_fail": 0,
+            "same_seed_fast_path": 0,
+            "epoch_batch_hits": 0,
+            "hint_warm_calls": 0,
+            "hint_warm_success": 0,
+            "history_updates": 0,
         }
 
         self._evt_init(
@@ -3770,6 +5333,8 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
                 "build_wait": 75.0,
                 "build_done": 60.0,
                 "build_fail": 90.0,
+                "epoch_batch": 75.0,
+                "hint_warm": 90.0,
             },
             phrases={
                 "build_start": [
@@ -3796,6 +5361,18 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
                     "RandomX dataset work fell out of step",
                     "the current build attempt broke apart",
                 ],
+                "epoch_batch": [
+                    "same-seed epoch requests were coalesced",
+                    "dataset reuse stayed safely inside the same seed",
+                    "repeated seed work was collapsed into one ready epoch",
+                    "epoch batching avoided redundant seed preparation",
+                ],
+                "hint_warm": [
+                    "a hinted seed was warmed ahead of use",
+                    "the dataset builder accepted a real next-seed hint",
+                    "a seed hint was prepared synchronously",
+                    "the next known seed was brought into readiness",
+                ],
             },
         )
 
@@ -3804,6 +5381,221 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
             self.logger(msg)
         except Exception:
             pass
+
+    @staticmethod
+    def _seed_key(seed_hash: bytes) -> str:
+        return bytes(seed_hash or b"").hex()[:16]
+
+    def _trim_history_locked(self) -> None:
+        if len(self.epoch_history) > 256:
+            keys = sorted(self.epoch_history.keys())[-128:]
+            self.epoch_history = {k: self.epoch_history[k] for k in keys}
+
+        if len(self._seed_epoch_history) > 256:
+            items = sorted(
+                self._seed_epoch_history.items(),
+                key=lambda kv: int(kv[1].get("last_epoch", 0)),
+            )[-128:]
+            self._seed_epoch_history = dict(items)
+
+    def _note_epoch_history_locked(
+        self,
+        *,
+        seed_hash: bytes,
+        epoch: int,
+        generation: Optional[int] = None,
+        worker_index: Optional[int] = None,
+        source: str = "ensure",
+    ) -> None:
+        seed_hash = bytes(seed_hash or b"")
+        seed_key = self._seed_key(seed_hash)
+        epoch = int(epoch)
+
+        self._stats["history_updates"] += 1
+
+        if generation is not None:
+            gen = int(generation)
+            hist = self.epoch_history.setdefault(
+                gen,
+                {
+                    "generation": gen,
+                    "seed_hash_hex": seed_hash.hex(),
+                    "seed_key": seed_key,
+                    "epochs": [],
+                    "workers": {},
+                    "hits": 0,
+                    "source": source,
+                },
+            )
+
+            hist["seed_hash_hex"] = seed_hash.hex()
+            hist["seed_key"] = seed_key
+            hist["hits"] = int(hist.get("hits", 0)) + 1
+            hist["source"] = source
+
+            epochs = hist.setdefault("epochs", [])
+            if epoch not in epochs:
+                epochs.append(epoch)
+                if len(epochs) > 16:
+                    del epochs[:-16]
+
+            if worker_index is not None:
+                workers = hist.setdefault("workers", {})
+                workers[int(worker_index)] = {
+                    "worker_index": int(worker_index),
+                    "epoch": epoch,
+                    "seed_key": seed_key,
+                    "source": source,
+                }
+
+        seed_hist = self._seed_epoch_history.setdefault(
+            seed_key,
+            {
+                "seed_key": seed_key,
+                "seed_hash_hex": seed_hash.hex(),
+                "first_epoch": epoch,
+                "last_epoch": epoch,
+                "hits": 0,
+                "sources": {},
+            },
+        )
+        seed_hist["last_epoch"] = epoch
+        seed_hist["hits"] = int(seed_hist.get("hits", 0)) + 1
+        seed_hist.setdefault("sources", {})[source] = int(
+            seed_hist.setdefault("sources", {}).get(source, 0)
+        ) + 1
+
+        self._trim_history_locked()
+
+    def _same_seed_ready_locked(
+        self,
+        *,
+        seed_hash: bytes,
+        generation: Optional[int] = None,
+        worker_index: Optional[int] = None,
+    ) -> Optional[int]:
+        """
+        Safe epoch batching fast path.
+
+        Only returns an epoch when the ready seed exactly matches seed_hash.
+        """
+        if self._ready_seed != seed_hash or self._build_error is not None:
+            return None
+
+        epoch = int(self._ready_epoch)
+
+        self._stats["same_seed_fast_path"] += 1
+
+        if self._last_seed == seed_hash and self._last_epoch == epoch:
+            self._same_seed_hits += 1
+        else:
+            self._last_seed = seed_hash
+            self._last_epoch = epoch
+            self._same_seed_hits = 1
+
+        if self._same_seed_hits >= 3:
+            self._stats["epoch_batch_hits"] += 1
+
+            if self._same_seed_hits in (3, 8, 32, 128):
+                self._evt_emit(
+                    "epoch_batch",
+                    details=(
+                        f"seed={self._seed_key(seed_hash)} epoch={epoch} "
+                        f"same_seed_hits={self._same_seed_hits}"
+                    ),
+                )
+
+        self._note_epoch_history_locked(
+            seed_hash=seed_hash,
+            epoch=epoch,
+            generation=generation,
+            worker_index=worker_index,
+            source="same_seed_batch",
+        )
+
+        return epoch
+
+    def ensure_seed_ready_for_generation(
+        self,
+        seed_hash: bytes,
+        *,
+        generation: Optional[int] = None,
+        worker_index: Optional[int] = None,
+        job_age_ms: Optional[float] = None,
+    ) -> int:
+        """
+        Generation-aware wrapper around ensure_seed_ready().
+
+        The public ensure_seed_ready(seed_hash) behavior remains valid.
+        This method adds metadata/history and safe same-seed batching.
+        """
+        seed_hash = bytes(seed_hash or b"")
+        if not seed_hash:
+            raise ValueError("empty seed_hash")
+
+        with self._cv:
+            fast_epoch = self._same_seed_ready_locked(
+                seed_hash=seed_hash,
+                generation=generation,
+                worker_index=worker_index,
+            )
+            if fast_epoch is not None:
+                return int(fast_epoch)
+
+        epoch = int(self.ensure_seed_ready(seed_hash))
+
+        with self._cv:
+            self._note_epoch_history_locked(
+                seed_hash=seed_hash,
+                epoch=epoch,
+                generation=generation,
+                worker_index=worker_index,
+                source="ensure_generation",
+            )
+
+            if job_age_ms is not None:
+                try:
+                    if generation is not None and int(generation) in self.epoch_history:
+                        self.epoch_history[int(generation)]["job_age_ms"] = float(job_age_ms)
+                except Exception:
+                    pass
+
+        return epoch
+
+    def warm_seed_hint(
+        self,
+        seed_hash: bytes,
+        *,
+        generation: Optional[int] = None,
+        worker_index: Optional[int] = None,
+    ) -> int:
+        """
+        Synchronously warm a real known seed hash.
+
+        This does not guess the next RandomX seed. The caller must provide the
+        actual seed_hash. Guessing generation + 1 is not safe.
+        """
+        self._stats["hint_warm_calls"] += 1
+
+        epoch = int(
+            self.ensure_seed_ready_for_generation(
+                seed_hash,
+                generation=generation,
+                worker_index=worker_index,
+            )
+        )
+
+        self._stats["hint_warm_success"] += 1
+
+        self._evt_emit(
+            "hint_warm",
+            details=(
+                f"seed={self._seed_key(bytes(seed_hash or b''))} "
+                f"epoch={epoch} generation={generation} worker={worker_index}"
+            ),
+        )
+
+        return epoch
 
     def ensure_seed_ready(self, seed_hash: bytes) -> int:
         seed_hash = bytes(seed_hash or b"")
@@ -3818,8 +5610,9 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
             self._stats["build_requests"] += 1
 
             while True:
-                if self._ready_seed == seed_hash and self._build_error is None:
-                    return self._ready_epoch
+                fast_epoch = self._same_seed_ready_locked(seed_hash=seed_hash)
+                if fast_epoch is not None:
+                    return int(fast_epoch)
 
                 if self._building_seed == seed_hash:
                     self._stats["build_waits"] += 1
@@ -3871,7 +5664,18 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
             self._building_seed = None
             self._build_error = None
             self._stats["build_success"] += 1
-            epoch = self._ready_epoch
+
+            epoch = int(self._ready_epoch)
+            self._last_seed = seed_hash
+            self._last_epoch = epoch
+            self._same_seed_hits = 1
+
+            self._note_epoch_history_locked(
+                seed_hash=seed_hash,
+                epoch=epoch,
+                source="build",
+            )
+
             self._cv.notify_all()
 
         if build_started_here:
@@ -3890,16 +5694,32 @@ class RandomXDatasetBuilder(_ClassEventLogMixin):
 
     def current_epoch(self) -> int:
         with self._mu:
-            return self._ready_epoch
+            return int(self._ready_epoch)
 
     def snapshot(self) -> dict:
         with self._mu:
             return {
                 "ready_seed_hex": self._ready_seed.hex() if self._ready_seed else "",
-                "ready_epoch": self._ready_epoch,
+                "ready_epoch": int(self._ready_epoch),
                 "building_seed_hex": self._building_seed.hex() if self._building_seed else "",
                 "has_build_error": self._build_error is not None,
+                "last_seed_hex": self._last_seed.hex() if self._last_seed else "",
+                "last_epoch": int(self._last_epoch),
+                "same_seed_hits": int(self._same_seed_hits),
                 "stats": dict(self._stats),
+                "epoch_history": {
+                    int(k): {
+                        **v,
+                        "workers": {
+                            int(wk): dict(wv)
+                            for wk, wv in dict(v.get("workers", {})).items()
+                        },
+                    }
+                    for k, v in self.epoch_history.items()
+                },
+                "seed_epoch_history": {
+                    str(k): dict(v) for k, v in self._seed_epoch_history.items()
+                },
             }
 
 
@@ -3907,6 +5727,14 @@ class RandomXVmPool(_ClassEventLogMixin):
     """
     Keeps one VM per worker and recreates it only when the RandomX dataset epoch
     changes.
+
+    Patch behavior:
+    - uses generation-aware dataset builder when available
+    - tracks per-worker generation/epoch hints
+    - supports synchronous warming of real next seed hints
+    - avoids repeated ensure_seed_ready() during warm_workers()
+    - tracks stale job age without unsafe early returns
+    - never reuses a VM across a different dataset epoch
     """
 
     def __init__(
@@ -3922,6 +5750,13 @@ class RandomXVmPool(_ClassEventLogMixin):
 
         self._mu = threading.RLock()
         self._entries: dict[int, dict[str, Any]] = {}
+
+        # worker_index -> hint dict
+        self._epoch_hints: dict[int, dict[str, Any]] = {}
+
+        # Optional callable returning current job age in ms.
+        self._job_age_provider: Optional[Callable[[], float]] = None
+
         self._stats = {
             "acquire_calls": 0,
             "vm_creates": 0,
@@ -3929,6 +5764,12 @@ class RandomXVmPool(_ClassEventLogMixin):
             "vm_rebuilds": 0,
             "vm_destroy": 0,
             "warm_calls": 0,
+            "warm_vm_reuses": 0,
+            "hint_notes": 0,
+            "hint_warm_calls": 0,
+            "hint_warm_success": 0,
+            "stale_observed": 0,
+            "generation_hint_hits": 0,
         }
 
         self._evt_init(
@@ -3938,6 +5779,8 @@ class RandomXVmPool(_ClassEventLogMixin):
                 "vm_create": 60.0,
                 "vm_rebuild": 60.0,
                 "warm": 90.0,
+                "hint": 90.0,
+                "stale": 90.0,
                 "close": 120.0,
             },
             phrases={
@@ -3959,6 +5802,18 @@ class RandomXVmPool(_ClassEventLogMixin):
                     "the pool prepped its active lanes",
                     "seed warmth spread across the worker VMs",
                 ],
+                "hint": [
+                    "an epoch hint was recorded for a worker",
+                    "the pool cached a worker generation hint",
+                    "a VM lane received a next-seed hint",
+                    "worker epoch metadata was refreshed",
+                ],
+                "stale": [
+                    "the VM pool noticed stale-age pressure",
+                    "a worker acquire arrived on an old job",
+                    "stale job age was recorded before VM acquire",
+                    "old work was observed during VM preparation",
+                ],
                 "close": [
                     "the VM pool cooled off",
                     "worker VMs were wound down",
@@ -3974,6 +5829,91 @@ class RandomXVmPool(_ClassEventLogMixin):
         except Exception:
             pass
 
+    def set_job_age_provider(self, provider: Optional[Callable[[], float]]) -> None:
+        """
+        Optional hook from JITWorker:
+
+            self._vm_pool.set_job_age_provider(self._dispatch.current_job_age_ms)
+
+        Existing code does not need to call this.
+        """
+        with self._mu:
+            self._job_age_provider = provider
+
+    def _current_job_age_ms(self) -> float:
+        provider = None
+        with self._mu:
+            provider = self._job_age_provider
+
+        if provider is None:
+            return 0.0
+
+        try:
+            return max(0.0, float(provider() or 0.0))
+        except Exception:
+            return 0.0
+
+    def note_worker_generation(
+        self,
+        worker_index: int,
+        generation: int,
+        *,
+        seed_hash: Optional[bytes] = None,
+        next_seed_hash: Optional[bytes] = None,
+    ) -> None:
+        """
+        Optional hint hook from JITWorker.
+
+        Safe usage:
+            self._vm_pool.note_worker_generation(
+                st.worker_index,
+                st.assigned_generation,
+                seed_hash=bytes(job.seed_hash or b""),
+            )
+
+        next_seed_hash must be a real known seed hash, not generation + 1.
+        """
+        idx = int(worker_index)
+        gen = int(generation)
+
+        with self._mu:
+            hint = self._epoch_hints.setdefault(
+                idx,
+                {
+                    "worker_index": idx,
+                    "generation": 0,
+                    "last_generation": 0,
+                    "stable_count": 0,
+                    "seed_hash": b"",
+                    "next_seed_hash": b"",
+                    "hint_epoch": 0,
+                    "last_epoch": 0,
+                    "last_job_age_ms": 0.0,
+                },
+            )
+
+            last_gen = int(hint.get("generation", 0))
+            if gen == last_gen:
+                hint["stable_count"] = int(hint.get("stable_count", 0)) + 1
+            else:
+                hint["last_generation"] = last_gen
+                hint["generation"] = gen
+                hint["stable_count"] = 1
+
+            if seed_hash is not None:
+                hint["seed_hash"] = bytes(seed_hash or b"")
+
+            if next_seed_hash is not None:
+                hint["next_seed_hash"] = bytes(next_seed_hash or b"")
+
+            self._stats["hint_notes"] += 1
+
+        if self._stats["hint_notes"] in (1, 8, 32, 128):
+            self._evt_emit(
+                "hint",
+                details=f"worker={idx} generation={gen}",
+            )
+
     def _destroy_entry_vm_locked(self, entry: dict[str, Any]) -> None:
         vm = entry.get("vm")
         if vm is not None:
@@ -3984,66 +5924,264 @@ class RandomXVmPool(_ClassEventLogMixin):
             entry["vm"] = None
             self._stats["vm_destroy"] += 1
 
+    def _ensure_epoch_for_worker(self, worker_index: int, seed_hash: bytes) -> int:
+        idx = int(worker_index)
+        seed_hash = bytes(seed_hash or b"")
+
+        with self._mu:
+            hint = dict(self._epoch_hints.get(idx, {}))
+
+        generation = hint.get("generation", None)
+        job_age_ms = self._current_job_age_ms()
+
+        if job_age_ms >= 2000.0:
+            with self._mu:
+                self._stats["stale_observed"] += 1
+                if idx in self._epoch_hints:
+                    self._epoch_hints[idx]["last_job_age_ms"] = float(job_age_ms)
+
+            self._evt_emit(
+                "stale",
+                details=f"worker={idx} job_age_ms={job_age_ms:.1f}",
+            )
+
+        ensure_for_gen = getattr(self.dataset_builder, "ensure_seed_ready_for_generation", None)
+        if callable(ensure_for_gen):
+            epoch = int(
+                ensure_for_gen(
+                    seed_hash,
+                    generation=None if generation is None else int(generation),
+                    worker_index=idx,
+                    job_age_ms=job_age_ms,
+                )
+            )
+        else:
+            epoch = int(self.dataset_builder.ensure_seed_ready(seed_hash))
+
+        with self._mu:
+            hint_ref = self._epoch_hints.setdefault(
+                idx,
+                {
+                    "worker_index": idx,
+                    "generation": 0,
+                    "last_generation": 0,
+                    "stable_count": 0,
+                    "seed_hash": b"",
+                    "next_seed_hash": b"",
+                    "hint_epoch": 0,
+                    "last_epoch": 0,
+                    "last_job_age_ms": 0.0,
+                },
+            )
+            hint_ref["last_epoch"] = epoch
+            hint_ref["seed_hash"] = seed_hash
+            hint_ref["last_job_age_ms"] = float(job_age_ms)
+
+            if generation is not None:
+                self._stats["generation_hint_hits"] += 1
+
+        return epoch
+
+    def _get_or_create_vm_locked(
+        self,
+        *,
+        worker_index: int,
+        seed_hash: bytes,
+        epoch: int,
+    ) -> tuple[Any, int, str]:
+        idx = int(worker_index)
+        epoch = int(epoch)
+
+        entry = self._entries.get(idx)
+        if entry is None:
+            vm = self.rx.create_vm()
+            self._entries[idx] = {
+                "vm": vm,
+                "epoch": epoch,
+                "seed_hash": seed_hash,
+            }
+            self._stats["vm_creates"] += 1
+            return vm, epoch, "create"
+
+        if entry.get("vm") is not None and int(entry.get("epoch", 0)) == epoch:
+            self._stats["vm_reuses"] += 1
+            return entry["vm"], epoch, "reuse"
+
+        self._destroy_entry_vm_locked(entry)
+
+        vm = self.rx.create_vm()
+        entry["vm"] = vm
+        entry["epoch"] = epoch
+        entry["seed_hash"] = seed_hash
+        self._stats["vm_rebuilds"] += 1
+
+        return vm, epoch, "rebuild"
+
     def acquire_for_worker(self, worker_index: int, seed_hash: bytes) -> tuple[Any, int]:
         seed_hash = bytes(seed_hash or b"")
         if not seed_hash:
             raise ValueError("empty seed_hash")
 
-        epoch = self.dataset_builder.ensure_seed_ready(seed_hash)
+        idx = int(worker_index)
+        epoch = self._ensure_epoch_for_worker(idx, seed_hash)
 
         with self._mu:
             self._stats["acquire_calls"] += 1
-            idx = int(worker_index)
 
-            entry = self._entries.get(idx)
-            if entry is None:
-                vm = self.rx.create_vm()
-                self._entries[idx] = {
-                    "vm": vm,
-                    "epoch": epoch,
-                    "seed_hash": seed_hash,
-                }
-                self._stats["vm_creates"] += 1
-                self._evt_emit(
-                    "vm_create",
-                    details=f"worker={idx} epoch={epoch} seed={seed_hash.hex()[:16]}",
-                )
-                return vm, epoch
+            vm, epoch, action = self._get_or_create_vm_locked(
+                worker_index=idx,
+                seed_hash=seed_hash,
+                epoch=epoch,
+            )
 
-            if entry.get("vm") is not None and int(entry.get("epoch", 0)) == epoch:
-                self._stats["vm_reuses"] += 1
-                return entry["vm"], epoch
-
-            self._destroy_entry_vm_locked(entry)
-            vm = self.rx.create_vm()
-            entry["vm"] = vm
-            entry["epoch"] = epoch
-            entry["seed_hash"] = seed_hash
-            self._stats["vm_rebuilds"] += 1
+        if action == "create":
+            self._evt_emit(
+                "vm_create",
+                details=f"worker={idx} epoch={epoch} seed={seed_hash.hex()[:16]}",
+            )
+        elif action == "rebuild":
             self._evt_emit(
                 "vm_rebuild",
                 details=f"worker={idx} epoch={epoch} seed={seed_hash.hex()[:16]}",
             )
-            return vm, epoch
+
+        return vm, int(epoch)
+
+    def warm_next_epoch_hint(
+        self,
+        worker_index: int,
+        seed_hash: bytes,
+        *,
+        generation: Optional[int] = None,
+    ) -> int:
+        """
+        Synchronously warm a real known next seed hash.
+
+        This does not guess next epoch from generation + 1. RandomX needs an
+        actual seed_hash.
+        """
+        idx = int(worker_index)
+        seed_hash = bytes(seed_hash or b"")
+        if not seed_hash:
+            raise ValueError("empty seed_hash")
+
+        self._stats["hint_warm_calls"] += 1
+
+        with self._mu:
+            self._epoch_hints.setdefault(
+                idx,
+                {
+                    "worker_index": idx,
+                    "generation": int(generation or 0),
+                    "last_generation": 0,
+                    "stable_count": 0,
+                    "seed_hash": b"",
+                    "next_seed_hash": seed_hash,
+                    "hint_epoch": 0,
+                    "last_epoch": 0,
+                    "last_job_age_ms": 0.0,
+                },
+            )["next_seed_hash"] = seed_hash
+
+        warm_hint = getattr(self.dataset_builder, "warm_seed_hint", None)
+        if callable(warm_hint):
+            epoch = int(
+                warm_hint(
+                    seed_hash,
+                    generation=generation,
+                    worker_index=idx,
+                )
+            )
+        else:
+            epoch = int(self.dataset_builder.ensure_seed_ready(seed_hash))
+
+        with self._mu:
+            hint = self._epoch_hints.setdefault(idx, {"worker_index": idx})
+            hint["hint_epoch"] = epoch
+            hint["next_seed_hash"] = seed_hash
+            self._stats["hint_warm_success"] += 1
+
+        self._evt_emit(
+            "hint",
+            details=(
+                f"worker={idx} warmed_hint_epoch={epoch} "
+                f"generation={generation} seed={seed_hash.hex()[:16]}"
+            ),
+        )
+
+        return epoch
 
     def warm_workers(self, worker_indices: list[int], seed_hash: bytes) -> int:
         seed_hash = bytes(seed_hash or b"")
         if not seed_hash:
             raise ValueError("empty seed_hash")
 
-        epoch = self.dataset_builder.ensure_seed_ready(seed_hash)
+        indices = [int(i) for i in (worker_indices or [])]
         self._stats["warm_calls"] += 1
 
-        for idx in worker_indices:
-            self.acquire_for_worker(int(idx), seed_hash)
+        # Ensure once, then create/reuse VMs under pool lock without repeating
+        # dataset ensure for every worker.
+        ensure_for_gen = getattr(self.dataset_builder, "ensure_seed_ready_for_generation", None)
 
-        if worker_indices:
+        if callable(ensure_for_gen):
+            epoch = int(
+                ensure_for_gen(
+                    seed_hash,
+                    generation=None,
+                    worker_index=None,
+                    job_age_ms=self._current_job_age_ms(),
+                )
+            )
+        else:
+            epoch = int(self.dataset_builder.ensure_seed_ready(seed_hash))
+
+        created = 0
+        reused = 0
+        rebuilt = 0
+
+        with self._mu:
+            for idx in indices:
+                vm, _epoch, action = self._get_or_create_vm_locked(
+                    worker_index=idx,
+                    seed_hash=seed_hash,
+                    epoch=epoch,
+                )
+
+                if action == "create":
+                    created += 1
+                elif action == "reuse":
+                    reused += 1
+                    self._stats["warm_vm_reuses"] += 1
+                elif action == "rebuild":
+                    rebuilt += 1
+
+                hint = self._epoch_hints.setdefault(
+                    idx,
+                    {
+                        "worker_index": idx,
+                        "generation": 0,
+                        "last_generation": 0,
+                        "stable_count": 0,
+                        "seed_hash": b"",
+                        "next_seed_hash": b"",
+                        "hint_epoch": 0,
+                        "last_epoch": 0,
+                        "last_job_age_ms": 0.0,
+                    },
+                )
+                hint["seed_hash"] = seed_hash
+                hint["last_epoch"] = int(epoch)
+
+        if indices:
             self._evt_emit(
                 "warm",
-                details=f"workers={len(worker_indices)} epoch={epoch} seed={seed_hash.hex()[:16]}",
+                details=(
+                    f"workers={len(indices)} epoch={epoch} seed={seed_hash.hex()[:16]} "
+                    f"created={created} reused={reused} rebuilt={rebuilt}"
+                ),
             )
 
-        return epoch
+        return int(epoch)
 
     def close(self) -> None:
         with self._mu:
@@ -4052,7 +6190,9 @@ class RandomXVmPool(_ClassEventLogMixin):
                 if entry.get("vm") is not None:
                     count += 1
                 self._destroy_entry_vm_locked(entry)
+
             self._entries.clear()
+            self._epoch_hints.clear()
 
         self._evt_emit("close", details=f"destroyed_vms={count}", force=True)
 
@@ -4061,6 +6201,20 @@ class RandomXVmPool(_ClassEventLogMixin):
             return {
                 "pool_size": len(self._entries),
                 "stats": dict(self._stats),
+                "epoch_hints": {
+                    int(idx): {
+                        "worker_index": int(hint.get("worker_index", idx)),
+                        "generation": int(hint.get("generation", 0)),
+                        "last_generation": int(hint.get("last_generation", 0)),
+                        "stable_count": int(hint.get("stable_count", 0)),
+                        "seed_hash_hex": bytes(hint.get("seed_hash", b"")).hex(),
+                        "next_seed_hash_hex": bytes(hint.get("next_seed_hash", b"")).hex(),
+                        "hint_epoch": int(hint.get("hint_epoch", 0)),
+                        "last_epoch": int(hint.get("last_epoch", 0)),
+                        "last_job_age_ms": float(hint.get("last_job_age_ms", 0.0)),
+                    }
+                    for idx, hint in self._epoch_hints.items()
+                },
                 "workers": {
                     int(idx): {
                         "has_vm": entry.get("vm") is not None,
@@ -4110,22 +6264,37 @@ class JITWorker:
     """
     Safe JITWorker using MoneroHashLoop.dll.
 
-    Important correction:
+    Important:
         Do NOT XOR arbitrary blob/seed bytes to create thread-specific VM states.
 
         For Monero/P2Pool, the share verifier expects the hash of the exact job
         blob with a valid nonce. Mutating seed bytes or non-nonce blob bytes
         creates a different proof and will be rejected.
 
-    What this version does instead:
+    This version:
         - keeps exact constructor/hash_job/stop signatures
         - keeps native MoneroHashLoop.dll hot loop
         - keeps RandomX VM pool reuse
         - keeps candidate ranking/diversity
-        - uses deterministic per-generation lane permutation
-        - guarantees each worker receives a unique nonce lane
-        - avoids duplicate nonce work without corrupting the blob
+        - keeps deterministic per-generation lane permutation
+        - guarantees each worker receives a unique nonce residue lane
+        - synchronizes native current_generation before workers start hashing
+        - tracks best share per worker/generation
+        - round-robin balances candidates across worker lanes
+        - validates duplicate candidates in logs/snapshots
+        - scales native candidate buffer for high-volatility jobs
+        - avoids duplicate nonce work without corrupting blob/seed
         - keeps final dedupe as protection against native/result bugs
+
+    Optional environment settings:
+        MONERO_LANE_VARIANT=A|B|C
+        JITWORKER_LANE_VARIANT=A|B|C
+
+        MONERO_NATIVE_MAX_CANDIDATES=256
+        JITWORKER_NATIVE_MAX_CANDIDATES=256
+
+        MONERO_DEBUG_NONCES=1
+        JITWORKER_DEBUG_NONCES=1
     """
 
     def __init__(
@@ -4150,16 +6319,54 @@ class JITWorker:
         self._threads: list[threading.Thread] = []
         self._mu = threading.RLock()
 
-        # Native hot-loop DLL state.
         self._native_stop_flag = ctypes.c_int(0)
+
+        # Native stale detection reads this pointer.
+        #
+        # hash_job() updates this BEFORE workers start hashing.
+        # Worker callbacks must NOT overwrite it with their own generation.
         self._native_generation = ctypes.c_uint64(0)
+
         self._hot_hash = None
         self._hot_hash_error = ""
         self._hot_hash_hash_fn_ptr = 0
 
-        # This intentionally stays false. It exists only so logs/snapshots make
-        # it obvious that unsafe blob XOR is not being used.
         self._unsafe_blob_xor_enabled = False
+
+        self._lane_permutation_variant = self._resolve_lane_permutation_variant()
+        self._native_max_candidates_cap = self._read_int_config(
+            names=(
+                "MONERO_NATIVE_MAX_CANDIDATES",
+                "JITWORKER_NATIVE_MAX_CANDIDATES",
+            ),
+            default=256,
+            minimum=8,
+            maximum=4096,
+        )
+        self._debug_unique_nonces = self._read_bool_config(
+            names=(
+                "MONERO_DEBUG_NONCES",
+                "JITWORKER_DEBUG_NONCES",
+            ),
+            default=True,
+        )
+
+        self._last_lane_ids: list[int] = []
+        self._last_generation = 0
+        self._last_threads_used = 0
+
+        self._last_shares_found_this_round = 0
+        self._last_duplicate_candidate_count = 0
+        self._last_duplicate_tail64_count = 0
+        self._last_round_worker_share_counts: dict[int, int] = {}
+        self._last_unique_share_snapshot: dict = {
+            "mode": "best_share_per_worker_generation",
+            "threads_active": 0,
+            "shares_found_this_round": 0,
+            "duplicate_candidate_count": 0,
+            "duplicate_tail64_count": 0,
+            "worker_share_counts": {},
+        }
 
         try:
             self._hot_hash = MoneroHashLoopDLL.load_same_dir()
@@ -4222,6 +6429,136 @@ class JITWorker:
         )
 
         self._bootstrap_workers()
+
+    @staticmethod
+    def _read_int_config(
+        *,
+        names: tuple[str, ...],
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        try:
+            import os
+
+            for name in names:
+                raw = os.getenv(name)
+                if raw is None:
+                    continue
+
+                try:
+                    value = int(str(raw).strip())
+                    return max(int(minimum), min(int(maximum), value))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return max(int(minimum), min(int(maximum), int(default)))
+
+    @staticmethod
+    def _read_bool_config(
+        *,
+        names: tuple[str, ...],
+        default: bool,
+    ) -> bool:
+        try:
+            import os
+
+            for name in names:
+                raw = os.getenv(name)
+                if raw is None:
+                    continue
+
+                text = str(raw).strip().lower()
+                if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+                    return True
+                if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+                    return False
+        except Exception:
+            pass
+
+        return bool(default)
+
+    def _resolve_lane_permutation_variant(self) -> str:
+        values = []
+
+        for obj in (
+            self.python_usage,
+            self.jit,
+            self.rx,
+            getattr(self.jit, "config", None),
+            getattr(self.rx, "config", None),
+        ):
+            if obj is None:
+                continue
+
+            for attr in (
+                "lane_permutation_variant",
+                "monero_lane_variant",
+                "jitworker_lane_variant",
+                "nonce_lane_variant",
+            ):
+                try:
+                    value = getattr(obj, attr, None)
+                    if value is not None:
+                        values.append(value)
+                except Exception:
+                    pass
+
+        try:
+            import os
+
+            values.append(os.getenv("MONERO_LANE_VARIANT"))
+            values.append(os.getenv("JITWORKER_LANE_VARIANT"))
+        except Exception:
+            pass
+
+        for value in values:
+            variant = self._normalize_lane_variant(value)
+            if variant:
+                return variant
+
+        return "A"
+
+    @staticmethod
+    def _normalize_lane_variant(value) -> str:
+        if value is None:
+            return ""
+
+        text = str(value).strip().lower()
+        text = text.replace("-", "_").replace(" ", "_")
+
+        if text in {
+            "a",
+            "variant_a",
+            "aggressive",
+            "aggressive_residue_rotation",
+            "residue_rotation",
+            "golden",
+            "golden_ratio",
+        }:
+            return "A"
+
+        if text in {
+            "b",
+            "variant_b",
+            "fixed",
+            "fixed_step",
+            "rotated_start",
+        }:
+            return "B"
+
+        if text in {
+            "c",
+            "variant_c",
+            "dual",
+            "dual_magic",
+            "dual_magic_rotation",
+        }:
+            return "C"
+
+        return ""
 
     def _resolve_native_hash_fn_ptr(self) -> int:
         """
@@ -4311,25 +6648,132 @@ class JITWorker:
             return min(count, max(256, self.batch_size))
         if age_ms < 800.0:
             return min(count, max(128, self.batch_size // 2))
+
         return min(count, 128)
 
     def _stale_check_mask(self) -> int:
+        """
+        Lower mask on older jobs.
+
+        Native meaning:
+            mask=63 checks generation every 64 hashes.
+            mask=31 checks every 32 hashes.
+            mask=15 checks every 16 hashes.
+            mask=7 checks every 8 hashes.
+        """
         age_ms = self._dispatch.current_job_age_ms()
+
         if age_ms < 150.0:
             return 63
         if age_ms < 400.0:
             return 31
         if age_ms < 900.0:
             return 15
+
         return 7
 
     @staticmethod
     def _gcd(a: int, b: int) -> int:
         a = abs(int(a))
         b = abs(int(b))
+
         while b:
             a, b = b, a % b
+
         return a
+
+    def _make_coprime_step(self, n: int, step: int) -> int:
+        n = max(1, int(n))
+        if n <= 1:
+            return 1
+
+        step = int(step) % n
+        if step <= 0:
+            step = 1
+
+        guard = 0
+        while self._gcd(step, n) != 1:
+            step = (step + 1) % n
+            if step <= 0:
+                step = 1
+
+            guard += 1
+            if guard > n + 4:
+                return 1
+
+        return int(step)
+
+    def _build_lane_sequence(self, n: int, start: int, step: int) -> list[int]:
+        n = max(1, int(n))
+        if n == 1:
+            return [0]
+
+        step = self._make_coprime_step(n, step)
+        start = int(start) % n
+
+        lanes: list[int] = []
+        seen: set[int] = set()
+
+        x = start
+        for _ in range(n):
+            lane = int(x % n)
+
+            if lane not in seen:
+                lanes.append(lane)
+                seen.add(lane)
+
+            x += step
+
+        if len(lanes) != n:
+            lanes = list(range(n))
+
+        return lanes
+
+    def _lane_permutation_variant_a(self, n: int, generation: int) -> list[int]:
+        n = max(1, int(n))
+        if n == 1:
+            return [0]
+
+        gen = int(generation) & 0xFFFFFFFFFFFFFFFF
+
+        magic1 = 0x9E3779B97F4A7C15
+        magic2 = 0xD1B54A32D192ED03
+        magic_start = 0xA0761D6478BD642F
+
+        step = int((gen * magic1 + magic2) % n)
+        start = int((gen ^ (gen >> 17) ^ magic_start) % n)
+
+        return self._build_lane_sequence(n, start, step)
+
+    def _lane_permutation_variant_b(self, n: int, generation: int) -> list[int]:
+        n = max(1, int(n))
+        if n == 1:
+            return [0]
+
+        gen = int(generation) & 0xFFFFFFFFFFFFFFFF
+
+        fixed_step = 3
+        magic_start = 0xA0761D6478BD642F
+
+        step = self._make_coprime_step(n, fixed_step)
+        start = int((gen ^ (gen >> 17) ^ magic_start) % n)
+
+        return self._build_lane_sequence(n, start, step)
+
+    def _lane_permutation_variant_c(self, n: int, generation: int) -> list[int]:
+        n = max(1, int(n))
+        if n == 1:
+            return [0]
+
+        gen = int(generation) & 0xFFFFFFFFFFFFFFFF
+
+        magic3 = 0x5DEECE66D97F4A7C15
+        magic4 = 0xB2B54A32D192ED03
+
+        step = int((gen * magic3 + magic4) % n)
+        start = int((gen ^ (gen >> 25)) % n)
+
+        return self._build_lane_sequence(n, start, step)
 
     def _lane_permutation(self, n: int, generation: int) -> list[int]:
         """
@@ -4345,48 +6789,45 @@ class JITWorker:
         if n == 1:
             return [0]
 
-        gen = int(generation) & 0xFFFFFFFFFFFFFFFF
+        variant = self._lane_permutation_variant
 
-        # Pick an odd-ish step that is coprime with n.
-        # This rotates which worker owns which residue class each generation.
-        step = int((gen * 0x9E3779B97F4A7C15 + 0xD1B54A32D192ED03) % n)
-        if step <= 0:
-            step = 1
+        try:
+            if variant == "B":
+                lanes = self._lane_permutation_variant_b(n, generation)
+            elif variant == "C":
+                lanes = self._lane_permutation_variant_c(n, generation)
+            else:
+                lanes = self._lane_permutation_variant_a(n, generation)
+        except Exception as e:
+            self.logger(
+                f"[JITWorker] lane permutation failed variant={variant}: "
+                f"{type(e).__name__}: {e}; falling back to range lanes"
+            )
+            lanes = list(range(n))
 
-        while self._gcd(step, n) != 1:
-            step = (step + 1) % n
-            if step <= 0:
-                step = 1
-
-        start = int((gen ^ (gen >> 17) ^ 0xA0761D6478BD642F) % n)
-
-        lanes: list[int] = []
-        seen: set[int] = set()
-
-        x = start
-        for _ in range(n):
-            lane = int(x % n)
-            if lane not in seen:
-                lanes.append(lane)
-                seen.add(lane)
-            x += step
-
-        if len(lanes) != n:
+        if len(lanes) != n or len(set(lanes)) != n:
+            self.logger(
+                f"[JITWorker] invalid lane permutation variant={variant} "
+                f"n={n} generation={generation}; falling back to range lanes"
+            )
             lanes = list(range(n))
 
         return lanes
 
     @staticmethod
     def _candidate_identity(item: dict) -> tuple:
-        """
-        Stable candidate identity used only for output cleanup.
-
-        The native hot loop should already avoid duplicate nonce work because
-        workers receive distinct lanes. This dedupe is a final safety net.
-        """
         nonce = int(item.get("nonce_u32", 0)) & 0xFFFFFFFF
         hash_hex = str(item.get("hash_hex", ""))
+
         return nonce, hash_hex
+
+    @staticmethod
+    def _candidate_tail64(item: dict) -> int:
+        return int(item.get("tail64", item.get("_tail64", 0))) & 0xFFFFFFFFFFFFFFFF
+
+    @staticmethod
+    def _candidate_nonce(item: dict) -> int:
+        return int(item.get("nonce_u32", item.get("_nonce", 0))) & 0xFFFFFFFF
 
     def _dedupe_candidates(self, candidates: list[dict]) -> list[dict]:
         out: list[dict] = []
@@ -4406,14 +6847,27 @@ class JITWorker:
 
         return out
 
+    def _strip_candidate_debug_fields(self, candidates: list[dict]) -> list[dict]:
+        out: list[dict] = []
+
+        for c in candidates or []:
+            try:
+                out.append({k: v for k, v in dict(c).items() if not str(k).startswith("_")})
+            except Exception:
+                continue
+
+        return out
+
     def _bootstrap_workers(self) -> None:
         jit_version = "unavailable"
+
         try:
             jit_version = str(self.jit.version())
         except Exception:
             pass
 
         hot_hash_status = "unavailable"
+
         if self._hot_hash is not None and self._hot_hash_hash_fn_ptr:
             hot_hash_status = (
                 f"loaded prefix={self._hot_hash.prefix} "
@@ -4442,7 +6896,6 @@ class JITWorker:
             st.thunk = None
             st.exec_mode = self._exec.bind_worker(st)
 
-            # Dynamic fields used by this worker.
             st.assigned_lane_id = 0
             st.assigned_stride = 1
             st.assigned_generation = 0
@@ -4450,6 +6903,16 @@ class JITWorker:
             st.assigned_count = 0
             st.assigned_max_results = 0
             st.assigned_job = None
+
+            # Unique nonce debugging.
+            try:
+                st.unique_nonce_tracker = threading.local()
+            except Exception:
+                st.unique_nonce_tracker = None
+
+            # Unique share tracking.
+            st.best_share_per_generation = {}
+            st.best_share_lock = threading.RLock()
 
             t = threading.Thread(
                 target=self._thread_main,
@@ -4466,9 +6929,435 @@ class JITWorker:
             f"[JITWorker] initialized: threads={self.threads} "
             f"batch_size={self.batch_size} jit_version={jit_version} "
             f"monero_hash_loop={hot_hash_status} "
+            f"lane_variant={self._lane_permutation_variant} "
+            f"native_max_candidates_cap={self._native_max_candidates_cap} "
+            f"debug_unique_nonces={self._debug_unique_nonces} "
             f"unsafe_blob_xor={self._unsafe_blob_xor_enabled} "
-            f"(native hot loop + vm pool + unique nonce lanes + candidate diversity)"
+            f"(native hot loop + vm pool + unique nonce lanes + unique share tracking)"
         )
+
+    def _max_candidates_for_job(self, job: "MoneroJob", keep_best: int) -> int:
+        keep_best = max(1, int(keep_best))
+        cap = max(8, int(self._native_max_candidates_cap))
+
+        pool_type = ""
+        try:
+            pool_type = str(getattr(job, "pool_type", "") or "").strip().lower()
+        except Exception:
+            pool_type = ""
+
+        volatility = ""
+        try:
+            volatility = str(getattr(job, "volatility", "") or "").strip().lower()
+        except Exception:
+            volatility = ""
+
+        high_volatility = False
+
+        if pool_type in {
+            "high_volatility",
+            "volatile",
+            "young",
+            "new",
+            "fast_jobs",
+            "fast",
+        }:
+            high_volatility = True
+
+        if volatility in {
+            "high",
+            "high_volatility",
+            "volatile",
+            "fast",
+        }:
+            high_volatility = True
+
+        for attr in (
+            "high_volatility",
+            "volatile_pool",
+            "pool_volatile",
+            "is_volatile",
+        ):
+            try:
+                if bool(getattr(job, attr, False)):
+                    high_volatility = True
+                    break
+            except Exception:
+                pass
+
+        multiplier = 8 if high_volatility else 4
+        return max(8, min(cap, keep_best * multiplier))
+
+    def _debug_track_unique_nonces(self, st: _ThreadState) -> None:
+        if not self._debug_unique_nonces:
+            return
+
+        try:
+            tracker = getattr(st, "unique_nonce_tracker", None)
+            if tracker is None:
+                return
+
+            generation = int(getattr(st, "assigned_generation", 0) or 0)
+
+            if getattr(tracker, "generation", None) != generation:
+                tracker.generation = generation
+                tracker.nonce_seen = set()
+                tracker.logged_count = 0
+
+            nonce_seen = getattr(tracker, "nonce_seen", None)
+            if nonce_seen is None:
+                nonce_seen = set()
+                tracker.nonce_seen = nonce_seen
+
+            logged_count = int(getattr(tracker, "logged_count", 0) or 0)
+
+            for c in st.found or []:
+                try:
+                    n = int(c.get("nonce_u32", 0)) & 0xFFFFFFFF
+                except Exception:
+                    continue
+
+                if n in nonce_seen:
+                    self.logger(
+                        f"[JITWorker-{st.worker_index}] duplicate_candidate_nonce "
+                        f"generation={generation} nonce={n} "
+                        f"lane={getattr(st, 'assigned_lane_id', 0)} "
+                        f"start_nonce={int(getattr(st, 'assigned_start_nonce', 0)) & 0xFFFFFFFF} "
+                        f"stride={int(getattr(st, 'assigned_stride', 1))}"
+                    )
+                    continue
+
+                nonce_seen.add(n)
+
+                if logged_count < 8:
+                    tail64 = self._candidate_tail64(c)
+
+                    self.logger(
+                        f"[JITWorker-{st.worker_index}] "
+                        f"unique_nonce={n} "
+                        f"tail64=0x{tail64:016X} "
+                        f"generation={generation} "
+                        f"lane={getattr(st, 'assigned_lane_id', 0)} "
+                        f"start_nonce={int(getattr(st, 'assigned_start_nonce', 0)) & 0xFFFFFFFF} "
+                        f"stride={int(getattr(st, 'assigned_stride', 1))}"
+                    )
+                    logged_count += 1
+                    tracker.logged_count = logged_count
+
+            if len(nonce_seen) > 65536:
+                tracker.nonce_seen = set(list(nonce_seen)[-8192:])
+
+        except Exception:
+            pass
+
+    def _track_best_share_per_generation(self, st: _ThreadState) -> None:
+        """
+        Track the best candidate/share per worker/generation.
+
+        Lower tail64 is better.
+
+        Stored shape:
+            st.best_share_per_generation[generation] = {
+                "candidate": candidate copy,
+                "tail64": int,
+                "nonce": int,
+                "lane_id": int,
+                "worker_index": int,
+            }
+        """
+        try:
+            if not st.found:
+                return
+
+            gen = int(getattr(st, "assigned_generation", 0) or 0)
+            if gen <= 0:
+                return
+
+            best_map = getattr(st, "best_share_per_generation", None)
+            if best_map is None:
+                best_map = {}
+                st.best_share_per_generation = best_map
+
+            lock = getattr(st, "best_share_lock", None)
+
+            def _update() -> None:
+                for c in st.found or []:
+                    try:
+                        candidate = dict(c)
+                        tail64 = self._candidate_tail64(candidate)
+                        nonce = self._candidate_nonce(candidate)
+                    except Exception:
+                        continue
+
+                    current = best_map.get(gen)
+
+                    replace = False
+                    if current is None:
+                        replace = True
+                    else:
+                        old_tail = int(current.get("tail64", 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+                        old_nonce = int(current.get("nonce", 0xFFFFFFFF)) & 0xFFFFFFFF
+
+                        if tail64 < old_tail:
+                            replace = True
+                        elif tail64 == old_tail and nonce < old_nonce:
+                            replace = True
+
+                    if replace:
+                        best_map[gen] = {
+                            "candidate": candidate.copy(),
+                            "tail64": tail64,
+                            "nonce": nonce,
+                            "lane_id": int(getattr(st, "assigned_lane_id", 0)),
+                            "worker_index": int(getattr(st, "worker_index", -1)),
+                        }
+
+                # Bound memory to recent generations.
+                if len(best_map) > 128:
+                    keep_keys = sorted(best_map.keys())[-64:]
+                    keep = {k: best_map[k] for k in keep_keys if k in best_map}
+                    best_map.clear()
+                    best_map.update(keep)
+
+            if lock is not None:
+                with lock:
+                    _update()
+            else:
+                _update()
+
+        except Exception:
+            pass
+
+    def _collect_annotated_worker_candidates(
+        self,
+        active_states: list["_ThreadState"],
+        generation: int,
+    ) -> list[dict]:
+        """
+        Collect candidates from every worker and preserve worker/lane metadata.
+
+        Candidate identity remains nonce+hash_hex.
+        Duplicate tail64 is logged separately because equal tail64 does not
+        necessarily mean equal share, but it is useful for debugging.
+        """
+        annotated: list[dict] = []
+        seen_identities: set[tuple] = set()
+        seen_tail64_by_generation: set[tuple[int, int]] = set()
+
+        duplicate_candidate_count = 0
+        duplicate_tail64_count = 0
+        worker_counts: dict[int, int] = {}
+
+        for st in active_states:
+            worker_index = int(getattr(st, "worker_index", -1))
+            lane_id = int(getattr(st, "assigned_lane_id", 0))
+            gen = int(getattr(st, "assigned_generation", generation) or generation)
+
+            for c in st.found or []:
+                try:
+                    cc = dict(c)
+                    identity = self._candidate_identity(cc)
+                    tail64 = self._candidate_tail64(cc)
+                    nonce = self._candidate_nonce(cc)
+                except Exception:
+                    continue
+
+                if identity in seen_identities:
+                    duplicate_candidate_count += 1
+                    continue
+
+                seen_identities.add(identity)
+
+                tail_key = (gen, tail64)
+                if tail_key in seen_tail64_by_generation:
+                    duplicate_tail64_count += 1
+                else:
+                    seen_tail64_by_generation.add(tail_key)
+
+                cc["_found_by_thread"] = worker_index
+                cc["_generation"] = gen
+                cc["_lane_id"] = lane_id
+                cc["_tail64"] = tail64
+                cc["_nonce"] = nonce
+
+                annotated.append(cc)
+                worker_counts[worker_index] = worker_counts.get(worker_index, 0) + 1
+
+        self._last_duplicate_candidate_count = int(duplicate_candidate_count)
+        self._last_duplicate_tail64_count = int(duplicate_tail64_count)
+        self._last_round_worker_share_counts = dict(worker_counts)
+
+        if duplicate_candidate_count:
+            self.logger(
+                f"[JITWorker] duplicate candidate identities detected: "
+                f"generation={generation} count={duplicate_candidate_count}"
+            )
+
+        if duplicate_tail64_count:
+            self.logger(
+                f"[JITWorker] duplicate tail64 values detected: "
+                f"generation={generation} count={duplicate_tail64_count}"
+            )
+
+        return annotated
+
+    def _round_robin_annotated_candidates(
+        self,
+        annotated: list[dict],
+        limit: int,
+    ) -> list[dict]:
+        """
+        Balance candidate ordering across workers.
+
+        Lower tail64 is better.
+
+        The output keeps debug fields. Strip debug fields only at final export.
+        """
+        limit = max(1, int(limit))
+        if not annotated:
+            return []
+
+        queues: dict[int, list[dict]] = {}
+
+        for c in annotated:
+            try:
+                worker_id = int(c.get("_found_by_thread", -1))
+            except Exception:
+                worker_id = -1
+
+            queues.setdefault(worker_id, []).append(c)
+
+        for worker_id, q in queues.items():
+            q.sort(
+                key=lambda x: (
+                    self._candidate_tail64(x),
+                    self._candidate_nonce(x),
+                    int(x.get("_lane_id", 0)),
+                )
+            )
+
+        worker_order = sorted(
+            queues.keys(),
+            key=lambda wid: (
+                self._candidate_tail64(queues[wid][0]) if queues.get(wid) else 0xFFFFFFFFFFFFFFFF,
+                wid,
+            ),
+        )
+
+        out: list[dict] = []
+        made_progress = True
+
+        while made_progress and len(out) < limit:
+            made_progress = False
+
+            for worker_id in worker_order:
+                q = queues.get(worker_id) or []
+                if not q:
+                    continue
+
+                out.append(q.pop(0))
+                made_progress = True
+
+                if len(out) >= limit:
+                    break
+
+        return out
+
+    def _reapply_worker_metadata(
+        self,
+        ranked_pool: list[dict],
+        annotated_source: list[dict],
+    ) -> list[dict]:
+        """
+        Reattach worker/lane metadata after _selector.rank(), if rank preserved
+        candidate identity but stripped/rewrapped dicts.
+        """
+        meta_by_identity: dict[tuple, dict] = {}
+
+        for c in annotated_source or []:
+            try:
+                identity = self._candidate_identity(c)
+            except Exception:
+                continue
+
+            meta_by_identity[identity] = {
+                "_found_by_thread": c.get("_found_by_thread", -1),
+                "_generation": c.get("_generation", 0),
+                "_lane_id": c.get("_lane_id", 0),
+                "_tail64": c.get("_tail64", self._candidate_tail64(c)),
+                "_nonce": c.get("_nonce", self._candidate_nonce(c)),
+            }
+
+        out: list[dict] = []
+
+        for c in ranked_pool or []:
+            try:
+                cc = dict(c)
+                identity = self._candidate_identity(cc)
+                meta = meta_by_identity.get(identity)
+                if meta:
+                    cc.update(meta)
+                else:
+                    cc["_found_by_thread"] = -1
+                    cc["_generation"] = 0
+                    cc["_lane_id"] = 0
+                    cc["_tail64"] = self._candidate_tail64(cc)
+                    cc["_nonce"] = self._candidate_nonce(cc)
+                out.append(cc)
+            except Exception:
+                continue
+
+        return out
+
+    def _update_unique_share_snapshot(
+        self,
+        active_states: list["_ThreadState"],
+        generation: int,
+        found: list[dict],
+    ) -> None:
+        try:
+            snap = {
+                "mode": "best_share_per_worker_generation",
+                "threads_active": int(len(active_states)),
+                "shares_found_this_round": int(len(found or [])),
+                "duplicate_candidate_count": int(self._last_duplicate_candidate_count),
+                "duplicate_tail64_count": int(self._last_duplicate_tail64_count),
+                "worker_share_counts": dict(self._last_round_worker_share_counts),
+            }
+
+            for st in active_states:
+                worker_index = int(getattr(st, "worker_index", -1))
+                best_map = getattr(st, "best_share_per_generation", {}) or {}
+
+                latest_gen = 0
+                latest_tail64 = 0
+                latest_nonce = 0
+                latest_lane = int(getattr(st, "assigned_lane_id", 0))
+
+                if best_map:
+                    try:
+                        latest_gen = max(int(k) for k in best_map.keys())
+                        latest = best_map.get(latest_gen, {}) or {}
+                        latest_tail64 = int(latest.get("tail64", 0)) & 0xFFFFFFFFFFFFFFFF
+                        latest_nonce = int(latest.get("nonce", 0)) & 0xFFFFFFFF
+                        latest_lane = int(latest.get("lane_id", latest_lane))
+                    except Exception:
+                        pass
+
+                snap[f"worker_{worker_index}_best_gen"] = {
+                    "generations_tracked": int(len(best_map)),
+                    "latest_generation": int(latest_gen),
+                    "latest_tail64": int(latest_tail64),
+                    "latest_tail64_hex": f"0x{int(latest_tail64):016X}",
+                    "latest_nonce": int(latest_nonce),
+                    "latest_lane_id": int(latest_lane),
+                }
+
+            self._last_unique_share_snapshot = snap
+            self._last_shares_found_this_round = int(len(found or []))
+
+        except Exception:
+            pass
 
     def _make_callback(self, st: _ThreadState):
         def _cb(_user_data=None) -> int:
@@ -4487,6 +7376,7 @@ class JITWorker:
 
                 job_id = str(job.job_id)
                 my_generation = int(st.assigned_generation or 0)
+
                 if my_generation <= 0:
                     return 0
 
@@ -4524,13 +7414,7 @@ class JITWorker:
                     requested_keep=max(8, min(128, keep_best * 2)),
                 )
 
-                # Critical:
-                # This must stay an exact copy of job.blob. The native DLL mutates
-                # only the nonce bytes at job.nonce_offset for each hash attempt.
-                #
-                # Do not XOR seed bytes, header bytes, tx merkle bytes, or any
-                # non-nonce blob field here. That creates a different proof that
-                # pool/node verification will reject.
+                # Exact job blob copy. Native mutates nonce bytes only.
                 native_blob = bytearray(job.blob)
 
                 vm_ptr = self._resolve_native_vm_ptr(st.vm)
@@ -4538,10 +7422,10 @@ class JITWorker:
                     st.error = "RandomX VM pointer is null"
                     return -1
 
-                self._native_generation.value = int(my_generation) & 0xFFFFFFFFFFFFFFFF
-
                 if self._stop.is_set():
                     self._native_stop_flag.value = 1
+
+                max_candidates = self._max_candidates_for_job(job, keep_best)
 
                 native_result = self._hot_hash.run_hot_loop(
                     hash_fn_ptr=int(self._hot_hash_hash_fn_ptr),
@@ -4556,7 +7440,7 @@ class JITWorker:
                     current_generation=self._native_generation,
                     generation=my_generation,
                     stale_mask=stale_mask,
-                    max_candidates=max(8, min(256, keep_best * 4)),
+                    max_candidates=max_candidates,
                     raise_on_error=False,
                     allow_blob_copy=False,
                 )
@@ -4608,24 +7492,34 @@ class JITWorker:
         if not seed_hash:
             raise ValueError("empty seed_hash")
 
+        blob = bytes(job.blob or b"")
+        if len(blob) < 4:
+            raise ValueError("job.blob is too small")
+
+        nonce_offset = int(job.nonce_offset)
+        if nonce_offset < 0 or nonce_offset + 4 > len(blob):
+            raise ValueError(
+                f"nonce_offset outside blob: nonce_offset={nonce_offset} blob_len={len(blob)}"
+            )
+
         if st.vm is None or st.last_seed != seed_hash:
             vm, epoch = self._vm_pool.acquire_for_worker(st.worker_index, seed_hash)
             st.vm = vm
             st.vm_epoch = int(epoch)
             st.last_seed = seed_hash
 
-        blob_changed = st.last_blob != job.blob
+        blob_changed = st.last_blob != blob
 
-        if st.blob_buf is None or len(st.blob_buf) != len(job.blob):
-            st.blob_buf = (c_ubyte * len(job.blob))()
+        if st.blob_buf is None or len(st.blob_buf) != len(blob):
+            st.blob_buf = (c_ubyte * len(blob))()
             blob_changed = True
 
         if blob_changed:
-            memmove(st.blob_buf, job.blob, len(job.blob))
-            st.last_blob = bytes(job.blob)
+            memmove(st.blob_buf, blob, len(blob))
+            st.last_blob = blob
 
         st.nonce_ptr = cast(
-            byref(st.blob_buf, int(job.nonce_offset)),
+            byref(st.blob_buf, nonce_offset),
             POINTER(c_uint32),
         )
 
@@ -4642,11 +7536,40 @@ class JITWorker:
 
             try:
                 self._exec.invoke(st)
+
+                self._debug_track_unique_nonces(st)
+                self._track_best_share_per_generation(st)
+
             except Exception as e:
                 st.error = f"{type(e).__name__}: {e}"
             finally:
                 st.busy = False
                 st.done_event.set()
+
+    def _validate_job_before_dispatch(self, job: "MoneroJob") -> str:
+        try:
+            seed_hash = bytes(job.seed_hash or b"")
+            if not seed_hash:
+                return "empty seed_hash"
+
+            blob = bytes(job.blob or b"")
+            if len(blob) < 4:
+                return f"job.blob too small: {len(blob)}"
+
+            nonce_offset = int(job.nonce_offset)
+            if nonce_offset < 0 or nonce_offset + 4 > len(blob):
+                return (
+                    f"nonce_offset outside blob: "
+                    f"nonce_offset={nonce_offset} blob_len={len(blob)}"
+                )
+
+            target64 = int(job.target64) & 0xFFFFFFFFFFFFFFFF
+            if target64 <= 0:
+                return "target64 must be > 0"
+
+            return ""
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
 
     def hash_job(
         self,
@@ -4656,6 +7579,16 @@ class JITWorker:
         count: int,
         max_results: int,
     ) -> dict:
+        validation_error = self._validate_job_before_dispatch(job)
+        if validation_error:
+            return {
+                "job_id": getattr(job, "job_id", ""),
+                "hashes_done": 0,
+                "found": [],
+                "elapsed_sec": 0.0,
+                "errors": [validation_error],
+            }
+
         count = self._effective_count(count)
         if count <= 0:
             return {
@@ -4677,7 +7610,12 @@ class JITWorker:
         except Exception:
             pass
 
+        # Critical stale-sync fix.
+        # This happens before VM warmup and before any worker starts hashing.
         self._native_generation.value = int(generation) & 0xFFFFFFFFFFFFFFFF
+
+        if not self._stop.is_set():
+            self._native_stop_flag.value = 0
 
         self._share_diversity.begin_round(
             job_id=str(job.job_id),
@@ -4699,15 +7637,11 @@ class JITWorker:
                 "errors": [f"randomx_prepare {type(e).__name__}: {e}"],
             }
 
-        # Unique lane layout:
-        #
-        # For active thread count N, every worker gets one residue class:
-        #     nonce = actual_start_nonce + lane + k * N
-        #
-        # The lane permutation changes per generation, so workers do not always
-        # own the same residue class. This gives thread-level diversity without
-        # doing duplicate work and without corrupting the blob/seed.
         lane_ids = self._lane_permutation(threads, int(generation))
+
+        self._last_lane_ids = list(lane_ids)
+        self._last_generation = int(generation)
+        self._last_threads_used = int(threads)
 
         per_thread = count // threads
         remainder = count % threads
@@ -4717,6 +7651,7 @@ class JITWorker:
         for i in range(threads):
             lane_id = int(lane_ids[i])
             take = per_thread + (1 if i < remainder else 0)
+
             if take <= 0:
                 continue
 
@@ -4725,7 +7660,7 @@ class JITWorker:
             st.assigned_generation = int(generation)
             st.assigned_lane_id = lane_id
             st.assigned_start_nonce = (int(actual_start_nonce) + lane_id) & 0xFFFFFFFF
-            st.assigned_count = take
+            st.assigned_count = int(take)
             st.assigned_max_results = int(max_results)
             st.assigned_stride = int(threads)
             st.done_hashes = 0
@@ -4780,28 +7715,62 @@ class JITWorker:
                 errors.append(
                     f"worker[{st.worker_index}] "
                     f"lane={getattr(st, 'assigned_lane_id', 0)} "
+                    f"start_nonce={int(getattr(st, 'assigned_start_nonce', 0)) & 0xFFFFFFFF} "
+                    f"stride={int(getattr(st, 'assigned_stride', 1))} "
                     f"{st.error}"
                 )
 
-        # Keep a broad pool before ranking/diversity.
-        pre_rank = round_batch.export(max(max_results * 16, 256))
+        annotated = self._collect_annotated_worker_candidates(
+            active_states=active_states,
+            generation=int(generation),
+        )
+
+        if annotated:
+            # First balance the broad native outputs by worker.
+            balanced_annotated = self._round_robin_annotated_candidates(
+                annotated,
+                limit=max(max_results * 16, 256),
+            )
+            pre_rank = self._strip_candidate_debug_fields(balanced_annotated)
+        else:
+            pre_rank = round_batch.export(max(max_results * 16, 256))
+
         pre_rank = self._dedupe_candidates(pre_rank)
 
         ranked_pool = self._selector.rank(
             pre_rank,
-            max(max_results * 6, 64),
+            max(max_results * 8, 64),
         )
 
         ranked_pool = self._dedupe_candidates(ranked_pool)
 
+        if annotated and ranked_pool:
+            # Reattach worker IDs after ranking, then do final worker-balanced order.
+            ranked_annotated = self._reapply_worker_metadata(ranked_pool, annotated)
+            ranked_balanced = self._round_robin_annotated_candidates(
+                ranked_annotated,
+                limit=max(max_results * 8, 64),
+            )
+            final_pool = self._strip_candidate_debug_fields(ranked_balanced)
+        else:
+            final_pool = ranked_pool
+
+        final_pool = self._dedupe_candidates(final_pool)
+
         found = self._share_diversity.pick(
             job_id=str(job.job_id),
             generation=int(generation),
-            candidates=ranked_pool,
+            candidates=final_pool,
             max_results=max_results,
         )
 
         found = self._dedupe_candidates(found)
+
+        self._update_unique_share_snapshot(
+            active_states=active_states,
+            generation=int(generation),
+            found=found,
+        )
 
         return {
             "job_id": job.job_id,
@@ -4821,15 +7790,65 @@ class JITWorker:
                 "prefix": "" if self._hot_hash is None else str(self._hot_hash.prefix),
                 "version": 0 if self._hot_hash is None else int(self._hot_hash.version()),
                 "hash_fn_ptr": int(self._hot_hash_hash_fn_ptr or 0),
+                "hash_fn_ptr_hex": f"0x{int(self._hot_hash_hash_fn_ptr or 0):x}",
                 "error": self._hot_hash_error,
+                "native_max_candidates_cap": int(self._native_max_candidates_cap),
+                "current_generation": int(self._native_generation.value),
+                "stop_flag": int(self._native_stop_flag.value),
             }
 
             snap["nonce_diversity"] = {
                 "mode": "unique_per_generation_lane_permutation",
+                "lane_permutation_variant": str(self._lane_permutation_variant),
                 "unsafe_blob_xor_enabled": bool(self._unsafe_blob_xor_enabled),
+                "debug_unique_nonces": bool(self._debug_unique_nonces),
                 "threads": int(self.threads),
                 "batch_size": int(self.batch_size),
+                "last_threads_used": int(self._last_threads_used),
+                "last_generation": int(self._last_generation),
+                "last_lane_ids": list(self._last_lane_ids),
+                "last_lane_count": len(self._last_lane_ids),
+                "last_lane_unique": len(set(self._last_lane_ids)) == len(self._last_lane_ids),
             }
+
+            share_snap = dict(self._last_unique_share_snapshot or {})
+            share_snap.setdefault("mode", "best_share_per_worker_generation")
+            share_snap.setdefault("threads_active", int(self._last_threads_used))
+            share_snap.setdefault("shares_found_this_round", int(self._last_shares_found_this_round))
+            share_snap.setdefault("duplicate_candidate_count", int(self._last_duplicate_candidate_count))
+            share_snap.setdefault("duplicate_tail64_count", int(self._last_duplicate_tail64_count))
+            share_snap.setdefault("worker_share_counts", dict(self._last_round_worker_share_counts))
+
+            for st in self._states:
+                worker_index = int(getattr(st, "worker_index", -1))
+                best_map = getattr(st, "best_share_per_generation", {}) or {}
+
+                latest_gen = 0
+                latest_tail64 = 0
+                latest_nonce = 0
+                latest_lane = int(getattr(st, "assigned_lane_id", 0))
+
+                if best_map:
+                    try:
+                        latest_gen = max(int(k) for k in best_map.keys())
+                        latest = best_map.get(latest_gen, {}) or {}
+                        latest_tail64 = int(latest.get("tail64", 0)) & 0xFFFFFFFFFFFFFFFF
+                        latest_nonce = int(latest.get("nonce", 0)) & 0xFFFFFFFF
+                        latest_lane = int(latest.get("lane_id", latest_lane))
+                    except Exception:
+                        pass
+
+                share_snap[f"worker_{worker_index}_best_gen"] = {
+                    "generations_tracked": int(len(best_map)),
+                    "latest_generation": int(latest_gen),
+                    "latest_tail64": int(latest_tail64),
+                    "latest_tail64_hex": f"0x{int(latest_tail64):016X}",
+                    "latest_nonce": int(latest_nonce),
+                    "latest_lane_id": int(latest_lane),
+                }
+
+            snap["unique_shares_per_thread"] = share_snap
+
         except Exception:
             pass
 
@@ -4950,5 +7969,19 @@ class JITWorker:
                         generation=0,
                         requested_keep=max(8, self.batch_size // 64),
                     )
+                except Exception:
+                    pass
+
+            if getattr(st, "unique_nonce_tracker", None) is not None:
+                try:
+                    st.unique_nonce_tracker.nonce_seen = set()
+                    st.unique_nonce_tracker.logged_count = 0
+                    st.unique_nonce_tracker.generation = 0
+                except Exception:
+                    pass
+
+            if getattr(st, "best_share_per_generation", None) is not None:
+                try:
+                    st.best_share_per_generation.clear()
                 except Exception:
                     pass
