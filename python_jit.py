@@ -6,6 +6,7 @@ import os
 import random
 import threading
 import time
+from collections import defaultdict, OrderedDict
 from ctypes import (
     c_void_p,
     c_int,
@@ -19,7 +20,7 @@ from ctypes import (
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Any, Dict, Tuple
+from typing import Callable, Optional, Any, Dict, Tuple, List
 
 from monero_job import MoneroJob
 from python_usage import PythonUsage
@@ -2141,24 +2142,31 @@ class _NonceStrideWriter(_ClassEventLogMixin):
             "bound": self._bound,
         }
 
+
 class _ShareDiversityCoordinator(_ClassEventLogMixin):
     """
-    Final-stage diversity chooser for JITWorker.
+    JITWorker share diversity coordinator.
 
-    Why this helps:
-    - does not basic-dedupe every repeated proof forever
-    - remembers recently returned proofs for a short TTL
-    - softly prefers different nonce stripes before returning the same proof again
-    - keeps tail64 as the main quality signal
+    Purpose:
+    - Keep recently returned proof candidates from being repeatedly selected.
+    - Spread returned candidates across nonce stripes.
+    - Prefer stronger candidates while still avoiding duplicate proof echoes.
+    - Stay safe under empty candidate lists, malformed native candidates, and
+      high worker concurrency.
+
+    Public API kept:
+        begin_round(job_id=..., generation=...)
+        pick(job_id=..., generation=..., candidates=..., max_results=...)
+        snapshot()
     """
 
     def __init__(
-        self,
-        *,
-        logger: Optional[Callable[[str], None]] = None,
-        ttl_ms: float = 18000.0,
-        max_recent: int = 8192,
-        stripe_shift: int = 12,
+            self,
+            *,
+            logger: Optional[Callable[[str], None]] = None,
+            ttl_ms: float = 18000.0,
+            max_recent: int = 8192,
+            stripe_shift: int = 12,
     ) -> None:
         self.logger = logger or (lambda s: None)
         self.ttl_ms = max(1000.0, float(ttl_ms))
@@ -2166,9 +2174,35 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
         self.stripe_shift = max(6, int(stripe_shift))
 
         self._mu = threading.RLock()
-        self._recent: dict[str, tuple[float, int]] = {}  # proof_key -> (seen_at, count)
+        self._recent: OrderedDict[str, tuple[float, int]] = OrderedDict()
+
         self._last_job_id: str = ""
         self._last_generation: int = 0
+
+        self._performance_stats: Dict[str, float] = defaultdict(float)
+        self._performance_stats["stability"] = 0.5
+
+        self._total_processed: int = 0
+        self._total_selected: int = 0
+        self._recent_diversity_score: float = 0.0
+
+        self._min_quality_threshold: float = 0.0
+        self._quality_history: List[float] = []
+
+        self._batch_size: int = 256
+        self._batch_threshold: float = 0.8
+
+        self._last_snapshot: dict = {
+            "job_id": "",
+            "generation": 0,
+            "recent_size": 0,
+            "total_processed": 0,
+            "total_selected": 0,
+            "recent_diversity_score": 0.0,
+            "min_quality_threshold": 0.0,
+            "batch_size": 256,
+            "last_pick": {},
+        }
 
         self._evt_init(
             class_prefix="ShareDiversity",
@@ -2179,6 +2213,8 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
                 "stripe": 45.0,
                 "picked": 20.0,
                 "prune": 60.0,
+                "empty": 60.0,
+                "bad": 60.0,
             },
             phrases={
                 "round": [
@@ -2206,6 +2242,14 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
                     "stale proof memory was trimmed back",
                     "expired diversity memory was cleared",
                 ],
+                "empty": [
+                    "no share candidates were available for diversity shaping",
+                    "the diversity picker saw an empty candidate pool",
+                ],
+                "bad": [
+                    "malformed share candidates were skipped safely",
+                    "candidate cleanup discarded unusable entries",
+                ],
             },
         )
 
@@ -2221,83 +2265,310 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
     def _norm_hash_hex(v: Any) -> str:
         return str(v or "").strip().lower()
 
+    @staticmethod
+    def _share_diff_est(tail64: int) -> float:
+        tail64 = int(tail64) & 0xFFFFFFFFFFFFFFFF
+        if tail64 <= 0:
+            return float("inf")
+        return float((1 << 64) / tail64)
+
     def _now(self) -> float:
         return time.perf_counter()
 
     def _proof_key(
-        self,
-        *,
-        job_id: str,
-        generation: int,
-        nonce_u32: int,
-        hash_hex: str,
+            self,
+            *,
+            job_id: str,
+            generation: int,
+            nonce_u32: int,
+            hash_hex: str,
     ) -> str:
         raw = (
-            f"{job_id}|{int(generation)}|{int(nonce_u32) & 0xFFFFFFFF}|{self._norm_hash_hex(hash_hex)}"
+            f"{str(job_id)}|"
+            f"{int(generation)}|"
+            f"{int(nonce_u32) & 0xFFFFFFFF}|"
+            f"{self._norm_hash_hex(hash_hex)}"
         ).encode("utf-8", "ignore")
         return hashlib.blake2s(raw, digest_size=16).hexdigest()
 
-    def _prune_locked(self) -> None:
-        now = self._now()
-        ttl_sec = self.ttl_ms / 1000.0
+    def _adaptive_ttl(
+            self,
+            base_ttl: float,
+            job_difficulty: float = 1.0,
+            success_rate: float = 0.5,
+    ) -> float:
+        difficulty_factor = 1.0 / max(0.1, float(job_difficulty))
+        success_factor = 0.5 + (max(0.0, min(1.0, float(success_rate))) * 0.5)
+        stability = float(self._performance_stats.get("stability", 0.5) or 0.5)
 
-        if not self._recent:
-            return
+        adaptive = float(base_ttl) * difficulty_factor * success_factor * (0.7 + 0.3 * stability)
 
-        doomed = [k for k, (ts, _count) in self._recent.items() if (now - ts) >= ttl_sec]
-        for k in doomed:
-            self._recent.pop(k, None)
+        if bool(self._performance_stats.get("aggressive_mode", False)):
+            adaptive *= 1.2
 
-        if len(self._recent) > self.max_recent:
-            ordered = sorted(self._recent.items(), key=lambda kv: (float(kv[1][0]), int(kv[1][1])))
-            drop_n = len(self._recent) - self.max_recent
-            for k, _ in ordered[:drop_n]:
-                self._recent.pop(k, None)
+        return max(1000.0, min(300000.0, adaptive))
+
+    def _quality_score(self, raw: dict) -> float:
+        """
+        Return a normalized quality score where LOWER is better.
+
+        Lower tail64 means a stronger candidate, so we rank by tail64 first.
+        share_diff_est slightly improves the score when present.
+        """
+        tail64 = self._u64(raw.get("tail64", raw.get("_tail64", 0xFFFFFFFFFFFFFFFF)))
+        share_diff_est = float(raw.get("share_diff_est", 0.0) or 0.0)
+
+        tail_rank = float(tail64) / float(0xFFFFFFFFFFFFFFFF)
+
+        if share_diff_est > 0.0:
+            boost = min(0.25, share_diff_est / 100000.0)
+            tail_rank *= 1.0 - boost
+
+        return max(0.0, min(1.0, tail_rank))
+
+    def _stripe_penalty(
+            self,
+            stripe_counts: dict[int, int],
+            stripe: int,
+            near_threshold: float = 0.1,
+    ) -> float:
+        same_stripe = int(stripe_counts.get(int(stripe), 0))
+        near_stripe = (
+            int(stripe_counts.get(int(stripe) - 1, 0)) +
+            int(stripe_counts.get(int(stripe) + 1, 0))
+        )
+
+        same_penalty = same_stripe * 0.15
+        near_penalty = near_stripe * 0.08
+
+        if same_stripe > 4 or (near_stripe > 2 and same_stripe > 2):
+            same_penalty *= 1.25
+            near_penalty *= 1.15
+
+        return float(same_penalty + near_penalty)
+
+    def _compute_score(
+            self,
+            cand: dict,
+            stripe_counts: dict[int, int],
+            quality_scores: Dict[int, float],
+    ) -> Tuple:
+        """
+        Lower tuple is better.
+
+        Priority:
+        1. Fresh proof first.
+        2. Less repeated proof first.
+        3. Less used stripe first.
+        4. Less neighboring stripe crowding first.
+        5. Stronger tail64 quality first.
+        6. Stable nonce tie-break.
+        """
+        stripe = int(cand["_stripe"])
+        recent_seen = int(cand["_recent_seen"])
+        recent_count = int(cand["_recent_count"])
+
+        same_stripe_pen = int(stripe_counts.get(stripe, 0))
+        near_stripe_pen = (
+            int(stripe_counts.get(stripe - 1, 0)) +
+            int(stripe_counts.get(stripe + 1, 0))
+        )
+
+        quality = float(cand.get("_quality_score", 1.0))
+        stripe_quality = float(quality_scores.get(stripe, quality))
+
+        return (
+            recent_seen,
+            recent_count,
+            same_stripe_pen,
+            near_stripe_pen,
+            self._stripe_penalty(stripe_counts, stripe),
+            quality,
+            stripe_quality,
+            int(cand["_tail64_int"]),
+            int(cand["_nonce_u32_int"]),
+        )
+
+    def _smart_prune(self, now: float, ttl_sec: float) -> List[str]:
+        doomed: list[str] = []
+
+        if self._recent:
+            for key, value in list(self._recent.items()):
+                try:
+                    ts = float(value[0])
+                except Exception:
+                    doomed.append(key)
+                    continue
+
+                if (now - ts) >= ttl_sec:
+                    doomed.append(key)
 
         if doomed:
-            self._evt_emit("prune", details=f"expired={len(doomed)} kept={len(self._recent)}")
+            doomed_set = set(doomed)
+            self._recent = OrderedDict(
+                (k, v) for k, v in self._recent.items() if k not in doomed_set
+            )
 
-    def begin_round(self, *, job_id: str, generation: int) -> None:
+            self._evt_emit(
+                "prune",
+                details=f"removed={len(doomed)} remaining={len(self._recent)}",
+            )
+
+        while len(self._recent) > self.max_recent:
+            try:
+                self._recent.popitem(last=False)
+            except Exception:
+                break
+
+        return doomed
+
+    def _adaptive_batch_size(self, num_candidates: int, max_results: int) -> int:
+        num_candidates = max(0, int(num_candidates))
+        max_results = max(1, int(max_results))
+
+        if num_candidates <= 0:
+            return max_results
+
+        ratio = float(num_candidates) / float(max_results)
+
+        if ratio < 0.5:
+            return max(1, min(512, num_candidates))
+
+        if ratio < 1.0:
+            return max(1, min(1024, num_candidates * 2))
+
+        return max(1, min(2048, num_candidates + 512))
+
+    def _normalize_candidate(self, raw: dict) -> Optional[dict]:
+        try:
+            if raw is None:
+                return None
+
+            nonce_u32 = self._u32(raw.get("nonce_u32", raw.get("_nonce", 0)))
+            hash_hex = self._norm_hash_hex(raw.get("hash_hex", ""))
+
+            # A candidate without a hash cannot be submitted safely by the old
+            # pipeline, so skip it instead of returning a broken object.
+            if not hash_hex:
+                return None
+
+            tail64 = raw.get("tail64", raw.get("_tail64", None))
+            if tail64 is None:
+                try:
+                    h = bytes.fromhex(hash_hex)
+                    if len(h) >= 32:
+                        tail64 = int.from_bytes(h[24:32], "little", signed=False)
+                    else:
+                        tail64 = 0xFFFFFFFFFFFFFFFF
+                except Exception:
+                    tail64 = 0xFFFFFFFFFFFFFFFF
+
+            tail64 = self._u64(tail64)
+            share_diff_est = float(raw.get("share_diff_est", self._share_diff_est(tail64)) or 0.0)
+
+            out = dict(raw)
+            out["nonce_u32"] = nonce_u32
+            out["hash_hex"] = hash_hex
+            out["tail64"] = tail64
+            out["share_diff_est"] = share_diff_est
+
+            return out
+
+        except Exception:
+            return None
+
+    def begin_round(
+            self,
+            *,
+            job_id: str,
+            generation: int,
+    ) -> None:
+        """
+        Begin a new diversity round.
+
+        Do NOT reference candidates or keep here. At this point no candidate
+        pool exists yet. Candidate-dependent sizing is done inside pick().
+        """
         job_id = str(job_id)
         generation = int(generation)
 
         with self._mu:
-            if self._last_job_id != job_id or self._last_generation != generation:
+            changed = (
+                self._last_job_id != job_id or
+                int(self._last_generation) != generation
+            )
+
+            if changed:
                 self._last_job_id = job_id
                 self._last_generation = generation
+
                 self._evt_emit(
                     "round",
                     details=f"job={job_id} gen={generation}",
                 )
-            self._prune_locked()
+
+                self._min_quality_threshold = max(
+                    0.0,
+                    min(0.30, float(self._min_quality_threshold) * 0.90),
+                )
+
+                self._batch_size = 256
+
+            ttl_sec = self.ttl_ms / 1000.0
+            self._smart_prune(self._now(), ttl_sec)
+
+            self._last_snapshot.update(
+                {
+                    "job_id": job_id,
+                    "generation": generation,
+                    "recent_size": len(self._recent),
+                    "min_quality_threshold": float(self._min_quality_threshold),
+                    "batch_size": int(self._batch_size),
+                }
+            )
 
     def pick(
-        self,
-        *,
-        job_id: str,
-        generation: int,
-        candidates: list[dict],
-        max_results: int,
+            self,
+            *,
+            job_id: str,
+            generation: int,
+            candidates: list[dict],
+            max_results: int,
     ) -> list[dict]:
         keep = max(1, int(max_results))
+
         if not candidates:
+            self._evt_emit("empty", details=f"job={job_id} gen={generation}")
             return []
 
         job_id = str(job_id)
         generation = int(generation)
 
         with self._mu:
-            self._prune_locked()
             now = self._now()
+            self._smart_prune(now, self.ttl_ms / 1000.0)
 
+            self._batch_size = self._adaptive_batch_size(len(candidates), keep)
+
+            quality_scores: Dict[int, float] = {}
             prepared: list[dict] = []
+            bad_items = 0
+            below_quality = 0
+
             for raw in candidates:
+                item = self._normalize_candidate(raw)
+                if item is None:
+                    bad_items += 1
+                    continue
+
                 try:
-                    nonce_u32 = self._u32(raw["nonce_u32"])
-                    hash_hex = self._norm_hash_hex(raw["hash_hex"])
-                    tail64 = self._u64(raw["tail64"])
-                    share_diff_est = float(raw.get("share_diff_est", 0.0))
-                    if not hash_hex:
+                    nonce_u32 = self._u32(item["nonce_u32"])
+                    hash_hex = self._norm_hash_hex(item["hash_hex"])
+                    tail64 = self._u64(item["tail64"])
+                    quality = self._quality_score(item)
+
+                    if quality > max(1.0, self._min_quality_threshold * 1.30):
+                        below_quality += 1
                         continue
 
                     proof_key = self._proof_key(
@@ -2306,24 +2577,48 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
                         nonce_u32=nonce_u32,
                         hash_hex=hash_hex,
                     )
+
                     stripe = int(nonce_u32 >> self.stripe_shift)
                     recent_entry = self._recent.get(proof_key)
                     recent_seen = 1 if recent_entry is not None else 0
                     recent_count = int(recent_entry[1]) if recent_entry is not None else 0
 
-                    item = dict(raw)
                     item["_proof_key"] = proof_key
                     item["_stripe"] = stripe
                     item["_recent_seen"] = recent_seen
                     item["_recent_count"] = recent_count
                     item["_tail64_int"] = int(tail64)
                     item["_nonce_u32_int"] = int(nonce_u32)
-                    item["_share_diff_est_float"] = float(share_diff_est)
+                    item["_share_diff_est_float"] = float(item.get("share_diff_est", 0.0))
+                    item["_quality_score"] = float(quality)
+
+                    quality_scores[stripe] = min(
+                        float(quality_scores.get(stripe, 1.0)),
+                        float(quality),
+                    )
+
                     prepared.append(item)
+
                 except Exception:
+                    bad_items += 1
                     continue
 
+            self._total_processed += int(len(candidates))
+
+            if bad_items:
+                self._evt_emit(
+                    "bad",
+                    details=f"bad={bad_items} pool={len(candidates)}",
+                )
+
             if not prepared:
+                self._last_snapshot["last_pick"] = {
+                    "incoming": len(candidates),
+                    "prepared": 0,
+                    "selected": 0,
+                    "bad_items": bad_items,
+                    "below_quality": below_quality,
+                }
                 return []
 
             selected: list[dict] = []
@@ -2331,40 +2626,18 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
 
             while prepared and len(selected) < keep:
                 best_idx: Optional[int] = None
-                best_score: Optional[tuple] = None
+                best_score: Optional[Tuple] = None
 
                 for idx, cand in enumerate(prepared):
-                    stripe = int(cand["_stripe"])
-                    recent_seen = int(cand["_recent_seen"])
-                    recent_count = int(cand["_recent_count"])
-
-                    same_stripe_pen = int(stripe_counts.get(stripe, 0))
-                    near_stripe_pen = (
-                        int(stripe_counts.get(stripe - 1, 0))
-                        + int(stripe_counts.get(stripe + 1, 0))
-                    )
-
-                    # tuple order matters:
-                    # 1) unseen proofs before recent echoes
-                    # 2) lower repeat count before heavily resurfaced proofs
-                    # 3) new stripes before already-used stripes
-                    # 4) neighboring stripe crowding penalty
-                    # 5) then tail64 quality
-                    # 6) stable tie-break by nonce
-                    score = (
-                        recent_seen,
-                        recent_count,
-                        same_stripe_pen,
-                        near_stripe_pen,
-                        int(cand["_tail64_int"]),
-                        int(cand["_nonce_u32_int"]),
-                    )
+                    score = self._compute_score(cand, stripe_counts, quality_scores)
 
                     if best_score is None or score < best_score:
                         best_score = score
                         best_idx = idx
 
-                assert best_idx is not None
+                if best_idx is None:
+                    break
+
                 chosen = prepared.pop(best_idx)
 
                 stripe = int(chosen["_stripe"])
@@ -2372,44 +2645,180 @@ class _ShareDiversityCoordinator(_ClassEventLogMixin):
 
                 stripe_counts[stripe] = int(stripe_counts.get(stripe, 0)) + 1
 
-                self._recent[proof_key] = (now, int(self._recent.get(proof_key, (now, 0))[1]) + 1)
+                prior_count = int(self._recent.get(proof_key, (now, 0))[1])
+                self._recent[proof_key] = (now, prior_count + 1)
+                try:
+                    self._recent.move_to_end(proof_key, last=True)
+                except Exception:
+                    pass
 
                 out = {
-                    "nonce_u32": int(chosen["nonce_u32"]),
+                    "nonce_u32": int(chosen["nonce_u32"]) & 0xFFFFFFFF,
                     "hash_hex": str(chosen["hash_hex"]),
-                    "tail64": int(chosen["tail64"]),
+                    "tail64": int(chosen["tail64"]) & 0xFFFFFFFFFFFFFFFF,
                     "share_diff_est": float(chosen.get("share_diff_est", 0.0)),
                 }
+
+                # Preserve useful debug metadata if the rest of the pipeline uses it.
+                for key in (
+                    "_found_by_thread",
+                    "_worker_index",
+                    "_thread_id",
+                    "_lane_id",
+                    "_generation",
+                    "_assigned_submit_thread",
+                    "_nonce",
+                    "_tail64",
+                ):
+                    if key in chosen:
+                        out[key] = chosen[key]
+
                 selected.append(out)
 
-            if selected:
-                used_stripes = len({int(x["nonce_u32"]) >> self.stripe_shift for x in selected})
-                if any(self._proof_key(
-                    job_id=job_id,
-                    generation=generation,
-                    nonce_u32=int(x["nonce_u32"]),
-                    hash_hex=str(x["hash_hex"]),
-                ) in self._recent for x in selected):
-                    self._evt_emit(
-                        "recent",
-                        details=f"selected={len(selected)} pool={len(candidates)}",
-                    )
-                if used_stripes > 1:
-                    self._evt_emit(
-                        "stripe",
-                        details=f"selected={len(selected)} used_stripes={used_stripes}",
+                if len(selected) % 8 == 0:
+                    recent_quality = [
+                        self._quality_score(x)
+                        for x in selected[-8:]
+                    ]
+                    avg_quality = sum(recent_quality) / max(1, len(recent_quality))
+                    self._quality_history.append(float(avg_quality))
+
+                    if len(self._quality_history) > 128:
+                        self._quality_history = self._quality_history[-64:]
+
+                    last_five = self._quality_history[-5:]
+                    avg_recent_quality = sum(last_five) / max(1, len(last_five))
+
+                    self._min_quality_threshold = max(
+                        0.0,
+                        min(0.30, float(avg_recent_quality) * 0.98),
                     )
 
-                best = selected[0]
+            if not selected:
+                self._last_snapshot["last_pick"] = {
+                    "incoming": len(candidates),
+                    "prepared": len(prepared),
+                    "selected": 0,
+                    "bad_items": bad_items,
+                    "below_quality": below_quality,
+                }
+                return []
+
+            used_stripes = len({int(x["nonce_u32"]) >> self.stripe_shift for x in selected})
+            diversity_score = float(used_stripes) / float(max(1, len(selected)))
+            self._recent_diversity_score = diversity_score
+
+            self._total_selected += int(len(selected))
+
+            selected_recent_echoes = 0
+            for x in selected:
+                try:
+                    key = self._proof_key(
+                        job_id=job_id,
+                        generation=generation,
+                        nonce_u32=int(x["nonce_u32"]),
+                        hash_hex=str(x["hash_hex"]),
+                    )
+                    if int(self._recent.get(key, (now, 0))[1]) > 1:
+                        selected_recent_echoes += 1
+                except Exception:
+                    pass
+
+            if selected_recent_echoes:
                 self._evt_emit(
-                    "picked",
+                    "recent",
                     details=(
-                        f"selected={len(selected)} pool={len(candidates)} "
-                        f"best_nonce={int(best['nonce_u32'])} best_tail64={int(best['tail64'])}"
+                        f"echoes={selected_recent_echoes} "
+                        f"selected={len(selected)} pool={len(candidates)}"
                     ),
                 )
 
+            if used_stripes > 1:
+                self._evt_emit(
+                    "stripe",
+                    details=(
+                        f"stripes={used_stripes} selected={len(selected)} "
+                        f"pool={len(candidates)} diversity={diversity_score:.3f}"
+                    ),
+                )
+
+            best = min(selected, key=lambda x: int(x["tail64"]) & 0xFFFFFFFFFFFFFFFF)
+            self._evt_emit(
+                "picked",
+                details=(
+                    f"selected={len(selected)} pool={len(candidates)} "
+                    f"prepared={len(selected) + len(prepared)} "
+                    f"best_nonce={int(best['nonce_u32'])} "
+                    f"best_tail64={int(best['tail64'])} "
+                    f"stripes={used_stripes}"
+                ),
+            )
+
+            while len(self._recent) > self.max_recent:
+                try:
+                    self._recent.popitem(last=False)
+                except Exception:
+                    break
+
+            self._last_snapshot = {
+                "job_id": job_id,
+                "generation": generation,
+                "recent_size": int(len(self._recent)),
+                "total_processed": int(self._total_processed),
+                "total_selected": int(self._total_selected),
+                "recent_diversity_score": float(self._recent_diversity_score),
+                "min_quality_threshold": float(self._min_quality_threshold),
+                "batch_size": int(self._batch_size),
+                "last_pick": {
+                    "incoming": int(len(candidates)),
+                    "prepared": int(len(selected) + len(prepared)),
+                    "selected": int(len(selected)),
+                    "bad_items": int(bad_items),
+                    "below_quality": int(below_quality),
+                    "used_stripes": int(used_stripes),
+                    "selected_recent_echoes": int(selected_recent_echoes),
+                    "best_nonce": int(best["nonce_u32"]),
+                    "best_tail64": int(best["tail64"]),
+                    "best_tail64_hex": f"0x{int(best['tail64']) & 0xFFFFFFFFFFFFFFFF:016X}",
+                },
+            }
+
             return selected
+
+    def snapshot(self) -> dict:
+        with self._mu:
+            return dict(self._last_snapshot)
+
+    def clear(self) -> None:
+        with self._mu:
+            old_recent = len(self._recent)
+
+            self._recent.clear()
+            self._last_job_id = ""
+            self._last_generation = 0
+            self._min_quality_threshold = 0.0
+            self._quality_history.clear()
+            self._batch_size = 256
+            self._recent_diversity_score = 0.0
+
+            self._last_snapshot = {
+                "job_id": "",
+                "generation": 0,
+                "recent_size": 0,
+                "total_processed": int(self._total_processed),
+                "total_selected": int(self._total_selected),
+                "recent_diversity_score": 0.0,
+                "min_quality_threshold": 0.0,
+                "batch_size": 256,
+                "last_pick": {},
+            }
+
+            if old_recent:
+                self._evt_emit(
+                    "prune",
+                    details=f"cleared_recent={old_recent}",
+                    force=True,
+                )
 
 class _CandidateBatch(_ClassEventLogMixin):
     """
